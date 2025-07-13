@@ -1,0 +1,1087 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>secret-reverse-proxy: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/scrtlabs/secret-reverse-proxy/mock_query_contract.go (0.0%)</option>
+				
+				<option value="file1">github.com/scrtlabs/secret-reverse-proxy/secret_reverse_proxy.go (33.0%)</option>
+				
+				<option value="file2">github.com/scrtlabs/secret-reverse-proxy/testable_validator.go (0.0%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">no coverage</span>
+				<span class="cov1">low coverage</span>
+				<span class="cov2">*</span>
+				<span class="cov3">*</span>
+				<span class="cov4">*</span>
+				<span class="cov5">*</span>
+				<span class="cov6">*</span>
+				<span class="cov7">*</span>
+				<span class="cov8">*</span>
+				<span class="cov9">*</span>
+				<span class="cov10">high coverage</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package secret_reverse_proxy
+
+// MockContractQuerier implements contract querying for testing
+type MockContractQuerier struct {
+        ValidHashes map[string]bool
+        ShouldFail  bool
+        FailError   error
+}
+
+// QueryContract mocks the contract query functionality
+func (m *MockContractQuerier) QueryContract(contractAddress string, query map[string]any) (map[string]any, error) <span class="cov0" title="0">{
+        if m.ShouldFail </span><span class="cov0" title="0">{
+                return nil, m.FailError
+        }</span>
+        
+        // Return mock API keys based on what we want to test
+        <span class="cov0" title="0">apiKeys := make([]any, 0)
+        for hash := range m.ValidHashes </span><span class="cov0" title="0">{
+                apiKeys = append(apiKeys, map[string]any{
+                        "hashed_key": hash,
+                })
+        }</span>
+        
+        <span class="cov0" title="0">return map[string]any{
+                "api_keys": apiKeys,
+        }, nil</span>
+}</pre>
+		
+		<pre class="file" id="file1" style="display: none">// Package secret_reverse_proxy implements a Caddy middleware that provides API key authentication
+// for reverse proxy operations. It validates API keys against multiple sources:
+// 1. Configured master key
+// 2. Master keys file (local file with one key per line)
+// 3. Secret Network smart contract (cached for performance)
+//
+// The middleware integrates with Caddy's HTTP handler chain and blocks requests with invalid
+// or missing API keys while forwarding valid requests to downstream handlers.
+//
+// Authentication Flow:
+// Request → Extract API Key → Check Master Key → Check Master Keys File → Check Cache → Query Contract → Allow/Deny
+//
+// Configuration:
+// The middleware can be configured via Caddyfile with directives for master keys, file paths,
+// contract addresses, and cache settings.
+package secret_reverse_proxy
+
+import (
+        "bufio"
+        querycontract "github.com/scrtlabs/secret-reverse-proxy/query-contract"
+        "crypto/sha256"
+        "encoding/hex"
+        "encoding/json"
+        "fmt"
+        "net/http"
+        "os"
+        "strings"
+        "sync"
+        "time"
+
+        "github.com/caddyserver/caddy/v2"
+        "github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+        "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+        "github.com/caddyserver/caddy/v2/modules/caddyhttp"
+        "go.uber.org/zap"
+)
+
+// Config holds the configuration parameters for the secret reverse proxy middleware.
+// This struct defines all the configurable aspects of the authentication system.
+type Config struct {
+        // APIKey is the primary master key that grants immediate access without further validation.
+        // This key should be kept secure and rotated regularly.
+        APIKey string `json:"api_key,omitempty"`
+        
+        // MasterKeysFile is the path to a file containing additional master keys (one per line).
+        // This allows for multiple master keys without hardcoding them in configuration.
+        // The file is read on each validation attempt, so keys can be rotated without restart.
+        MasterKeysFile string `json:"master_keys_file,omitempty"`
+        
+        // PermitFile is the path to a JSON file containing the Secret Network permit configuration.
+        // If not specified, a default hardcoded permit will be used.
+        // The permit defines blockchain authentication parameters for contract queries.
+        PermitFile string `json:"permit_file,omitempty"`
+        
+        // ContractAddress is the Secret Network smart contract address that stores valid API keys.
+        // This contract is queried to refresh the cache of valid hashed API keys.
+        ContractAddress string `json:"contract_address,omitempty"`
+        
+        // CacheTTL defines how long cached API key validation results remain valid.
+        // After this duration, the cache will be refreshed from the smart contract.
+        CacheTTL time.Duration `json:"cache_ttl,omitempty"`
+}
+
+// defaultConfig returns a Config struct populated with sensible default values.
+// These defaults are used when no explicit configuration is provided.
+//
+// Default values:
+// - MasterKeysFile: "master_keys.txt" (local file in working directory)
+// - ContractAddress: Secret Network contract for API key validation
+// - CacheTTL: 30 minutes (balances performance vs. key rotation speed)
+//
+// Returns:
+//   - *Config: A new Config instance with default values
+func defaultConfig() *Config <span class="cov9" title="8">{
+        return &amp;Config{
+                // Default master keys file location - should contain one API key per line
+                MasterKeysFile: "master_keys.txt",
+                
+                // Default Secret Network contract address for API key validation
+                ContractAddress: "secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr",
+                
+                // Default cache TTL - 30 minutes provides good balance between performance and security
+                CacheTTL: 30 * time.Minute,
+        }
+}</span>
+
+// APIKeyValidator encapsulates all logic for validating API keys against multiple sources.
+// It manages an in-memory cache of valid API key hashes for performance optimization.
+// Thread-safe operations are ensured through proper mutex usage.
+type APIKeyValidator struct {
+        // config holds the validator configuration parameters
+        config *Config
+        
+        // cache stores SHA256 hashes of valid API keys mapped to their validity status
+        // Key: SHA256 hash of API key, Value: true if valid
+        cache map[string]bool
+        
+        // cacheMutex protects concurrent access to the cache map
+        // Uses RWMutex to allow multiple concurrent reads while serializing writes
+        cacheMutex sync.RWMutex
+        
+        // lastUpdate tracks when the cache was last refreshed from the smart contract
+        // Used to determine if cache has exceeded TTL and needs refresh
+        lastUpdate time.Time
+}
+
+// NewAPIKeyValidator creates and initializes a new APIKeyValidator instance.
+// This constructor sets up the validator with the provided configuration and
+// initializes the internal cache for storing API key validation results.
+//
+// Parameters:
+//   - config: Configuration parameters for the validator
+//
+// Returns:
+//   - *APIKeyValidator: A new validator instance ready for use
+//
+// Note: The cache starts empty and will be populated on first validation attempt
+// or when updateAPIKeyCache() is called.
+func NewAPIKeyValidator(config *Config) *APIKeyValidator <span class="cov3" title="2">{
+        return &amp;APIKeyValidator{
+                // Store reference to configuration
+                config: config,
+                
+                // Initialize empty cache - will be populated from contract on first use
+                cache: make(map[string]bool),
+                
+                // lastUpdate will be set to zero time initially, forcing immediate cache update
+        }
+}</span>
+
+// init registers the middleware with Caddy's module system.
+// This function is called automatically when the package is imported.
+// It performs two critical registrations:
+// 1. Registers the Middleware as a Caddy module
+// 2. Registers the Caddyfile directive parser
+func init() <span class="cov1" title="1">{
+        // Register this middleware as a Caddy module so it can be loaded
+        caddy.RegisterModule(&amp;Middleware{})
+        
+        // Register the Caddyfile directive "secret_reverse_proxy" and its parser
+        // This allows users to configure the middleware in their Caddyfile
+        httpcaddyfile.RegisterHandlerDirective("secret_reverse_proxy", parseCaddyfile)
+}</span>
+
+// Middleware represents the Caddy HTTP middleware that performs API key authentication.
+// It implements the required Caddy interfaces to integrate into the HTTP handler chain.
+// Each request passes through this middleware before reaching downstream handlers.
+type Middleware struct {
+        // config holds the middleware configuration loaded from Caddyfile
+        config *Config
+        
+        // validator performs the actual API key validation logic
+        // Initialized during the Provision phase
+        validator *APIKeyValidator
+}
+
+// CaddyModule returns the module information required by Caddy's module system.
+// This method implements the caddy.Module interface and provides metadata
+// about this middleware to Caddy's module loader.
+//
+// Returns:
+//   - caddy.ModuleInfo: Module metadata including ID and constructor function
+func (Middleware) CaddyModule() caddy.ModuleInfo <span class="cov3" title="2">{
+        return caddy.ModuleInfo{
+                // Unique module ID within Caddy's HTTP handler namespace
+                // Format: namespace.category.module_name
+                ID: "http.handlers.secret_reverse_proxy",
+                
+                // Constructor function that returns a new instance of this middleware
+                // Called by Caddy when creating middleware instances
+                New: func() caddy.Module </span><span class="cov3" title="2">{ return new(Middleware) }</span>,
+        }
+}
+
+// Provision implements caddy.Provisioner and is called by Caddy to set up the middleware.
+// This method is invoked during Caddy's configuration loading phase, before any requests
+// are processed. It initializes the middleware with configuration and creates the validator.
+//
+// Parameters:
+//   - ctx: Caddy context containing global configuration and services
+//
+// Returns:
+//   - error: nil on success, error on configuration failure
+//
+// Note: This method must complete successfully for the middleware to be active.
+func (m *Middleware) Provision(ctx caddy.Context) error <span class="cov3" title="2">{
+        logger := caddy.Log()
+        logger.Debug("Provisioning secret reverse proxy middleware")
+        
+        // BLOCK 1: Configuration Setup
+        // Ensure we have a valid configuration, using defaults if none provided
+        if m.config == nil </span><span class="cov1" title="1">{
+                m.config = defaultConfig()
+                logger.Debug("Using default configuration")
+        }</span>
+        
+        // BLOCK 2: Validator Initialization
+        // Create the API key validator that will handle authentication logic
+        <span class="cov3" title="2">m.validator = NewAPIKeyValidator(m.config)
+        if m.validator == nil </span><span class="cov0" title="0">{
+                return fmt.Errorf("failed to create API key validator")
+        }</span>
+        
+        // BLOCK 3: Configuration Logging
+        // Log configuration details for debugging (excluding sensitive data)
+        <span class="cov3" title="2">logger.Info("Secret reverse proxy middleware provisioned",
+                zap.String("contract_address", m.config.ContractAddress),
+                zap.Duration("cache_ttl", m.config.CacheTTL),
+                zap.String("master_keys_file", m.config.MasterKeysFile),
+                zap.Bool("master_key_configured", m.config.APIKey != ""),
+                zap.Bool("permit_file_configured", m.config.PermitFile != ""))
+        
+        return nil</span>
+}
+
+// Validate implements caddy.Validator and is called by Caddy to verify configuration.
+// This method checks that all required configuration parameters are present and valid.
+// It's called after Provision() but before the middleware starts handling requests.
+//
+// Returns:
+//   - error: nil if configuration is valid, error describing the problem if invalid
+//
+// Validation checks:
+// - Configuration object exists
+// - Contract address is specified
+// - Cache TTL is positive
+// - File paths are accessible (if specified)
+func (m *Middleware) Validate() error <span class="cov7" title="5">{
+        logger := caddy.Log()
+        logger.Debug("Validating secret reverse proxy middleware configuration")
+        
+        // BLOCK 1: Basic Configuration Validation
+        // Ensure we have a configuration object to work with
+        if m.config == nil </span><span class="cov1" title="1">{
+                err := fmt.Errorf("configuration is nil")
+                logger.Error("Validation failed", zap.Error(err))
+                return err
+        }</span>
+        
+        // BLOCK 2: Required Field Validation
+        // Check that essential configuration parameters are provided
+        <span class="cov6" title="4">if m.config.ContractAddress == "" </span><span class="cov1" title="1">{
+                err := fmt.Errorf("contract address is required")
+                logger.Error("Validation failed", zap.Error(err))
+                return err
+        }</span>
+        
+        <span class="cov5" title="3">if m.config.CacheTTL &lt;= 0 </span><span class="cov3" title="2">{
+                err := fmt.Errorf("cache TTL must be positive, got %v", m.config.CacheTTL)
+                logger.Error("Validation failed", zap.Error(err))
+                return err
+        }</span>
+        
+        // BLOCK 3: File Access Validation
+        // Verify that specified files are accessible (warn but don't fail)
+        <span class="cov1" title="1">if m.config.MasterKeysFile != "" </span><span class="cov0" title="0">{
+                if _, err := os.Stat(m.config.MasterKeysFile); err != nil &amp;&amp; !os.IsNotExist(err) </span><span class="cov0" title="0">{
+                        logger.Warn("Master keys file access issue",
+                                zap.String("file", m.config.MasterKeysFile),
+                                zap.Error(err))
+                }</span>
+        }
+        
+        <span class="cov1" title="1">if m.config.PermitFile != "" </span><span class="cov0" title="0">{
+                if _, err := os.Stat(m.config.PermitFile); err != nil </span><span class="cov0" title="0">{
+                        logger.Warn("Permit file access issue",
+                                zap.String("file", m.config.PermitFile),
+                                zap.Error(err))
+                }</span>
+        }
+        
+        <span class="cov1" title="1">logger.Debug("Configuration validation successful")
+        return nil</span>
+}
+
+// ServeHTTP implements caddyhttp.MiddlewareHandler and is the main request processing method.
+// This method is called for every HTTP request that passes through this middleware.
+// It performs API key authentication and either blocks or forwards the request.
+//
+// Request Processing Flow:
+// 1. Extract Authorization header
+// 2. Parse API key from header
+// 3. Validate API key through multiple sources
+// 4. Allow/deny request based on validation result
+//
+// Parameters:
+//   - w: HTTP response writer for sending responses
+//   - r: HTTP request containing headers and request data
+//   - next: Next handler in the Caddy chain to call if authentication succeeds
+//
+// Returns:
+//   - error: nil on success, error if request processing fails
+func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error <span class="cov0" title="0">{
+        logger := caddy.Log()
+        
+        // BLOCK 1: Request Logging
+        // Log incoming request details for debugging and audit purposes
+        logger.Debug("Processing request through secret reverse proxy middleware",
+                zap.String("method", r.Method),
+                zap.String("path", r.URL.Path),
+                zap.String("remote_addr", r.RemoteAddr))
+        
+        // BLOCK 2: Authorization Header Extraction
+        // Check if the request contains an Authorization header
+        authHeader := r.Header.Get("Authorization")
+        if authHeader == "" </span><span class="cov0" title="0">{
+                // No authorization header = immediate rejection
+                logger.Debug("Request rejected: missing Authorization header",
+                        zap.String("remote_addr", r.RemoteAddr),
+                        zap.String("path", r.URL.Path))
+                http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
+                return nil
+        }</span>
+
+        // BLOCK 3: API Key Parsing
+        // Extract the actual API key from the Authorization header
+        // Handles both "Basic" and "Bearer" token formats
+        <span class="cov0" title="0">apiKey := extractAPIKey(authHeader)
+        if apiKey == "" </span><span class="cov0" title="0">{
+                // Invalid header format = rejection
+                logger.Debug("Request rejected: invalid Authorization header format",
+                        zap.String("remote_addr", r.RemoteAddr),
+                        zap.String("auth_header_prefix", authHeader[:min(20, len(authHeader))]))
+                http.Error(w, "Invalid Authorization header format", http.StatusUnauthorized)
+                return nil
+        }</span>
+
+        // BLOCK 4: API Key Validation
+        // Perform the core authentication logic using the validator
+        <span class="cov0" title="0">logger.Debug("Validating API key",
+                zap.String("key_prefix", apiKey[:min(8, len(apiKey))]+"..."))
+
+        isValid, err := m.validator.ValidateAPIKey(apiKey)
+        if err != nil </span><span class="cov0" title="0">{
+                // Validation process failed (not invalid key, but system error)
+                logger.Error("API key validation failed",
+                        zap.Error(err),
+                        zap.String("remote_addr", r.RemoteAddr),
+                        zap.String("path", r.URL.Path))
+                http.Error(w, "Internal server error", http.StatusInternalServerError)
+                return nil
+        }</span>
+
+        // BLOCK 5: Validation Result Processing
+        // Check the validation result and either block or allow the request
+        <span class="cov0" title="0">if !isValid </span><span class="cov0" title="0">{
+                // Valid validation process but invalid key = rejection
+                logger.Info("Request rejected: invalid API key",
+                        zap.String("remote_addr", r.RemoteAddr),
+                        zap.String("path", r.URL.Path),
+                        zap.String("key_prefix", apiKey[:min(8, len(apiKey))]+"..."))
+                http.Error(w, "Invalid API key", http.StatusUnauthorized)
+                return nil
+        }</span>
+
+        // BLOCK 6: Request Forwarding
+        // Authentication successful - forward request to next handler in chain
+        <span class="cov0" title="0">logger.Debug("API key validation successful, forwarding request")
+        return next.ServeHTTP(w, r)</span>
+}
+
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler and parses Caddyfile configuration.
+// This method is called by Caddy when parsing the Caddyfile to extract configuration
+// directives specific to this middleware.
+//
+// Supported Caddyfile directives:
+//   - API_MASTER_KEY &lt;key&gt;         : Sets the primary master API key
+//   - master_keys_file &lt;path&gt;      : Path to file containing additional master keys
+//   - permit_file &lt;path&gt;           : Path to JSON file with Secret Network permit
+//   - contract_address &lt;address&gt;   : Secret Network contract address for API key validation
+//
+// Example Caddyfile configuration:
+//   secret_reverse_proxy {
+//       API_MASTER_KEY "your-master-key-here"
+//       master_keys_file "/etc/caddy/master_keys.txt"
+//       contract_address "secret1abc..."
+//   }
+//
+// Parameters:
+//   - d: Caddyfile dispenser for parsing configuration tokens
+//
+// Returns:
+//   - error: nil on successful parsing, error if configuration is invalid
+func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error <span class="cov8" title="7">{
+        // BLOCK 1: Configuration Initialization
+        // Ensure we have a config object to populate
+        if m.config == nil </span><span class="cov8" title="7">{
+                m.config = defaultConfig()
+        }</span>
+        
+        // BLOCK 2: Directive Parsing Loop
+        // Parse each configuration directive from the Caddyfile
+        <span class="cov8" title="7">for d.Next() </span><span class="cov8" title="7">{
+                // Process configuration block contents
+                for d.NextBlock(0) </span><span class="cov10" title="10">{
+                        // Parse individual configuration directives
+                        switch d.Val() </span>{
+                        case "API_MASTER_KEY":<span class="cov5" title="3">
+                                // Primary master key configuration
+                                if !d.Args(&amp;m.config.APIKey) </span><span class="cov1" title="1">{
+                                        return d.ArgErr()
+                                }</span>
+                        case "master_keys_file":<span class="cov3" title="2">
+                                // Additional master keys file path
+                                if !d.Args(&amp;m.config.MasterKeysFile) </span><span class="cov0" title="0">{
+                                        return d.ArgErr()
+                                }</span>
+                        case "permit_file":<span class="cov3" title="2">
+                                // Secret Network permit file path
+                                if !d.Args(&amp;m.config.PermitFile) </span><span class="cov0" title="0">{
+                                        return d.ArgErr()
+                                }</span>
+                        case "contract_address":<span class="cov3" title="2">
+                                // Smart contract address for API key validation
+                                if !d.Args(&amp;m.config.ContractAddress) </span><span class="cov0" title="0">{
+                                        return d.ArgErr()
+                                }</span>
+                        default:<span class="cov1" title="1">
+                                // Unknown directive - return error
+                                return d.Errf("unknown subdirective: %s", d.Val())</span>
+                        }
+                }
+        }
+        <span class="cov7" title="5">return nil</span>
+}
+
+// min returns the minimum of two integers.
+// This utility function is used for safe string slicing to prevent
+// index out of bounds errors when logging partial API keys.
+//
+// Parameters:
+//   - a, b: Two integers to compare
+//
+// Returns:
+//   - int: The smaller of the two input values
+func min(a, b int) int <span class="cov8" title="6">{
+        if a &lt; b </span><span class="cov6" title="4">{
+                return a
+        }</span>
+        <span class="cov3" title="2">return b</span>
+}
+
+// extractAPIKey extracts the actual API key from an Authorization header.
+// This function handles the standard HTTP Authorization header formats:
+// - "Basic &lt;key&gt;" - Used for basic authentication
+// - "Bearer &lt;key&gt;" - Used for token-based authentication
+// - Raw key without prefix - Fallback for custom implementations
+//
+// Parameters:
+//   - authHeader: The complete Authorization header value
+//
+// Returns:
+//   - string: The extracted API key, or original header if no known prefix found
+//
+// Example:
+//   extractAPIKey("Bearer abc123") returns "abc123"
+//   extractAPIKey("Basic xyz789") returns "xyz789"
+//   extractAPIKey("plainkey") returns "plainkey"
+func extractAPIKey(authHeader string) string <span class="cov8" title="6">{
+        // Try to remove "Basic " prefix (HTTP Basic Auth format)
+        if apiKey, found := strings.CutPrefix(authHeader, "Basic "); found </span><span class="cov3" title="2">{
+                return apiKey
+        }</span>
+        
+        // Try to remove "Bearer " prefix (OAuth/JWT token format)
+        <span class="cov6" title="4">if apiKey, found := strings.CutPrefix(authHeader, "Bearer "); found </span><span class="cov1" title="1">{
+                return apiKey
+        }</span>
+        
+        // No recognized prefix - return the header as-is (custom format)
+        <span class="cov5" title="3">return authHeader</span>
+}
+
+// ValidateAPIKey performs comprehensive API key validation through multiple authentication sources.
+// This is the core authentication method that implements a tiered validation strategy:
+//
+// Validation Hierarchy (in order of precedence):
+// 1. Configured master key (immediate access)
+// 2. Master keys file (local file-based keys)
+// 3. Cached contract results (performance optimization)
+// 4. Fresh contract query (authoritative source)
+//
+// Parameters:
+//   - apiKey: The API key string to validate
+//
+// Returns:
+//   - bool: true if the API key is valid, false otherwise
+//   - error: nil on successful validation process, error if validation cannot be performed
+//
+// Note: A return of (false, nil) means the key is definitively invalid.
+//       A return of (false, error) means the validation process failed.
+func (v *APIKeyValidator) ValidateAPIKey(apiKey string) (bool, error) <span class="cov0" title="0">{
+        logger := caddy.Log()
+        
+        // BLOCK 1: Input Validation
+        // Ensure we have a non-empty API key to work with
+        if strings.TrimSpace(apiKey) == "" </span><span class="cov0" title="0">{
+                logger.Debug("API key validation failed: empty key")
+                return false, fmt.Errorf("empty API key")
+        }</span>
+        
+        // Create safe logging prefix for debugging (only first 8 characters)
+        <span class="cov0" title="0">keyPrefix := apiKey[:min(8, len(apiKey))] + "..."
+        logger.Debug("Starting API key validation", zap.String("key_prefix", keyPrefix))
+        
+        // BLOCK 2: Master Key Check
+        // Check against the primary configured master key (highest priority)
+        if v.config.APIKey != "" &amp;&amp; apiKey == v.config.APIKey </span><span class="cov0" title="0">{
+                logger.Debug("API key validated: matches configured master key")
+                return true, nil
+        }</span>
+
+        // BLOCK 3: Master Keys File Check
+        // Check against additional master keys stored in a local file
+        <span class="cov0" title="0">isMasterKey, err := v.checkMasterKeys(apiKey)
+        if err != nil </span><span class="cov0" title="0">{
+                logger.Error("Master key check failed",
+                        zap.Error(err),
+                        zap.String("key_prefix", keyPrefix))
+                return false, fmt.Errorf("master key check failed: %w", err)
+        }</span>
+        <span class="cov0" title="0">if isMasterKey </span><span class="cov0" title="0">{
+                logger.Debug("API key validated: found in master keys file")
+                return true, nil
+        }</span>
+
+        // BLOCK 4: Cache Preparation
+        // Hash the API key for secure cache storage and lookup
+        // We store hashes instead of plain keys for security
+        <span class="cov0" title="0">hasher := sha256.New()
+        hasher.Write([]byte(apiKey))
+        apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
+
+        // BLOCK 5: Cache Lookup
+        // Check if we have a recent validation result cached
+        v.cacheMutex.RLock()
+        cached, found := v.cache[apiKeyHash]
+        isStale := time.Since(v.lastUpdate) &gt; v.config.CacheTTL
+        cacheSize := len(v.cache)
+        v.cacheMutex.RUnlock()
+
+        logger.Debug("Cache lookup",
+                zap.String("hash_prefix", apiKeyHash[:min(16, len(apiKeyHash))]+"..."),
+                zap.Bool("found", found),
+                zap.Bool("stale", isStale),
+                zap.Int("cache_size", cacheSize),
+                zap.Duration("age", time.Since(v.lastUpdate)))
+
+        // BLOCK 6: Cache Hit Processing
+        // If we have a fresh cache entry, use it to avoid contract query
+        if found &amp;&amp; !isStale </span><span class="cov0" title="0">{
+                logger.Debug("API key validation result from cache", zap.Bool("valid", cached))
+                return cached, nil
+        }</span>
+
+        // BLOCK 7: Contract Query
+        // Cache miss or stale data - query the authoritative smart contract
+        <span class="cov0" title="0">logger.Debug("Updating API key cache from contract")
+        if err := v.updateAPIKeyCache(); err != nil </span><span class="cov0" title="0">{
+                logger.Error("Cache update failed",
+                        zap.Error(err),
+                        zap.String("contract_address", v.config.ContractAddress))
+                return false, fmt.Errorf("cache update failed: %w", err)
+        }</span>
+
+        // BLOCK 8: Final Result
+        // Check the updated cache for the validation result
+        <span class="cov0" title="0">v.cacheMutex.RLock()
+        defer v.cacheMutex.RUnlock()
+        result := v.cache[apiKeyHash]
+        logger.Debug("API key validation result after cache update",
+                zap.Bool("valid", result),
+                zap.Int("new_cache_size", len(v.cache)))
+        return result, nil</span>
+}
+
+// checkMasterKeys checks if the provided API key exists in the master keys file
+func (v *APIKeyValidator) checkMasterKeys(apiKey string) (bool, error) <span class="cov0" title="0">{
+        logger := caddy.Log()
+        
+        if v.config.MasterKeysFile == "" </span><span class="cov0" title="0">{
+                logger.Debug("No master keys file configured")
+                return false, nil
+        }</span>
+        
+        <span class="cov0" title="0">logger.Debug("Checking master keys file", zap.String("file", v.config.MasterKeysFile))
+        
+        file, err := os.Open(v.config.MasterKeysFile)
+        if err != nil </span><span class="cov0" title="0">{
+                // If file doesn't exist, that's not an error
+                if os.IsNotExist(err) </span><span class="cov0" title="0">{
+                        logger.Debug("Master keys file does not exist", zap.String("file", v.config.MasterKeysFile))
+                        return false, nil
+                }</span>
+                <span class="cov0" title="0">logger.Error("Failed to open master keys file",
+                        zap.String("file", v.config.MasterKeysFile),
+                        zap.Error(err))
+                return false, fmt.Errorf("failed to open master keys file: %w", err)</span>
+        }
+        <span class="cov0" title="0">defer file.Close()
+
+        lineCount := 0
+        scanner := bufio.NewScanner(file)
+        for scanner.Scan() </span><span class="cov0" title="0">{
+                lineCount++
+                nextMasterKey := strings.TrimSpace(scanner.Text())
+                if nextMasterKey != "" &amp;&amp; nextMasterKey == apiKey </span><span class="cov0" title="0">{
+                        logger.Debug("API key found in master keys file",
+                                zap.String("file", v.config.MasterKeysFile),
+                                zap.Int("line", lineCount))
+                        return true, nil
+                }</span>
+        }
+
+        <span class="cov0" title="0">if err := scanner.Err(); err != nil </span><span class="cov0" title="0">{
+                logger.Error("Error reading master keys file",
+                        zap.String("file", v.config.MasterKeysFile),
+                        zap.Error(err))
+                return false, fmt.Errorf("error reading master keys file: %w", err)
+        }</span>
+
+        <span class="cov0" title="0">logger.Debug("API key not found in master keys file",
+                zap.String("file", v.config.MasterKeysFile),
+                zap.Int("lines_checked", lineCount))
+        return false, nil</span>
+}
+
+// updateAPIKeyCache queries the contract and updates the in-memory cache
+func (v *APIKeyValidator) updateAPIKeyCache() error <span class="cov0" title="0">{
+        logger := caddy.Log()
+        start := time.Now()
+        
+        logger.Debug("Starting cache update", zap.String("contract_address", v.config.ContractAddress))
+        
+        // Load permit from file or use default
+        var permit map[string]any
+        var err error
+        
+        if v.config.PermitFile != "" </span><span class="cov0" title="0">{
+                logger.Debug("Loading permit from file", zap.String("file", v.config.PermitFile))
+                permit, err = readPermitFromFile(v.config.PermitFile)
+                if err != nil </span><span class="cov0" title="0">{
+                        logger.Error("Failed to read permit file",
+                                zap.String("file", v.config.PermitFile),
+                                zap.Error(err))
+                        return fmt.Errorf("failed to read permit file: %w", err)
+                }</span>
+        } else<span class="cov0" title="0"> {
+                logger.Debug("Using default permit configuration")
+                // Use default permit if no file specified
+                permit = getDefaultPermit()
+        }</span>
+
+        <span class="cov0" title="0">query := map[string]any{
+                "api_keys_with_permit": map[string]any{
+                        "permit": permit,
+                },
+        }
+
+        logger.Debug("Querying contract for API keys")
+        result, err := querycontract.QueryContract(v.config.ContractAddress, query)
+        if err != nil </span><span class="cov0" title="0">{
+                logger.Error("Contract query failed",
+                        zap.String("contract_address", v.config.ContractAddress),
+                        zap.Error(err),
+                        zap.Duration("duration", time.Since(start)))
+                return fmt.Errorf("contract query failed: %w", err)
+        }</span>
+
+        <span class="cov0" title="0">apiKeys, ok := result["api_keys"].([]any)
+        if !ok </span><span class="cov0" title="0">{
+                logger.Error("Unexpected response format: api_keys field not found or wrong type",
+                        zap.Any("response_keys", getResponseKeys(result)))
+                return fmt.Errorf("unexpected response format: api_keys not found")
+        }</span>
+
+        <span class="cov0" title="0">newCache := make(map[string]bool)
+        validKeys := 0
+        skippedEntries := 0
+        
+        for i, entry := range apiKeys </span><span class="cov0" title="0">{
+                entryMap, ok := entry.(map[string]any)
+                if !ok </span><span class="cov0" title="0">{
+                        skippedEntries++
+                        logger.Debug("Skipping invalid entry", zap.Int("index", i))
+                        continue</span>
+                }
+                <span class="cov0" title="0">hashedKey, ok := entryMap["hashed_key"].(string)
+                if ok &amp;&amp; hashedKey != "" </span><span class="cov0" title="0">{
+                        newCache[hashedKey] = true
+                        validKeys++
+                }</span> else<span class="cov0" title="0"> {
+                        skippedEntries++
+                        logger.Debug("Skipping entry with invalid hashed_key", zap.Int("index", i))
+                }</span>
+        }
+
+        <span class="cov0" title="0">v.cacheMutex.Lock()
+        oldCacheSize := len(v.cache)
+        v.cache = newCache
+        v.lastUpdate = time.Now()
+        v.cacheMutex.Unlock()
+
+        duration := time.Since(start)
+        logger.Info("Cache update completed",
+                zap.Int("old_cache_size", oldCacheSize),
+                zap.Int("new_cache_size", len(newCache)),
+                zap.Int("valid_keys", validKeys),
+                zap.Int("skipped_entries", skippedEntries),
+                zap.Duration("duration", duration),
+                zap.String("contract_address", v.config.ContractAddress))
+
+        return nil</span>
+}
+
+// getResponseKeys extracts the keys from a response map for debugging
+func getResponseKeys(response map[string]any) []string <span class="cov1" title="1">{
+        keys := make([]string, 0, len(response))
+        for k := range response </span><span class="cov5" title="3">{
+                keys = append(keys, k)
+        }</span>
+        <span class="cov1" title="1">return keys</span>
+}
+
+// getDefaultPermit returns the default permit configuration
+func getDefaultPermit() map[string]any <span class="cov1" title="1">{
+        return map[string]any{
+                "params": map[string]any{
+                        "permit_name":    "api_keys_permit",
+                        "allowed_tokens": []any{"secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr"},
+                        "chain_id":       "pulsar-3",
+                        "permissions":    []any{},
+                },
+                "signature": map[string]any{
+                        "pub_key": map[string]any{
+                                "type":  "tendermint/PubKeySecp256k1",
+                                "value": "Aur9D8RLqYMf3sBTiXdhH8mMI9bPHisdDa9y9jwW9RyT",
+                        },
+                        "signature": "OLvqQxg0KxAb2fWz+O4pSZK3m0EsLKHp+gSQXmM0NxpDZs0BBBWltGLbqzA8jdiXr/JTpG27a4TiwDIEA8nZ8g==",
+                },
+        }
+}</span>
+
+// readPermitFromFile reads the permit from a JSON file
+func readPermitFromFile(filePath string) (map[string]any, error) <span class="cov5" title="3">{
+        logger := caddy.Log()
+        logger.Debug("Reading permit file", zap.String("file", filePath))
+        
+        file, err := os.Open(filePath)
+        if err != nil </span><span class="cov1" title="1">{
+                logger.Error("Failed to open permit file",
+                        zap.String("file", filePath),
+                        zap.Error(err))
+                return nil, fmt.Errorf("failed to open permit file: %w", err)
+        }</span>
+        <span class="cov3" title="2">defer file.Close()
+
+        var permit map[string]any
+        if err := json.NewDecoder(file).Decode(&amp;permit); err != nil </span><span class="cov1" title="1">{
+                logger.Error("Failed to decode permit file",
+                        zap.String("file", filePath),
+                        zap.Error(err))
+                return nil, fmt.Errorf("failed to decode permit file: %w", err)
+        }</span>
+
+        <span class="cov1" title="1">logger.Debug("Permit file loaded successfully",
+                zap.String("file", filePath),
+                zap.Int("keys_count", len(permit)))
+        return permit, nil</span>
+}
+
+// parseCaddyfile is the entry point for Caddyfile parsing of this middleware.
+// This function is registered with Caddy's directive system and is called
+// when the "secret_reverse_proxy" directive is encountered in a Caddyfile.
+//
+// Parameters:
+//   - h: Helper containing the Caddyfile dispenser and parsing utilities
+//
+// Returns:
+//   - caddyhttp.MiddlewareHandler: Configured middleware instance
+//   - error: nil on success, error if parsing fails
+//
+// Note: This function creates a new Middleware instance and delegates
+//       the actual parsing to UnmarshalCaddyfile.
+func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) <span class="cov0" title="0">{
+        // Create new middleware instance
+        var m Middleware
+        
+        // Parse configuration using the Caddyfile dispenser
+        err := m.UnmarshalCaddyfile(h.Dispenser)
+        
+        // Return configured middleware (or error if parsing failed)
+        return m, err
+}</span>
+
+// Interface guards
+var (
+        _ caddy.Module                = (*Middleware)(nil)
+        _ caddy.Provisioner           = (*Middleware)(nil)
+        _ caddy.Validator             = (*Middleware)(nil)
+        _ caddyhttp.MiddlewareHandler = (*Middleware)(nil)
+        _ caddyfile.Unmarshaler       = (*Middleware)(nil)
+)
+</pre>
+		
+		<pre class="file" id="file2" style="display: none">package secret_reverse_proxy
+
+import (
+        "crypto/sha256"
+        "encoding/hex"
+        "fmt"
+        "strings"
+        "sync"
+        "time"
+)
+
+// ContractQuerier interface for dependency injection in tests
+type ContractQuerier interface {
+        QueryContract(contractAddress string, query map[string]any) (map[string]any, error)
+}
+
+// TestableAPIKeyValidator is a version of APIKeyValidator that accepts a ContractQuerier
+type TestableAPIKeyValidator struct {
+        config         *Config
+        cache          map[string]bool
+        cacheMutex     sync.RWMutex
+        lastUpdate     time.Time
+        contractQuery  ContractQuerier
+}
+
+// NewTestableAPIKeyValidator creates a new testable validator with dependency injection
+func NewTestableAPIKeyValidator(config *Config, querier ContractQuerier) *TestableAPIKeyValidator <span class="cov0" title="0">{
+        return &amp;TestableAPIKeyValidator{
+                config:        config,
+                cache:         make(map[string]bool),
+                contractQuery: querier,
+        }
+}</span>
+
+// ValidateAPIKey performs API key validation using the injected contract querier
+func (v *TestableAPIKeyValidator) ValidateAPIKey(apiKey string) (bool, error) <span class="cov0" title="0">{
+        // Validate input
+        if strings.TrimSpace(apiKey) == "" </span><span class="cov0" title="0">{
+                return false, fmt.Errorf("empty API key")
+        }</span>
+        
+        // Check against configured master key
+        <span class="cov0" title="0">if v.config.APIKey != "" &amp;&amp; apiKey == v.config.APIKey </span><span class="cov0" title="0">{
+                return true, nil
+        }</span>
+
+        // Check against the master keys file
+        <span class="cov0" title="0">isMasterKey, err := v.checkMasterKeys(apiKey)
+        if err != nil </span><span class="cov0" title="0">{
+                return false, fmt.Errorf("master key check failed: %w", err)
+        }</span>
+        <span class="cov0" title="0">if isMasterKey </span><span class="cov0" title="0">{
+                return true, nil
+        }</span>
+
+        // Hash the API key for cache lookup
+        <span class="cov0" title="0">hasher := sha256.New()
+        hasher.Write([]byte(apiKey))
+        apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
+
+        // Check cache
+        v.cacheMutex.RLock()
+        cached, found := v.cache[apiKeyHash]
+        isStale := time.Since(v.lastUpdate) &gt; v.config.CacheTTL
+        v.cacheMutex.RUnlock()
+
+        if found &amp;&amp; !isStale </span><span class="cov0" title="0">{
+                return cached, nil
+        }</span>
+
+        // Update cache from contract
+        <span class="cov0" title="0">if err := v.updateAPIKeyCache(); err != nil </span><span class="cov0" title="0">{
+                return false, fmt.Errorf("cache update failed: %w", err)
+        }</span>
+
+        // Check cache again after update
+        <span class="cov0" title="0">v.cacheMutex.RLock()
+        defer v.cacheMutex.RUnlock()
+        return v.cache[apiKeyHash], nil</span>
+}
+
+// checkMasterKeys checks if the provided API key exists in the master keys file
+func (v *TestableAPIKeyValidator) checkMasterKeys(apiKey string) (bool, error) <span class="cov0" title="0">{
+        // Use the same logic as the original validator
+        validator := &amp;APIKeyValidator{config: v.config}
+        return validator.checkMasterKeys(apiKey)
+}</span>
+
+// updateAPIKeyCache queries the contract and updates the in-memory cache
+func (v *TestableAPIKeyValidator) updateAPIKeyCache() error <span class="cov0" title="0">{
+        // Load permit from file or use default
+        var permit map[string]any
+        var err error
+        
+        if v.config.PermitFile != "" </span><span class="cov0" title="0">{
+                permit, err = readPermitFromFile(v.config.PermitFile)
+                if err != nil </span><span class="cov0" title="0">{
+                        return fmt.Errorf("failed to read permit file: %w", err)
+                }</span>
+        } else<span class="cov0" title="0"> {
+                // Use default permit if no file specified
+                permit = getDefaultPermit()
+        }</span>
+
+        <span class="cov0" title="0">query := map[string]any{
+                "api_keys_with_permit": map[string]any{
+                        "permit": permit,
+                },
+        }
+
+        result, err := v.contractQuery.QueryContract(v.config.ContractAddress, query)
+        if err != nil </span><span class="cov0" title="0">{
+                return fmt.Errorf("contract query failed: %w", err)
+        }</span>
+
+        <span class="cov0" title="0">apiKeys, ok := result["api_keys"].([]any)
+        if !ok </span><span class="cov0" title="0">{
+                return fmt.Errorf("unexpected response format: api_keys not found")
+        }</span>
+
+        <span class="cov0" title="0">newCache := make(map[string]bool)
+        for _, entry := range apiKeys </span><span class="cov0" title="0">{
+                entryMap, ok := entry.(map[string]any)
+                if !ok </span><span class="cov0" title="0">{
+                        continue</span>
+                }
+                <span class="cov0" title="0">hashedKey, ok := entryMap["hashed_key"].(string)
+                if ok &amp;&amp; hashedKey != "" </span><span class="cov0" title="0">{
+                        newCache[hashedKey] = true
+                }</span>
+        }
+
+        <span class="cov0" title="0">v.cacheMutex.Lock()
+        defer v.cacheMutex.Unlock()
+        v.cache = newCache
+        v.lastUpdate = time.Now()
+
+        return nil</span>
+}</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>

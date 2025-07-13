@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  echo-server:
+    image: ealen/echo-server
+    container_name: echo-server
+    # ports:
+    #   - "3000:80" # Optional for debug access
+    networks:
+      - testnet
+
+  caddy:
+    image: secret-reverse-proxy:latest
+    container_name: caddy-reverse-proxy
+    ports:
+      - "8085:80" # External access point
+    environment:
+      - SECRET_API_MASTER_KEY=bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1
+    volumes:
+      - ./Caddyfile-test:/etc/caddy/Caddyfile
+      - ./config:/config/caddy
+      - ./data:/data/caddy
+    networks:
+      - testnet
+    depends_on:
+      - echo-server
+
+networks:
+  testnet:
+    driver: bridge

@@ -1,0 +1,71 @@
+{
+	debug
+	order secret_reverse_proxy first
+	log {
+		output stdout
+		format console
+		level DEBUG
+	}
+}
+
+:80 {
+	# CORS preflight handler
+	@cors_preflight method OPTIONS
+	handle @cors_preflight {
+		@has_origin header Origin *
+		header @has_origin {
+			Access-Control-Allow-Origin {header.origin}
+			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Max-Age "86400"
+			Vary "Origin"
+		}
+		# header !@has_origin {
+		# 	Access-Control-Allow-Origin "*"
+		# 	Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+		# 	Access-Control-Allow-Headers "*"
+		# 	Access-Control-Max-Age "86400"
+		# 	Vary "Origin"
+		# }
+		respond "" 204
+	}
+
+	# Main request handler
+	handle {
+		@has_origin header Origin *
+		header @has_origin {
+			Access-Control-Allow-Origin {header.origin}
+			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Expose-Headers "*"
+			Vary "Origin"
+		}
+		# header !@has_origin {
+		# 	Access-Control-Allow-Origin "*"
+		# 	Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+		# 	Access-Control-Allow-Headers "*"
+		# 	Access-Control-Expose-Headers "*"
+		# 	Vary "Origin"
+		# }
+
+		
+		# Use environment variable for API key
+		secret_reverse_proxy {
+			API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+		}
+		
+		reverse_proxy echo-server:80 {
+			health_uri /health
+			health_interval 30s
+			health_timeout 10s
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Port {server_port}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+}

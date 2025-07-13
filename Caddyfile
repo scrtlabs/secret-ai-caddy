@@ -1,0 +1,93 @@
+{
+	debug
+	order secret_reverse_proxy first
+	log {
+		output stdout
+		format console
+		level DEBUG
+	}
+}
+
+# HTTP to HTTPS redirect
+secretai-fetch-morai.scrtlabs.com:80 {
+	redir https://secretai-fetch-morai.scrtlabs.com:23434{uri} permanent
+}
+
+# Main HTTPS site configuration
+secretai-fetch-morai.scrtlabs.com:23434 {
+	# TLS configuration using provided certificates
+	tls /etc/ssl/certs/secret_vm_fullchain.pem /etc/ssl/private/secret_vm_private.pem
+
+	# CORS preflight handler
+	@cors_preflight method OPTIONS
+	handle @cors_preflight {
+		@has_origin header Origin *
+		header @has_origin {
+			Access-Control-Allow-Origin {header.origin}
+			Access-Control-Allow-Credentials "true"
+		}
+		header !@has_origin {
+			Access-Control-Allow-Origin "*"
+		}
+		header {
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Max-Age "86400"
+			Vary "Origin"
+		}
+		respond "" 204
+	}
+
+	# Main request handler
+	handle {
+		@has_origin header Origin *
+		header @has_origin {
+			Access-Control-Allow-Origin {header.origin}
+			Access-Control-Allow-Credentials "true"
+		}
+		header !@has_origin {
+			Access-Control-Allow-Origin "*"
+		}
+		header {
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Expose-Headers "*"
+			Vary "Origin"
+		}
+		
+		# Use environment variable for API key
+		secret_reverse_proxy {
+			API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+		}
+		
+		reverse_proxy auth-gateway:8090 {
+			health_uri /health
+			health_interval 30s
+			health_timeout 10s
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Port {server_port}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	# Security headers
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		X-XSS-Protection "1; mode=block"
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	# Error handling
+	handle_errors {
+		@502 expression {http.error.status_code} == 502
+		@503 expression {http.error.status_code} == 503
+		@504 expression {http.error.status_code} == 504
+		respond @502 "Service temporarily unavailable - auth-gateway not ready" 502
+		respond @503 "Service temporarily unavailable - please try again" 503
+		respond @504 "Service timeout - request took too long" 504
+	}
+}
