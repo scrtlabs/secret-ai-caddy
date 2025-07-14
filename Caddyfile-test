@@ -54,6 +54,11 @@
 		# Use environment variable for API key
 		secret_reverse_proxy {
 			API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+			master_keys_file ./keys.txt
+    		contract_address secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr
+    		permit_file ./permit.json
+			metering_interval 15m
+    		metering_contract secret1xyz...abc
 		}
 		
 		reverse_proxy echo-server:80 {

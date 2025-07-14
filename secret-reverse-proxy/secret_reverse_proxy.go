@@ -60,6 +60,9 @@ type Config struct {
 	// CacheTTL defines how long cached API key validation results remain valid.
 	// After this duration, the cache will be refreshed from the smart contract.
 	CacheTTL time.Duration `json:"cache_ttl,omitempty"`
+
+	MeteringInterval time.Duration `json:"metering_interval,omitempty"` // e.g., "5m", "1h"
+	MeteringContract string        `json:"metering_contract,omitempty"` // smart contract for usage reports
 }
 
 // defaultConfig returns a Config struct populated with sensible default values.
@@ -82,6 +85,10 @@ func defaultConfig() *Config {
 		
 		// Default cache TTL - 30 minutes provides good balance between performance and security
 		CacheTTL: 30 * time.Minute,
+
+		// Default metering contract - hardcoded for now
+		MeteringContract: "secret1x6w0mzpxlwwl9j8v3r6x6r65s7wqcz3ej74n2z",
+		MeteringInterval: 10 * time.Minute,
 	}
 }
 
@@ -154,6 +161,8 @@ type Middleware struct {
 	// validator performs the actual API key validation logic
 	// Initialized during the Provision phase
 	validator *APIKeyValidator
+
+	accumulator *TokenAccumulator
 }
 
 // CaddyModule returns the module information required by Caddy's module system.
@@ -202,7 +211,14 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	if m.validator == nil {
 		return fmt.Errorf("failed to create API key validator")
 	}
-	
+
+	// BLOCK 3: Token Metering
+	// Create the token accumulator
+	if m.accumulator == nil {
+		m.accumulator = NewTokenAccumulator()
+	}
+	m.StartTokenReportingLoop(m.Config.MeteringInterval)
+
 	// BLOCK 3: Configuration Logging
 	// Log configuration details for debugging (excluding sensitive data)
 	logger.Info("Secret reverse proxy middleware provisioned",
@@ -211,7 +227,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		zap.String("master_keys_file", m.Config.MasterKeysFile),
 		zap.Bool("master_key_configured", m.Config.APIKey != ""),
 		zap.Bool("permit_file_configured", m.Config.PermitFile != ""))
-	
+
 	return nil
 }
 
@@ -357,8 +373,29 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 	// BLOCK 6: Request Forwarding
 	// Authentication successful - forward request to next handler in chain
-	logger.Debug("API key validation successful, forwarding request")
-	return next.ServeHTTP(w, r)
+	// logger.Debug("API key validation successful, forwarding request")
+	// return next.ServeHTTP(w, r)
+
+	wrappedWriter := NewTokenMeteringResponseWriter(w)
+	err = next.ServeHTTP(wrappedWriter, r)
+	if err != nil {
+		return err
+	}
+
+	// Re-read request body (see below)
+	requestBody := readRequestBody(r)
+	inputTokens := CountTokensHeuristic(requestBody)
+
+	// Count response tokens
+	responseBody := wrappedWriter.Body()
+	outputTokens := CountTokensHeuristic(string(responseBody))
+
+	// Hash and record usage
+	apiKeyHash := sha256.Sum256([]byte(apiKey))
+	hashHex := hex.EncodeToString(apiKeyHash[:])
+	m.accumulator.RecordUsage(hashHex, inputTokens, outputTokens)
+
+	return nil
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler and parses Caddyfile configuration.
@@ -400,6 +437,21 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		for d.NextBlock(0) {
 			// Parse individual configuration directives
 			switch d.Val() {
+				case "metering_interval":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					intervalStr := d.Val()
+					interval, err := time.ParseDuration(intervalStr)
+					if err != nil {
+						return d.Errf("invalid metering_interval: %v", err)
+					}
+					m.Config.MeteringInterval = interval
+
+				case "metering_contract":
+					if !d.Args(&m.Config.MeteringContract) {
+						return d.ArgErr()
+					}
 				case "API_MASTER_KEY":
 					// Primary master key configuration
 					logger.Info("Processing API_MASTER_KEY directive")
@@ -444,7 +496,10 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		zap.String("api_key", m.Config.APIKey),
 		zap.String("master_keys_file", m.Config.MasterKeysFile),
 		zap.String("permit_file", m.Config.PermitFile),
-		zap.String("contract_address", m.Config.ContractAddress))
+		zap.String("contract_address", m.Config.ContractAddress),
+		zap.Duration("metering_interval", m.Config.MeteringInterval),
+		zap.String("metering_contract", m.Config.MeteringContract),
+	)
 	return nil
 }
 

@@ -25,11 +25,13 @@ secretai-fetch-morai.scrtlabs.com:23434 {
 		header @has_origin {
 			Access-Control-Allow-Origin {header.origin}
 			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Max-Age "86400"
+			Vary "Origin"
 		}
 		header !@has_origin {
 			Access-Control-Allow-Origin "*"
-		}
-		header {
 			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
 			Access-Control-Allow-Headers "*"
 			Access-Control-Max-Age "86400"
@@ -44,11 +46,13 @@ secretai-fetch-morai.scrtlabs.com:23434 {
 		header @has_origin {
 			Access-Control-Allow-Origin {header.origin}
 			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Expose-Headers "*"
+			Vary "Origin"
 		}
 		header !@has_origin {
 			Access-Control-Allow-Origin "*"
-		}
-		header {
 			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
 			Access-Control-Allow-Headers "*"
 			Access-Control-Expose-Headers "*"
@@ -57,7 +61,7 @@ secretai-fetch-morai.scrtlabs.com:23434 {
 		
 		# Use environment variable for API key
 		secret_reverse_proxy {
-			API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+			API_MASTER_KEY bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1
 		}
 		
 		reverse_proxy auth-gateway:8090 {
