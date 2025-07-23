@@ -35,7 +35,7 @@ jobs:
         id: push
         run: |
           # Push latest first
-          docker push ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:latest
+          # docker push ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:latest
           # Tag with version and push
           docker tag ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:latest ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:${{ steps.get_version.outputs.VERSION }}
           docker push ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:${{ steps.get_version.outputs.VERSION }}
