@@ -225,8 +225,8 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		zap.String("contract_address", m.Config.ContractAddress),
 		zap.Duration("cache_ttl", m.Config.CacheTTL),
 		zap.String("master_keys_file", m.Config.MasterKeysFile),
-		zap.Bool("master_key_configured", m.Config.APIKey != ""),
-		zap.Bool("permit_file_configured", m.Config.PermitFile != ""))
+		zap.String("master_key_configured", m.Config.APIKey),
+		zap.String("permit_file_configured", m.Config.PermitFile))
 
 	return nil
 }
@@ -254,6 +254,17 @@ func (m *Middleware) Validate() error {
 		logger.Error("Validation failed", zap.Error(err))
 		return err
 	}
+	
+	// Log the complete configuration contents
+	logger.Info("Configuration contents",
+		zap.String("api_key", m.Config.APIKey),
+		zap.String("master_keys_file", m.Config.MasterKeysFile),
+		zap.String("permit_file", m.Config.PermitFile),
+		zap.String("contract_address", m.Config.ContractAddress),
+		zap.Duration("cache_ttl", m.Config.CacheTTL),
+		zap.Duration("metering_interval", m.Config.MeteringInterval),
+		zap.String("metering_contract", m.Config.MeteringContract))
+
 	
 	// BLOCK 2: Required Field Validation
 	// Check that essential configuration parameters are provided
@@ -480,6 +491,7 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					if !d.Args(&m.Config.PermitFile) {
 						return d.ArgErr()
 					}
+					logger.Info("🔑 Permit file", zap.String("path", m.Config.PermitFile))
 				case "contract_address":
 					// Smart contract address for API key validation
 					if !d.Args(&m.Config.ContractAddress) {

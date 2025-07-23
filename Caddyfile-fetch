@@ -1,6 +1,6 @@
 {
 	debug
-	order secret_reverse_proxy first
+	order claive_reverse_proxy first
 	log {
 		output stdout
 		format console
@@ -30,13 +30,6 @@ secretai-fetch-morai.scrtlabs.com:23434 {
 			Access-Control-Max-Age "86400"
 			Vary "Origin"
 		}
-		header !@has_origin {
-			Access-Control-Allow-Origin "*"
-			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-			Access-Control-Allow-Headers "*"
-			Access-Control-Max-Age "86400"
-			Vary "Origin"
-		}
 		respond "" 204
 	}
 
@@ -51,20 +44,12 @@ secretai-fetch-morai.scrtlabs.com:23434 {
 			Access-Control-Expose-Headers "*"
 			Vary "Origin"
 		}
-		header !@has_origin {
-			Access-Control-Allow-Origin "*"
-			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-			Access-Control-Allow-Headers "*"
-			Access-Control-Expose-Headers "*"
-			Vary "Origin"
-		}
-		
+
 		# Use environment variable for API key
-		secret_reverse_proxy {
+		claive_reverse_proxy {
 			API_MASTER_KEY bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1
-			permit_file /etc/caddy/xxxpermit.json
 		}
-		
+
 		reverse_proxy auth-gateway:8090 {
 			health_uri /health
 			health_interval 30s
@@ -75,15 +60,6 @@ secretai-fetch-morai.scrtlabs.com:23434 {
 			header_up X-Forwarded-Proto {scheme}
 			header_up X-Forwarded-For {remote_host}
 		}
-	}
-
-	# Security headers
-	header {
-		-Server
-		X-Content-Type-Options nosniff
-		X-Frame-Options SAMEORIGIN
-		X-XSS-Protection "1; mode=block"
-		Referrer-Policy strict-origin-when-cross-origin
 	}
 
 	# Error handling

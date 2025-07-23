@@ -15,9 +15,13 @@ services:
     ports:
       - "8085:80" # External access point
     environment:
+      - SKIP_SSL_VALIDATION=true
+      - SECRET_NODE=pulsar.lcd.secretnodes.com
       - SECRET_API_MASTER_KEY=bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1
     volumes:
       - ./Caddyfile-test:/etc/caddy/Caddyfile
+      - ./permit.json:/etc/caddy/permit.json
+      - ./master_keys.txt:/etc/caddy/master_keys.txt
       - ./config:/config/caddy
       - ./data:/data/caddy
     networks:

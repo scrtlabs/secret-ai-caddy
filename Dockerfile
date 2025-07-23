@@ -63,12 +63,6 @@ COPY --from=caddy-builder /tmp/build/caddy /usr/bin/caddy
 # Make sure Caddy is executable
 RUN chmod +x /usr/bin/caddy
 
-# Copy custom Caddyfile (if you have one)
-COPY Caddyfile /etc/caddy/Caddyfile
-
-# Set ownership of the Caddyfile
-RUN chown caddy:caddy /etc/caddy/Caddyfile
-
 # Switch to caddy user for security
 USER caddy
 

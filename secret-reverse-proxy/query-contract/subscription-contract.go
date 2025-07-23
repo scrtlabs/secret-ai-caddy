@@ -3,6 +3,7 @@ package querycontract
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -13,11 +14,32 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/miscreant/miscreant.go"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
+
+func getSecretNode() string {
+	if node := os.Getenv("SECRET_NODE"); node != "" {
+		return node
+	}
+	return "pulsar.lcd.secretnodes.com"
+}
+
+func getHTTPClient() *http.Client {
+	skipSSL := os.Getenv("SKIP_SSL_VALIDATION")
+	if strings.ToLower(skipSSL) == "true" {
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		return &http.Client{Transport: tr}
+	}
+	return http.DefaultClient
+}
 
 func Trace() string {
 	pc := make([]uintptr, 10) // at least 1 entry needed
@@ -109,7 +131,8 @@ func (w *WASMContext) getTxSenderKeyPair() ([]byte, []byte, error) {
 }
 
 func (w *WASMContext) getConsensusIOPubKey() ([]byte, error) {
-	resp, err := http.Get("https://pulsar.lcd.secretnodes.com/registration/v1beta1/tx-key")
+	client := getHTTPClient()
+	resp, err := client.Get(fmt.Sprintf("https://%s/registration/v1beta1/tx-key", getSecretNode()))
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("failed to fetch consensus IO public key: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to fetch consensus IO public key: %w", err)
 	}
@@ -201,11 +224,21 @@ func (w *WASMContext) Decrypt(ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
+// getMapKeys extracts keys from a map for logging purposes
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func fetchCodeHash(contractAddress string) (string, error) {
 	// API endpoint to get the code hash by contract address
-	url := fmt.Sprintf("https://pulsar.lcd.secretnodes.com/compute/v1beta1/code_hash/by_contract_address/%s", contractAddress)
+	url := fmt.Sprintf("https://%s/compute/v1beta1/code_hash/by_contract_address/%s", getSecretNode(), contractAddress)
 
-	resp, err := http.Get(url)
+	client := getHTTPClient()
+	resp, err := client.Get(url)
 	if err != nil {
 		return "", errors.New(fmt.Sprintf("failed to fetch code hash: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to fetch code hash: %w", err)
 	}
@@ -252,9 +285,10 @@ func QueryContract(contractAddress string, query map[string]interface{}) (map[st
 	}
 
 	encodedData := base64.URLEncoding.EncodeToString(encryptedData)
-	url := fmt.Sprintf("https://pulsar.lcd.secretnodes.com/compute/v1beta1/query/%s?query=%s", contractAddress, encodedData)
+	url := fmt.Sprintf("https://%s/compute/v1beta1/query/%s?query=%s", getSecretNode(), contractAddress, encodedData)
 
-	resp, err := http.Get(url)
+	client := getHTTPClient()
+	resp, err := client.Get(url)
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("failed to query contract: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to query contract: %w", err)
 	}
@@ -286,11 +320,17 @@ func QueryContract(contractAddress string, query map[string]interface{}) (map[st
 			return nil, errors.New(fmt.Sprintf("failed to decode decrypted data: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to decode decrypted data: %w", err)
 		}
 
-		fmt.Printf("Query result: %s\n", string(decodedData))
-
 		var result map[string]interface{}
 		if err := json.Unmarshal(decodedData, &result); err != nil {
 			return nil, errors.New(fmt.Sprintf("failed to parse decrypted data: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to parse decrypted data: %w", err)
+		}
+
+		// Log count of entries instead of full JSON
+		logger := caddy.Log()
+		if apiKeys, ok := result["api_keys"].([]interface{}); ok {
+			logger.Info("Query result: Retrieved API key entries", zap.Int("count", len(apiKeys)))
+		} else {
+			logger.Info("Query result: Response received", zap.Strings("structure_keys", getMapKeys(result)))
 		}
 
 		return result, nil
