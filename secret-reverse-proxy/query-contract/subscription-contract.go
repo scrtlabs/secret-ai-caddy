@@ -234,8 +234,10 @@ func getMapKeys(m map[string]interface{}) []string {
 }
 
 func fetchCodeHash(contractAddress string) (string, error) {
+	logger := caddy.Log()
 	// API endpoint to get the code hash by contract address
 	url := fmt.Sprintf("https://%s/compute/v1beta1/code_hash/by_contract_address/%s", getSecretNode(), contractAddress)
+	logger.Info("fetchCodeHash", zap.String("url", url))
 
 	client := getHTTPClient()
 	resp, err := client.Get(url)
@@ -261,6 +263,7 @@ func fetchCodeHash(contractAddress string) (string, error) {
 }
 
 func QueryContract(contractAddress string, query map[string]interface{}) (map[string]interface{}, error) {
+	logger := caddy.Log()
 	// Fetch the code hash dynamically
 	codeHash, err := fetchCodeHash(contractAddress)
 	if err != nil {
@@ -286,7 +289,7 @@ func QueryContract(contractAddress string, query map[string]interface{}) (map[st
 
 	encodedData := base64.URLEncoding.EncodeToString(encryptedData)
 	url := fmt.Sprintf("https://%s/compute/v1beta1/query/%s?query=%s", getSecretNode(), contractAddress, encodedData)
-
+	logger.Info("QueryContract", zap.String("url", url))
 	client := getHTTPClient()
 	resp, err := client.Get(url)
 	if err != nil {

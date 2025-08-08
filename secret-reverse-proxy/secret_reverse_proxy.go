@@ -78,16 +78,16 @@ type Config struct {
 func defaultConfig() *Config {
 	return &Config{
 		// Default master keys file location - should contain one API key per line
-		MasterKeysFile: "master_keys.txt",
+		MasterKeysFile: "",
 		
 		// Default Secret Network contract address for API key validation
-		ContractAddress: "secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr",
+		ContractAddress: "",
 		
 		// Default cache TTL - 30 minutes provides good balance between performance and security
 		CacheTTL: 30 * time.Minute,
 
 		// Default metering contract - hardcoded for now
-		MeteringContract: "secret1x6w0mzpxlwwl9j8v3r6x6r65s7wqcz3ej74n2z",
+		MeteringContract: "",
 		MeteringInterval: 10 * time.Minute,
 	}
 }
@@ -201,8 +201,9 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	// BLOCK 1: Configuration Setup
 	// Ensure we have a valid configuration, using defaults if none provided
 	if m.Config == nil {
-		m.Config = defaultConfig()
-		logger.Debug("Using default configuration")
+		logger.Error("🔴 Nil configuration")
+		// raise an error if no configuration is provided
+		return fmt.Errorf("nil configuration")
 	}
 	
 	// BLOCK 2: Validator Initialization
@@ -219,7 +220,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	}
 	m.StartTokenReportingLoop(m.Config.MeteringInterval)
 
-	// BLOCK 3: Configuration Logging
+	// BLOCK 4: Configuration Logging
 	// Log configuration details for debugging (excluding sensitive data)
 	logger.Info("Secret reverse proxy middleware provisioned",
 		zap.String("contract_address", m.Config.ContractAddress),
@@ -437,6 +438,7 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// Ensure we have a config object to populate
 	if m.Config == nil {
 		m.Config = defaultConfig()
+		logger.Debug("Using default configuration")
 	}
 	
 	logger.Info("UnmarshalCaddyfile called - parsing secret_reverse_proxy configuration")
@@ -486,18 +488,21 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					if !d.Args(&m.Config.MasterKeysFile) {
 						return d.ArgErr()
 					}
+					logger.Info("🔑 Master keys file path", zap.String("master keys file path", m.Config.MasterKeysFile))
 				case "permit_file":
 					// Secret Network permit file path
 					if !d.Args(&m.Config.PermitFile) {
 						return d.ArgErr()
 					}
-					logger.Info("🔑 Permit file", zap.String("path", m.Config.PermitFile))
+					logger.Info("🔑 Permit file", zap.String("permit file path", m.Config.PermitFile))
 				case "contract_address":
 					// Smart contract address for API key validation
 					if !d.Args(&m.Config.ContractAddress) {
 						return d.ArgErr()
 					}
+					logger.Info("🔑 Contract address", zap.String("contract address", m.Config.ContractAddress))
 				default:
+					logger.Error("🔴 Unmarshal Caddyfile", zap.String("unknown subdirective", d.Val()))
 					// Unknown directive - return error
 					return d.Errf("unknown subdirective: %s", d.Val())
 			}
