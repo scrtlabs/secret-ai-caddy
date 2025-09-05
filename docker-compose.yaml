@@ -16,8 +16,13 @@ services:
       - "8085:80" # External access point
     environment:
       - SKIP_SSL_VALIDATION=true
-      - SECRET_NODE=pulsar.lcd.secretnodes.com
+      - SECRET_NODE=lcd.secret.tactus.starshell.net
+      - SECRET_CHAIN_ID=secret-4
+      - SECRET_CONTRACT=secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm
       - SECRET_API_MASTER_KEY=bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1
+      - METERING=1
+      - METERING_INTERVAL=1m
+      - METERING_URL=https://preview-aidev.scrtlabs.com
     volumes:
       - ./Caddyfile-test:/etc/caddy/Caddyfile
       - ./permit.json:/etc/caddy/permit.json

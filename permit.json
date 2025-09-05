@@ -2,9 +2,9 @@
     "params": {
         "permit_name": "api_keys_permit",
         "allowed_tokens": [
-            "secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr"
+            "secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm"
         ],
-        "chain_id": "pulsar-3",
+        "chain_id": "secret-4",
         "permissions": []
     },
     "signature": {
@@ -12,6 +12,6 @@
             "type": "tendermint/PubKeySecp256k1",
             "value": "Aur9D8RLqYMf3sBTiXdhH8mMI9bPHisdDa9y9jwW9RyT"
         },
-        "signature": "OLvqQxg0KxAb2fWz+O4pSZK3m0EsLKHp+gSQXmM0NxpDZs0BBBWltGLbqzA8jdiXr/JTpG27a4TiwDIEA8nZ8g=="
+        "signature": "TeNtblPmooqErLX3ECMKfAYJdVB5/BTULW00CGX5nDZ1iuvHUPY+fetdBCQ8NfmyPARzcH5QRkmC2hQG8+fJJw=="
     }
 }

@@ -99,7 +99,7 @@ func (v *TestableAPIKeyValidator) updateAPIKeyCache() error {
 		}
 	} else {
 		// Use default permit if no file specified
-		permit = getDefaultPermit()
+		permit = getDefaultPermit(v.config)
 	}
 
 	query := map[string]any{

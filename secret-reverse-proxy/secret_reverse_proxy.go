@@ -57,12 +57,17 @@ type Config struct {
 	// This contract is queried to refresh the cache of valid hashed API keys.
 	ContractAddress string `json:"contract_address,omitempty"`
 	
+	SecretNode string `json:"secret_node,omitempty"`
+
+	SecretChainID string `json:"secret_chain_id,omitempty"`
+
 	// CacheTTL defines how long cached API key validation results remain valid.
 	// After this duration, the cache will be refreshed from the smart contract.
 	CacheTTL time.Duration `json:"cache_ttl,omitempty"`
 
 	MeteringInterval time.Duration `json:"metering_interval,omitempty"` // e.g., "5m", "1h"
-	MeteringContract string        `json:"metering_contract,omitempty"` // smart contract for usage reports
+	Metering bool        `json:"metering,omitempty"` // metering if enabled
+	MeteringURL string    `json:"metering_url,omitempty"` // metering URL
 }
 
 // defaultConfig returns a Config struct populated with sensible default values.
@@ -82,12 +87,16 @@ func defaultConfig() *Config {
 		
 		// Default Secret Network contract address for API key validation
 		ContractAddress: "",
+
+		SecretNode: "",
+
+		SecretChainID: "",
 		
 		// Default cache TTL - 30 minutes provides good balance between performance and security
 		CacheTTL: 30 * time.Minute,
 
 		// Default metering contract - hardcoded for now
-		MeteringContract: "",
+		Metering: false,
 		MeteringInterval: 10 * time.Minute,
 	}
 }
@@ -163,6 +172,12 @@ type Middleware struct {
 	validator *APIKeyValidator
 
 	accumulator *TokenAccumulator
+	
+	// quitChan is used to signal the background token reporting goroutine to stop
+	quitChan chan struct{}
+	
+	// meteringRunning tracks whether the token reporting goroutine is active
+	meteringRunning bool
 }
 
 // CaddyModule returns the module information required by Caddy's module system.
@@ -218,16 +233,26 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	if m.accumulator == nil {
 		m.accumulator = NewTokenAccumulator()
 	}
-	m.StartTokenReportingLoop(m.Config.MeteringInterval)
-
+	// Initialize quit channel for background goroutine management
+	m.quitChan = make(chan struct{})
+	if m.Config.Metering {
+		logger.Info("⚖️  Starting Metering...")
+		m.StartTokenReportingLoop(m.Config.MeteringInterval)
+		m.meteringRunning = true
+	}
 	// BLOCK 4: Configuration Logging
 	// Log configuration details for debugging (excluding sensitive data)
 	logger.Info("Secret reverse proxy middleware provisioned",
+		zap.String("secret_node", m.Config.SecretNode),
+		zap.String("secret_chain_id", m.Config.SecretChainID),
 		zap.String("contract_address", m.Config.ContractAddress),
 		zap.Duration("cache_ttl", m.Config.CacheTTL),
 		zap.String("master_keys_file", m.Config.MasterKeysFile),
 		zap.String("master_key_configured", m.Config.APIKey),
-		zap.String("permit_file_configured", m.Config.PermitFile))
+		zap.String("permit_file_configured", m.Config.PermitFile),
+		zap.Bool("metering", m.Config.Metering),
+		zap.Duration("metering_interval", m.Config.MeteringInterval),
+		zap.String("metering_url", m.Config.MeteringURL))
 
 	return nil
 }
@@ -261,14 +286,31 @@ func (m *Middleware) Validate() error {
 		zap.String("api_key", m.Config.APIKey),
 		zap.String("master_keys_file", m.Config.MasterKeysFile),
 		zap.String("permit_file", m.Config.PermitFile),
+		zap.String("secret_node", m.Config.SecretNode),
+		zap.String("secret_chain_id", m.Config.SecretChainID),
 		zap.String("contract_address", m.Config.ContractAddress),
+		zap.String("secret_node", m.Config.SecretNode),
 		zap.Duration("cache_ttl", m.Config.CacheTTL),
+		zap.Bool("metering", m.Config.Metering),
 		zap.Duration("metering_interval", m.Config.MeteringInterval),
-		zap.String("metering_contract", m.Config.MeteringContract))
+		zap.String("metering_url", m.Config.MeteringURL))
 
 	
 	// BLOCK 2: Required Field Validation
 	// Check that essential configuration parameters are provided
+
+	if m.Config.SecretNode == "" {
+		err := fmt.Errorf("secret node is required")
+		logger.Error("Validation failed", zap.Error(err))
+		return err
+	}
+
+	if m.Config.SecretChainID == "" {
+		err := fmt.Errorf("secret chain id is required")
+		logger.Error("Validation failed", zap.Error(err))
+		return err
+	}
+
 	if m.Config.ContractAddress == "" {
 		err := fmt.Errorf("contract address is required")
 		logger.Error("Validation failed", zap.Error(err))
@@ -299,7 +341,21 @@ func (m *Middleware) Validate() error {
 		}
 	}
 	
-	logger.Debug("Configuration validation successful")
+	if m.Config.Metering {
+		if m.Config.MeteringURL == "" {
+			err := fmt.Errorf("metering URL is required")
+			logger.Error("Validation failed", zap.Error(err))
+			return err
+		}
+
+		if m.Config.MeteringInterval <= 0 {
+			err := fmt.Errorf("metering interval must be positive, got %v", m.Config.MeteringInterval)
+			logger.Error("Validation failed", zap.Error(err))
+			return err
+		}
+	}
+
+	logger.Info("✅ Configuration validation successful")
 	return nil
 }
 
@@ -388,15 +444,15 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// logger.Debug("API key validation successful, forwarding request")
 	// return next.ServeHTTP(w, r)
 
+	// Read request body BEFORE forwarding to downstream handlers
+	requestBody := readRequestBody(r)
+	inputTokens := CountTokensHeuristic(requestBody)
+
 	wrappedWriter := NewTokenMeteringResponseWriter(w)
 	err = next.ServeHTTP(wrappedWriter, r)
 	if err != nil {
 		return err
 	}
-
-	// Re-read request body (see below)
-	requestBody := readRequestBody(r)
-	inputTokens := CountTokensHeuristic(requestBody)
 
 	// Count response tokens
 	responseBody := wrappedWriter.Body()
@@ -454,17 +510,43 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					if !d.NextArg() {
 						return d.ArgErr()
 					}
-					intervalStr := d.Val()
-					interval, err := time.ParseDuration(intervalStr)
+					rawValue := d.Val()
+					expandedValue := expandEnvVars(rawValue)
+					interval, err := time.ParseDuration(expandedValue)
 					if err != nil {
 						return d.Errf("invalid metering_interval: %v", err)
 					}
 					m.Config.MeteringInterval = interval
+					logger.Info("⏰  Metering", zap.Int("Interval", int(m.Config.MeteringInterval)))
 
-				case "metering_contract":
-					if !d.Args(&m.Config.MeteringContract) {
+				case "metering":
+					if !d.NextArg() {
 						return d.ArgErr()
 					}
+					expandedValue := expandEnvVars(d.Val())
+					m.Config.Metering = map[string]bool{
+						"on": true, "true": true, "1": true,
+					}[strings.ToLower(strings.TrimSpace(expandedValue))]
+					logger.Info("⚖️  Metering", zap.Bool("ON/OFF", m.Config.Metering))
+
+				case "metering_url":
+					logger.Info("Processing metering_url directive")
+					
+					// Get the next token manually to handle environment variables
+					if !d.NextArg() {
+						logger.Error("🔴 metering_url directive missing argument")
+						return d.ArgErr()
+					}
+					
+					rawValue := d.Val()
+					logger.Info("Raw metering_url value:", zap.String("raw", rawValue))
+					
+					// Expand environment variables if present
+					expandedValue := expandEnvVars(rawValue)
+					m.Config.MeteringURL = expandedValue
+					
+					logger.Info("🔗 Metering URL configured successfully:", zap.String("metering_url", m.Config.MeteringURL))
+
 				case "API_MASTER_KEY":
 					// Primary master key configuration
 					logger.Info("Processing API_MASTER_KEY directive")
@@ -483,24 +565,100 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					m.Config.APIKey = expandedValue
 					
 					logger.Info("🔑 Primary master key configured successfully:", zap.String("API_MASTER_KEY", m.Config.APIKey))
+
 				case "master_keys_file":
 					// Additional master keys file path
-					if !d.Args(&m.Config.MasterKeysFile) {
+					logger.Info("Processing master_keys_file directive")
+					
+					// Get the next token manually to handle environment variables
+					if !d.NextArg() {
+						logger.Error("🔴 master_keys_file directive missing argument")
 						return d.ArgErr()
 					}
-					logger.Info("🔑 Master keys file path", zap.String("master keys file path", m.Config.MasterKeysFile))
+					
+					rawValue := d.Val()
+					logger.Info("Raw master_keys_file value:", zap.String("raw", rawValue))
+					
+					// Expand environment variables if present
+					expandedValue := expandEnvVars(rawValue)
+					m.Config.MasterKeysFile = expandedValue
+					
+					logger.Info("🔑 Master keys file path configured successfully:", zap.String("master_keys_file", m.Config.MasterKeysFile))
+
 				case "permit_file":
 					// Secret Network permit file path
-					if !d.Args(&m.Config.PermitFile) {
+					logger.Info("Processing permit_file directive")
+					
+					// Get the next token manually to handle environment variables
+					if !d.NextArg() {
+						logger.Error("🔴 permit_file directive missing argument")
 						return d.ArgErr()
 					}
-					logger.Info("🔑 Permit file", zap.String("permit file path", m.Config.PermitFile))
+					
+					rawValue := d.Val()
+					logger.Info("Raw permit_file value:", zap.String("raw", rawValue))
+					
+					// Expand environment variables if present
+					expandedValue := expandEnvVars(rawValue)
+					m.Config.PermitFile = expandedValue
+					
+					logger.Info("🔑 Permit file configured successfully:", zap.String("permit_file", m.Config.PermitFile))
+
 				case "contract_address":
 					// Smart contract address for API key validation
-					if !d.Args(&m.Config.ContractAddress) {
+					logger.Info("Processing contract_address directive")
+					
+					// Get the next token manually to handle environment variables
+					if !d.NextArg() {
+						logger.Error("🔴 contract_address directive missing argument")
 						return d.ArgErr()
 					}
-					logger.Info("🔑 Contract address", zap.String("contract address", m.Config.ContractAddress))
+					
+					rawValue := d.Val()
+					logger.Info("Raw contract_address value:", zap.String("raw", rawValue))
+					
+					// Expand environment variables if present
+					expandedValue := expandEnvVars(rawValue)
+					m.Config.ContractAddress = expandedValue
+					
+					logger.Info("🔑 Contract address configured successfully:", zap.String("contract_address", m.Config.ContractAddress))
+
+				case "secret_chain_id":
+					logger.Info("Processing secret_chain_id directive")
+					
+					// Get the next token manually to handle environment variables
+					if !d.NextArg() {
+						logger.Error("🔴 secret_chain_id directive missing argument")
+						return d.ArgErr()
+					}
+					
+					rawValue := d.Val()
+					logger.Info("Raw secret_chain_id value:", zap.String("raw", rawValue))
+					
+					// Expand environment variables if present
+					expandedValue := expandEnvVars(rawValue)
+					m.Config.SecretChainID = expandedValue
+					
+					logger.Info("🔗 Secret chain ID configured successfully:", zap.String("secret_chain_id", m.Config.SecretChainID))
+
+				case "secret_node":
+					logger.Info("Processing secret_node directive")
+					
+					// Get the next token manually to handle environment variables
+					if !d.NextArg() {
+						logger.Error("🔴 secret_node directive missing argument")
+						return d.ArgErr()
+					}
+					
+					rawValue := d.Val()
+					logger.Info("Raw secret_node value:", zap.String("raw", rawValue))
+					
+					// Expand environment variables if present
+					expandedValue := expandEnvVars(rawValue)
+					m.Config.SecretNode = expandedValue
+					
+					logger.Info("💻 Secret node configured successfully:", zap.String("secret_node", m.Config.SecretNode))
+
 				default:
 					logger.Error("🔴 Unmarshal Caddyfile", zap.String("unknown subdirective", d.Val()))
 					// Unknown directive - return error
@@ -514,8 +672,11 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		zap.String("master_keys_file", m.Config.MasterKeysFile),
 		zap.String("permit_file", m.Config.PermitFile),
 		zap.String("contract_address", m.Config.ContractAddress),
+		zap.String("secret_node", m.Config.SecretNode),
+		zap.String("secret_chain_id", m.Config.SecretChainID),
+		zap.Bool("metering", m.Config.Metering),
 		zap.Duration("metering_interval", m.Config.MeteringInterval),
-		zap.String("metering_contract", m.Config.MeteringContract),
+		zap.String("metering_url", m.Config.MeteringURL),
 	)
 	return nil
 }
@@ -774,7 +935,7 @@ func (v *APIKeyValidator) updateAPIKeyCache() error {
 	} else {
 		logger.Debug("Using default permit configuration")
 		// Use default permit if no file specified
-		permit = getDefaultPermit()
+		permit = getDefaultPermit(v.config)
 	}
 
 	query := map[string]any{
@@ -849,12 +1010,12 @@ func getResponseKeys(response map[string]any) []string {
 }
 
 // getDefaultPermit returns the default permit configuration
-func getDefaultPermit() map[string]any {
+func getDefaultPermit(config *Config) map[string]any {
 	return map[string]any{
 		"params": map[string]any{
 			"permit_name":    "api_keys_permit",
-			"allowed_tokens": []any{"secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr"},
-			"chain_id":       "pulsar-3",
+			"allowed_tokens": []any{config.ContractAddress},
+			"chain_id":       config.SecretChainID,
 			"permissions":    []any{},
 		},
 		"signature": map[string]any{
@@ -862,7 +1023,7 @@ func getDefaultPermit() map[string]any {
 				"type":  "tendermint/PubKeySecp256k1",
 				"value": "Aur9D8RLqYMf3sBTiXdhH8mMI9bPHisdDa9y9jwW9RyT",
 			},
-			"signature": "OLvqQxg0KxAb2fWz+O4pSZK3m0EsLKHp+gSQXmM0NxpDZs0BBBWltGLbqzA8jdiXr/JTpG27a4TiwDIEA8nZ8g==",
+		"signature": "TeNtblPmooqErLX3ECMKfAYJdVB5/BTULW00CGX5nDZ1iuvHUPY+fetdBCQ8NfmyPARzcH5QRkmC2hQG8+fJJw==",
 		},
 	}
 }
@@ -927,6 +1088,44 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return m, nil
 }
 
+// Cleanup implements caddy.CleanerUpper and is called by Caddy to clean up resources
+// when the module is being shut down or reloaded. This prevents memory leaks from
+// background goroutines and other allocated resources.
+//
+// Returns:
+//   - error: nil on successful cleanup, error if cleanup fails
+func (m *Middleware) Cleanup() error {
+	logger := caddy.Log()
+	logger.Debug("Cleaning up secret reverse proxy middleware")
+
+	// Stop any background token reporting goroutines
+	if m.meteringRunning && m.quitChan != nil {
+		logger.Debug("Stopping token reporting goroutine")
+		close(m.quitChan)
+		m.meteringRunning = false
+		logger.Debug("Token reporting goroutine stopped")
+	}
+
+	// Clean up validator resources (if any)
+	if m.validator != nil {
+		logger.Debug("Cleaning up validator cache")
+		m.validator.cacheMutex.Lock()
+		// Clear the cache to free memory
+		m.validator.cache = make(map[string]bool)
+		m.validator.cacheMutex.Unlock()
+	}
+
+	// Clean up accumulator resources
+	if m.accumulator != nil {
+		logger.Debug("Clearing token accumulator")
+		// Flush any remaining usage data before cleanup
+		m.accumulator.FlushUsage()
+	}
+
+	logger.Debug("Secret reverse proxy middleware cleanup completed")
+	return nil
+}
+
 // Interface guards
 var (
 	_ caddy.Module                = (*Middleware)(nil)
@@ -934,4 +1133,5 @@ var (
 	_ caddy.Validator             = (*Middleware)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Middleware)(nil)
 	_ caddyfile.Unmarshaler       = (*Middleware)(nil)
+	_ caddy.CleanerUpper          = (*Middleware)(nil)
 )

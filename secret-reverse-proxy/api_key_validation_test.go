@@ -194,7 +194,11 @@ func TestAPIKeyValidator_ValidateAPIKey_StaleCache(t *testing.T) {
 }
 
 func TestGetDefaultPermit(t *testing.T) {
-	permit := getDefaultPermit()
+	config := &Config{
+		ContractAddress: "secret1abc123",
+		SecretChainID:   "secret-4",
+	}
+	permit := getDefaultPermit(config)
 	
 	// Check structure
 	params, ok := permit["params"].(map[string]any)

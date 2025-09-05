@@ -27,7 +27,8 @@ func NewTokenAccumulator() *TokenAccumulator {
 func DefaultMeteringConfig() *EnhancedConfig {
 	baseConfig := &Config{
 		MeteringInterval: 10 * time.Minute,
-		MeteringContract: "secret1x6w0mzpxlwwl9j8v3r6x6r65s7wqcz3ej74n2z",
+		Metering: true,
+		MeteringURL: "https://preview-aidev.scrtlabs.com",
 		CacheTTL:         30 * time.Minute,
 	}
 	

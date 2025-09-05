@@ -1,11 +1,14 @@
 package metering
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 	
 	"github.com/caddyserver/caddy/v2"
@@ -90,17 +93,86 @@ func (rr *ResilientReporter) submitWithRetry(records []map[string]any, attempt i
 		return nil
 	}
 
-	payload := map[string]any{
-		"report_usage": map[string]any{
-			"records": records,
-		},
+	// Convert records to the expected format for the metering endpoint
+	usageData := make(map[string]map[string]any)
+	for _, record := range records {
+		if apiKeyHash, ok := record["api_key_hash"].(string); ok {
+			usageData[apiKeyHash] = map[string]any{
+				"input_tokens":  record["input_tokens"],
+				"output_tokens": record["output_tokens"],
+				"timestamp":     record["timestamp"],
+			}
+		}
 	}
 
-	rr.logger.Info("Reporting usage to log", 
-		zap.Int("record_count", len(records)),
-		zap.Any("payload", payload))
+	payload := map[string]any{
+		"usage_data": usageData,
+	}
 
-	rr.logger.Info("✅ Usage logged successfully", zap.Int("records", len(records)))
+	// Construct the full URL with the endpoint path
+	baseURL := strings.TrimRight(rr.config.MeteringURL, "/")
+	fullURL := baseURL + "/api/user/report-usage"
+
+	// Marshal the payload to JSON
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal usage payload: %w", err)
+	}
+
+	rr.logger.Info("📩  Sending POST request to metering endpoint",
+		zap.String("url", fullURL),
+		zap.String("payload", string(jsonData)),
+		zap.Int("attempt", attempt+1))
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", fullURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Caddy-Secret-Reverse-Proxy-Enhanced/1.0")
+
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	// Send the request
+	resp, err := client.Do(req)
+	if err != nil {
+		if attempt < rr.maxRetries-1 {
+			rr.logger.Warn("HTTP request failed, will retry", 
+				zap.Error(err), 
+				zap.Int("attempt", attempt+1),
+				zap.Int("max_retries", rr.maxRetries))
+			time.Sleep(rr.retryBackoff * time.Duration(attempt+1)) // Exponential backoff
+			return rr.submitWithRetry(records, attempt+1)
+		}
+		return fmt.Errorf("🔴  failed HTTP request %s after %d attempts: %w", fullURL, attempt+1, err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if attempt < rr.maxRetries-1 {
+			rr.logger.Warn("Metering endpoint returned non-2xx status, will retry", 
+				zap.Int("status_code", resp.StatusCode),
+				zap.String("status", resp.Status),
+				zap.Int("attempt", attempt+1))
+			time.Sleep(rr.retryBackoff * time.Duration(attempt+1)) // Exponential backoff
+			return rr.submitWithRetry(records, attempt+1)
+		}
+		return fmt.Errorf("🔴  metering endpoint returned non-2xx status after %d attempts: %d %s", 
+			attempt+1, resp.StatusCode, resp.Status)
+	}
+
+	rr.logger.Info("✅ Successfully reported usage to metering endpoint",
+		zap.String("url", fullURL),
+		zap.Int("status_code", resp.StatusCode),
+		zap.Int("records", len(records)))
+
 	return nil
 }
 

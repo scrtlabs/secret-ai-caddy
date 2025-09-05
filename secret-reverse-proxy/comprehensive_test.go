@@ -492,7 +492,11 @@ func TestServeHTTP_WithProperMocking(t *testing.T) {
 
 // TestDefaultPermitStructure tests the default permit structure
 func TestDefaultPermitStructure(t *testing.T) {
-	permit := getDefaultPermit()
+	config := &Config{
+		ContractAddress: "secret1test123",
+		SecretChainID:   "secret-4",
+	}
+	permit := getDefaultPermit(config)
 
 	// Test complete structure
 	if permit == nil {
