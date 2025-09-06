@@ -12,6 +12,9 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+
+	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
+	validators "github.com/scrtlabs/secret-reverse-proxy/validators"
 )
 
 // TestParseCaddyfileDirectly tests the parseCaddyfile function directly
@@ -67,10 +70,10 @@ func TestUpdateAPIKeyCache_PermitFileErrors(t *testing.T) {
 		PermitFile:      invalidPermitFile,
 	}
 
-	validator := NewAPIKeyValidator(config)
+	validator := apikeyval.NewAPIKeyValidator(config)
 
 	// Try to update cache with invalid permit file
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err == nil {
 		t.Error("Expected error with invalid permit file")
 	}
@@ -80,9 +83,9 @@ func TestUpdateAPIKeyCache_PermitFileErrors(t *testing.T) {
 
 	// Test with nonexistent permit file
 	config.PermitFile = "/nonexistent/file.json"
-	validator = NewAPIKeyValidator(config)
+	validator = validators.NewAPIKeyValidator(config)
 
-	err = validator.updateAPIKeyCache()
+	err = validator.UpdateAPIKeyCache()
 	if err == nil {
 		t.Error("Expected error with nonexistent permit file")
 	}
@@ -100,7 +103,7 @@ func TestServeHTTP_ValidationErrorPaths(t *testing.T) {
 
 	middleware := &Middleware{
 		Config:    config,
-		validator: NewAPIKeyValidator(config),
+		validator: apikeyval.NewAPIKeyValidator(config),
 	}
 
 	mockNext := &MockHandler{}
@@ -152,10 +155,10 @@ func TestCheckMasterKeys_ErrorConditions(t *testing.T) {
 		MasterKeysFile: tmpDir, // Directory, not file
 	}
 
-	validator := NewAPIKeyValidator(config)
+	validator := apikeyval.NewAPIKeyValidator(config)
 
 	// This should cause an error when trying to read the directory as a file
-	found, err := validator.checkMasterKeys("any-key")
+	found, err := validator.CheckMasterKeys("any-key")
 	if err == nil {
 		t.Error("Expected error when reading directory as file")
 	}

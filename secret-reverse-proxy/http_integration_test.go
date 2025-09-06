@@ -11,6 +11,10 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+
+	validators "github.com/scrtlabs/secret-reverse-proxy/validators"
+	utils "github.com/scrtlabs/secret-reverse-proxy/util"
+	mocktests "github.com/scrtlabs/secret-reverse-proxy/tests"
 )
 
 // MockHandler implements caddyhttp.Handler for testing
@@ -18,6 +22,12 @@ type MockHandler struct {
 	called bool
 	status int
 	body   string
+}
+
+var mockQueryContractFunc = mocktests.MockQueryContractFunc
+var queryContractFunc = func(contractAddress string, query map[string]any) (map[string]any, error) {
+	// This should be replaced by the actual querycontract.QueryContract in production
+	return nil, fmt.Errorf("mock function not initialized")
 }
 
 func (m *MockHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
@@ -41,7 +51,7 @@ func TestMiddleware_ServeHTTP_MissingAuthHeader(t *testing.T) {
 			CacheTTL:        time.Hour,
 		},
 	}
-	middleware.validator = NewAPIKeyValidator(middleware.Config)
+	middleware.validator = validators.NewAPIKeyValidator(middleware.Config)
 	
 	mockNext := &MockHandler{}
 	
@@ -74,7 +84,7 @@ func TestMiddleware_ServeHTTP_InvalidAuthHeader(t *testing.T) {
 			CacheTTL:        time.Hour,
 		},
 	}
-	middleware.validator = NewAPIKeyValidator(middleware.Config)
+	middleware.validator = validators.NewAPIKeyValidator(middleware.Config)
 	
 	mockNext := &MockHandler{}
 	
@@ -104,7 +114,7 @@ func TestMiddleware_ServeHTTP_ValidMasterKey(t *testing.T) {
 			CacheTTL:        time.Hour,
 		},
 	}
-	middleware.validator = NewAPIKeyValidator(middleware.Config)
+	middleware.validator = validators.NewAPIKeyValidator(middleware.Config)
 	
 	mockNext := &MockHandler{}
 	
@@ -158,10 +168,10 @@ func TestMiddleware_ServeHTTP_InvalidAPIKey(t *testing.T) {
 			CacheTTL:        time.Hour,
 		},
 	}
-	middleware.validator = NewAPIKeyValidator(middleware.Config)
+	middleware.validator = validators.NewAPIKeyValidator(middleware.Config)
 	
 	// Set up mock contract with no valid keys
-	setupMockContract(map[string]bool{})
+	mocktests.SetupMockContract(map[string]bool{})
 	
 	// Replace the contract query function for testing
 	originalQuery := queryContractFunc
@@ -200,10 +210,10 @@ func TestMiddleware_ServeHTTP_ValidationError(t *testing.T) {
 			CacheTTL:        time.Hour,
 		},
 	}
-	middleware.validator = NewAPIKeyValidator(middleware.Config)
+	middleware.validator = validators.NewAPIKeyValidator(middleware.Config)
 	
 	// Set up failing mock contract
-	setupFailingMockContract(fmt.Errorf("contract service unavailable"))
+	mocktests.SetupFailingMockContract(fmt.Errorf("contract service unavailable"))
 	
 	// Replace the contract query function for testing
 	originalQuery := queryContractFunc
@@ -237,8 +247,8 @@ func TestMiddleware_ServeHTTP_ValidationError(t *testing.T) {
 func TestMiddleware_ServeHTTP_MasterKeysFile(t *testing.T) {
 	// Create temp file with master keys
 	fileContent := "file-key-1\nfile-key-2\nfile-key-3\n"
-	tmpFile := createTempFile(t, fileContent)
-	defer cleanupTempFile(t, tmpFile)
+	tmpFile := utils.CreateTempFile(t, fileContent)
+	defer utils.CleanupTempFile(t, tmpFile)
 	
 	middleware := &Middleware{
 		Config: &Config{
@@ -247,7 +257,7 @@ func TestMiddleware_ServeHTTP_MasterKeysFile(t *testing.T) {
 			CacheTTL:        time.Hour,
 		},
 	}
-	middleware.validator = NewAPIKeyValidator(middleware.Config)
+	middleware.validator = validators.NewAPIKeyValidator(middleware.Config)
 	
 	mockNext := &MockHandler{}
 	
@@ -277,7 +287,7 @@ func TestMiddleware_ServeHTTP_RequestLogging(t *testing.T) {
 			CacheTTL:        time.Hour,
 		},
 	}
-	middleware.validator = NewAPIKeyValidator(middleware.Config)
+	middleware.validator = validators.NewAPIKeyValidator(middleware.Config)
 	
 	mockNext := &MockHandler{}
 	
@@ -328,7 +338,7 @@ func TestMiddleware_FullIntegration(t *testing.T) {
 	w := httptest.NewRecorder()
 	
 	// Set up mock contract for this test
-	setupMockContract(map[string]bool{})
+	mocktests.SetupMockContract(map[string]bool{})
 	originalQuery := queryContractFunc
 	queryContractFunc = mockQueryContractFunc
 	defer func() { queryContractFunc = originalQuery }()
@@ -402,7 +412,7 @@ func TestMiddleware_ErrorHandling(t *testing.T) {
 					ContractAddress: "test-contract",
 					CacheTTL:        time.Hour,
 				}
-				return NewAPIKeyValidator(config)
+				return validators.NewAPIKeyValidator(config)
 			},
 			authHeader:     "Bearer test-key",
 			expectedStatus: http.StatusInternalServerError,

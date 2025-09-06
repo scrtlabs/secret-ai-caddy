@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
+	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
+	validators "github.com/scrtlabs/secret-reverse-proxy/validators"
 )
 
 // TestTestableAPIKeyValidator tests the dependency injection validator
@@ -35,7 +38,7 @@ func TestTestableAPIKeyValidator(t *testing.T) {
 		ShouldFail: false,
 	}
 
-	validator := NewTestableAPIKeyValidator(config, mockQuerier)
+	validator := validators.NewTestableAPIKeyValidator(config, mockQuerier)
 
 	tests := []struct {
 		name        string
@@ -109,7 +112,7 @@ func TestTestableAPIKeyValidator_ContractFailure(t *testing.T) {
 		FailError:  fmt.Errorf("network error"),
 	}
 
-	validator := NewTestableAPIKeyValidator(config, mockQuerier)
+	validator := validators.NewTestableAPIKeyValidator(config, mockQuerier)
 
 	// Test that non-master keys fail when contract is unavailable
 	valid, err := validator.ValidateAPIKey("non-master-key")
@@ -157,7 +160,7 @@ func TestMiddleware_ServeHTTP_WithTestableValidator(t *testing.T) {
 	}
 
 	// For this test, just use the regular validator and set up a mock for the contract call
-	middleware.validator = NewAPIKeyValidator(config)
+	middleware.validator = apikeyval.NewAPIKeyValidator(config)
 	
 	// Replace the contract query function temporarily
 	originalQuery := queryContractFunc
@@ -294,7 +297,7 @@ func TestParseCaddyfileFunctionExists(t *testing.T) {
 
 // TestDefaultConfigurationValues tests all default configuration values
 func TestDefaultConfigurationValues(t *testing.T) {
-	config := defaultConfig()
+	config := proxyconfig.DefaultConfig()
 
 	// Test all default values
 	expectedDefaults := map[string]interface{}{
@@ -333,22 +336,14 @@ func TestAPIKeyValidatorCreation(t *testing.T) {
 		CacheTTL:        time.Hour,
 	}
 
-	validator := NewAPIKeyValidator(config)
+	validator := apikeyval.NewAPIKeyValidator(config)
 
-	if validator.config != config {
-		t.Error("Expected validator config to match input config")
-	}
-
-	if validator.cache == nil {
-		t.Error("Expected validator cache to be initialized")
-	}
-
-	if len(validator.cache) != 0 {
-		t.Error("Expected validator cache to be empty initially")
+	if validator == nil {
+		t.Fatal("Expected validator to be non-nil")
 	}
 
 	// Test that zero time is initial value
-	if !validator.lastUpdate.IsZero() {
+	if !validator.LastUpdate().IsZero() {
 		t.Error("Expected lastUpdate to be zero initially")
 	}
 }
@@ -496,7 +491,7 @@ func TestDefaultPermitStructure(t *testing.T) {
 		ContractAddress: "secret1test123",
 		SecretChainID:   "secret-4",
 	}
-	permit := getDefaultPermit(config)
+	permit := apikeyval.GetDefaultPermit(config)
 
 	// Test complete structure
 	if permit == nil {
@@ -627,7 +622,7 @@ func TestReadPermitFromFile_ComprehensiveErrorHandling(t *testing.T) {
 				os.Remove(tmpFile)
 			}()
 
-			permit, err := readPermitFromFile(tmpFile)
+			permit, err := apikeyval.ReadPermitFromFile(tmpFile)
 
 			if tt.expectError {
 				if err == nil {

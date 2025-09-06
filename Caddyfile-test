@@ -62,6 +62,14 @@
 			metering {env.METERING}
 			metering_interval {env.METERING_INTERVAL}
     		metering_url {env.METERING_URL}
+			
+			# Enhanced metering configuration (always enabled)
+			max_body_size 2097152
+			token_counting_mode accurate
+			max_retries 5
+			retry_backoff 300s
+			enable_metrics true
+			metrics_path /metrics
 		}
 		
 		reverse_proxy echo-server:80 {

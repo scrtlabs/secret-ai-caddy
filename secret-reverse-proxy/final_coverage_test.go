@@ -11,6 +11,8 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+
+	validators "github.com/scrtlabs/secret-reverse-proxy/validators"
 )
 
 // TestUnmarshalCaddyfile_AdditionalCoverage tests edge cases in UnmarshalCaddyfile
@@ -248,7 +250,7 @@ func TestUpdateAPIKeyCache_EdgeCases(t *testing.T) {
 		PermitFile:      permitFile,
 	}
 
-	validator := NewAPIKeyValidator(config)
+	validator := validators.NewAPIKeyValidator(config)
 
 	// Mock the contract query function to test permit file usage
 	originalQuery := queryContractFunc
@@ -277,13 +279,13 @@ func TestUpdateAPIKeyCache_EdgeCases(t *testing.T) {
 	}
 
 	// Test cache update with permit file
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err != nil {
 		t.Errorf("Expected no error but got: %v", err)
 	}
 
 	// Test that cache was updated
-	if len(validator.cache) == 0 {
+	if validator.CacheSize() == 0 {
 		t.Error("Expected cache to be populated")
 	}
 }

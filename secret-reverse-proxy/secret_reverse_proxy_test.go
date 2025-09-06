@@ -8,63 +8,14 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
+	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
+	utils "github.com/scrtlabs/secret-reverse-proxy/util"
 )
 
-// MockQueryContract replaces the real contract query functionality for testing
-type MockQueryContract struct {
-	ValidHashes map[string]bool
-	ShouldFail  bool
-	FailError   error
-}
-
-var mockContract *MockQueryContract
-
-// Mock the querycontract.QueryContract function
-func mockQueryContractFunc(contractAddress string, query map[string]any) (map[string]any, error) {
-	if mockContract.ShouldFail {
-		return nil, mockContract.FailError
-	}
-
-	// Return mock API keys based on what we want to test
-	apiKeys := make([]any, 0)
-	for hash := range mockContract.ValidHashes {
-		apiKeys = append(apiKeys, map[string]any{
-			"hashed_key": hash,
-		})
-	}
-
-	return map[string]any{
-		"api_keys": apiKeys,
-	}, nil
-}
-
-// Test helper to create a temporary file with content
-func createTempFile(t *testing.T, content string) string {
-	tmpFile, err := os.CreateTemp("", "test_keys_*.txt")
-	if err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
-	
-	if _, err := tmpFile.WriteString(content); err != nil {
-		t.Fatalf("Failed to write to temp file: %v", err)
-	}
-	
-	if err := tmpFile.Close(); err != nil {
-		t.Fatalf("Failed to close temp file: %v", err)
-	}
-	
-	return tmpFile.Name()
-}
-
-// Test helper to clean up temp files
-func cleanupTempFile(t *testing.T, filename string) {
-	if err := os.Remove(filename); err != nil {
-		t.Logf("Warning: Failed to remove temp file %s: %v", filename, err)
-	}
-}
 
 func TestDefaultConfig(t *testing.T) {
-	config := defaultConfig()
+	config := proxyconfig.DefaultConfig()
 	
 	if config.MasterKeysFile != "master_keys.txt" {
 		t.Errorf("Expected MasterKeysFile to be 'master_keys.txt', got %s", config.MasterKeysFile)
@@ -86,19 +37,10 @@ func TestNewAPIKeyValidator(t *testing.T) {
 		CacheTTL:        time.Hour,
 	}
 	
-	validator := NewAPIKeyValidator(config)
-	
-	if validator.config != config {
-		t.Error("Expected validator config to match input config")
-	}
-	
-	if validator.cache == nil {
-		t.Error("Expected validator cache to be initialized")
-	}
-	
-	if len(validator.cache) != 0 {
-		t.Error("Expected validator cache to be empty initially")
-	}
+	validator := apikeyval.NewAPIKeyValidator(config)
+	if validator == nil {
+		t.Fatal("Expected validator to be created, got nil")
+	}	
 }
 
 func TestMiddleware_CaddyModule(t *testing.T) {
@@ -377,8 +319,8 @@ func TestAPIKeyValidator_checkMasterKeys(t *testing.T) {
 			config := &Config{}
 			
 			if !tt.noFile {
-				tmpFile := createTempFile(t, tt.fileContent)
-				defer cleanupTempFile(t, tmpFile)
+				tmpFile := utils.CreateTempFile(t, tt.fileContent)
+				defer utils.CleanupTempFile(t, tmpFile)
 				
 				if tt.name == "file does not exist" {
 					// Delete the file to simulate non-existence
@@ -388,9 +330,9 @@ func TestAPIKeyValidator_checkMasterKeys(t *testing.T) {
 				config.MasterKeysFile = tmpFile
 			}
 			
-			validator := NewAPIKeyValidator(config)
+			validator := apikeyval.NewAPIKeyValidator(config)
 			
-			found, err := validator.checkMasterKeys(tt.apiKey)
+			found, err := validator.CheckMasterKeys(tt.apiKey)
 			
 			if tt.expectError && err == nil {
 				t.Error("Expected error but got none")

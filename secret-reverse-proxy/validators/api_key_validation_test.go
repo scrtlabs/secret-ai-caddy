@@ -1,10 +1,12 @@
-package secret_reverse_proxy
+package validators
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
 	"testing"
 	"time"
+	utils "github.com/scrtlabs/secret-reverse-proxy/util"
+	mocktests "github.com/scrtlabs/secret-reverse-proxy/tests"
 )
 
 func TestAPIKeyValidator_ValidateAPIKey_MasterKey(t *testing.T) {
@@ -74,8 +76,8 @@ func TestAPIKeyValidator_ValidateAPIKey_MasterKey(t *testing.T) {
 func TestAPIKeyValidator_ValidateAPIKey_MasterKeysFile(t *testing.T) {
 	// Create temp file with master keys
 	fileContent := "file-key-1\nfile-key-2\nfile-key-3\n"
-	tmpFile := createTempFile(t, fileContent)
-	defer cleanupTempFile(t, tmpFile)
+	tmpFile := utils.CreateTempFile(t, fileContent)
+	defer utils.CleanupTempFile(t, tmpFile)
 	
 	config := &Config{
 		MasterKeysFile:  tmpFile,
@@ -148,7 +150,7 @@ func TestAPIKeyValidator_ValidateAPIKey_Cache(t *testing.T) {
 	missingKey := "not-in-cache"
 	
 	// Set up mock contract to simulate contract query
-	setupMockContract(map[string]bool{})
+	mocktests.SetupMockContract(map[string]bool{})
 	
 	valid, err = validator.ValidateAPIKey(missingKey)
 	if err != nil {
@@ -177,7 +179,7 @@ func TestAPIKeyValidator_ValidateAPIKey_StaleCache(t *testing.T) {
 	validator.lastUpdate = time.Now().Add(-time.Hour) // Old timestamp
 	
 	// Set up mock contract
-	setupMockContract(map[string]bool{
+	mocktests.SetupMockContract(map[string]bool{
 		keyHash: true,
 	})
 	
@@ -198,7 +200,7 @@ func TestGetDefaultPermit(t *testing.T) {
 		ContractAddress: "secret1abc123",
 		SecretChainID:   "secret-4",
 	}
-	permit := getDefaultPermit(config)
+	permit := GetDefaultPermit(config)
 	
 	// Check structure
 	params, ok := permit["params"].(map[string]any)
@@ -250,10 +252,10 @@ func TestReadPermitFromFile(t *testing.T) {
 		}
 	}`
 	
-	tmpFile := createTempFile(t, permitJSON)
-	defer cleanupTempFile(t, tmpFile)
+	tmpFile := utils.CreateTempFile(t, permitJSON)
+	defer utils.CleanupTempFile(t, tmpFile)
 	
-	permit, err := readPermitFromFile(tmpFile)
+	permit, err := ReadPermitFromFile(tmpFile)
 	if err != nil {
 		t.Fatalf("Expected no error but got: %v", err)
 	}
@@ -269,16 +271,16 @@ func TestReadPermitFromFile(t *testing.T) {
 	
 	// Test invalid JSON
 	invalidJSON := `{"invalid": json}`
-	invalidFile := createTempFile(t, invalidJSON)
-	defer cleanupTempFile(t, invalidFile)
+	invalidFile := utils.CreateTempFile(t, invalidJSON)
+	defer utils.CleanupTempFile(t, invalidFile)
 	
-	_, err = readPermitFromFile(invalidFile)
+	_, err = ReadPermitFromFile(invalidFile)
 	if err == nil {
 		t.Error("Expected error for invalid JSON")
 	}
 	
 	// Test non-existent file
-	_, err = readPermitFromFile("/non/existent/file.json")
+	_, err = ReadPermitFromFile("/non/existent/file.json")
 	if err == nil {
 		t.Error("Expected error for non-existent file")
 	}
@@ -311,18 +313,3 @@ func TestGetResponseKeys(t *testing.T) {
 	}
 }
 
-// Helper function to set up mock contract for testing
-func setupMockContract(validHashes map[string]bool) {
-	mockContract = &MockQueryContract{
-		ValidHashes: validHashes,
-		ShouldFail:  false,
-	}
-}
-
-// Helper function to set up failing mock contract
-func setupFailingMockContract(err error) {
-	mockContract = &MockQueryContract{
-		ShouldFail: true,
-		FailError:  err,
-	}
-}

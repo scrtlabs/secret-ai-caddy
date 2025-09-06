@@ -16,17 +16,14 @@
 package secret_reverse_proxy
 
 import (
-	"bufio"
-	querycontract "github.com/scrtlabs/secret-reverse-proxy/query-contract"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -34,116 +31,15 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
+	
+	"github.com/scrtlabs/secret-reverse-proxy/factories"
+	"github.com/scrtlabs/secret-reverse-proxy/interfaces"
+	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
+	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
 )
 
-// Config holds the configuration parameters for the secret reverse proxy middleware.
-// This struct defines all the configurable aspects of the authentication system.
-type Config struct {
-	// APIKey is the primary master key that grants immediate access without further validation.
-	// This key should be kept secure and rotated regularly.
-	APIKey string `json:"api_key,omitempty"`
-	
-	// MasterKeysFile is the path to a file containing additional master keys (one per line).
-	// This allows for multiple master keys without hardcoding them in configuration.
-	// The file is read on each validation attempt, so keys can be rotated without restart.
-	MasterKeysFile string `json:"master_keys_file,omitempty"`
-	
-	// PermitFile is the path to a JSON file containing the Secret Network permit configuration.
-	// If not specified, a default hardcoded permit will be used.
-	// The permit defines blockchain authentication parameters for contract queries.
-	PermitFile string `json:"permit_file,omitempty"`
-	
-	// ContractAddress is the Secret Network smart contract address that stores valid API keys.
-	// This contract is queried to refresh the cache of valid hashed API keys.
-	ContractAddress string `json:"contract_address,omitempty"`
-	
-	SecretNode string `json:"secret_node,omitempty"`
-
-	SecretChainID string `json:"secret_chain_id,omitempty"`
-
-	// CacheTTL defines how long cached API key validation results remain valid.
-	// After this duration, the cache will be refreshed from the smart contract.
-	CacheTTL time.Duration `json:"cache_ttl,omitempty"`
-
-	MeteringInterval time.Duration `json:"metering_interval,omitempty"` // e.g., "5m", "1h"
-	Metering bool        `json:"metering,omitempty"` // metering if enabled
-	MeteringURL string    `json:"metering_url,omitempty"` // metering URL
-}
-
-// defaultConfig returns a Config struct populated with sensible default values.
-// These defaults are used when no explicit configuration is provided.
-//
-// Default values:
-// - MasterKeysFile: "master_keys.txt" (local file in working directory)
-// - ContractAddress: Secret Network contract for API key validation
-// - CacheTTL: 30 minutes (balances performance vs. key rotation speed)
-//
-// Returns:
-//   - *Config: A new Config instance with default values
-func defaultConfig() *Config {
-	return &Config{
-		// Default master keys file location - should contain one API key per line
-		MasterKeysFile: "",
-		
-		// Default Secret Network contract address for API key validation
-		ContractAddress: "",
-
-		SecretNode: "",
-
-		SecretChainID: "",
-		
-		// Default cache TTL - 30 minutes provides good balance between performance and security
-		CacheTTL: 30 * time.Minute,
-
-		// Default metering contract - hardcoded for now
-		Metering: false,
-		MeteringInterval: 10 * time.Minute,
-	}
-}
-
-// APIKeyValidator encapsulates all logic for validating API keys against multiple sources.
-// It manages an in-memory cache of valid API key hashes for performance optimization.
-// Thread-safe operations are ensured through proper mutex usage.
-type APIKeyValidator struct {
-	// config holds the validator configuration parameters
-	config *Config
-	
-	// cache stores SHA256 hashes of valid API keys mapped to their validity status
-	// Key: SHA256 hash of API key, Value: true if valid
-	cache map[string]bool
-	
-	// cacheMutex protects concurrent access to the cache map
-	// Uses RWMutex to allow multiple concurrent reads while serializing writes
-	cacheMutex sync.RWMutex
-	
-	// lastUpdate tracks when the cache was last refreshed from the smart contract
-	// Used to determine if cache has exceeded TTL and needs refresh
-	lastUpdate time.Time
-}
-
-// NewAPIKeyValidator creates and initializes a new APIKeyValidator instance.
-// This constructor sets up the validator with the provided configuration and
-// initializes the internal cache for storing API key validation results.
-//
-// Parameters:
-//   - config: Configuration parameters for the validator
-//
-// Returns:
-//   - *APIKeyValidator: A new validator instance ready for use
-//
-// Note: The cache starts empty and will be populated on first validation attempt
-// or when updateAPIKeyCache() is called.
-func NewAPIKeyValidator(config *Config) *APIKeyValidator {
-	return &APIKeyValidator{
-		// Store reference to configuration
-		config: config,
-		
-		// Initialize empty cache - will be populated from contract on first use
-		cache: make(map[string]bool),
-		
-		// lastUpdate will be set to zero time initially, forcing immediate cache update
-	}
-}
+type Config = proxyconfig.Config
+type APIKeyValidator = apikeyval.APIKeyValidator
 
 // init registers the middleware with Caddy's module system.
 // This function is called automatically when the package is imported.
@@ -171,13 +67,19 @@ type Middleware struct {
 	// Initialized during the Provision phase
 	validator *APIKeyValidator
 
-	accumulator *TokenAccumulator
 	
 	// quitChan is used to signal the background token reporting goroutine to stop
 	quitChan chan struct{}
 	
 	// meteringRunning tracks whether the token reporting goroutine is active
 	meteringRunning bool
+	
+	// Enhanced metering components (only initialized when EnhancedMetering is enabled)
+	tokenCounter      interfaces.TokenCounter
+	bodyHandler       interfaces.BodyHandler
+	tokenAccumulator  *TokenAccumulator
+	resilientReporter *ResilientReporter
+	metricsCollector  interfaces.MetricsCollector
 }
 
 // CaddyModule returns the module information required by Caddy's module system.
@@ -223,21 +125,55 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	
 	// BLOCK 2: Validator Initialization
 	// Create the API key validator that will handle authentication logic
-	m.validator = NewAPIKeyValidator(m.Config)
+	m.validator = apikeyval.NewAPIKeyValidator(m.Config)
 	if m.validator == nil {
 		return fmt.Errorf("failed to create API key validator")
 	}
 
-	// BLOCK 3: Token Metering
-	// Create the token accumulator
-	if m.accumulator == nil {
-		m.accumulator = NewTokenAccumulator()
+	// BLOCK 3: Enhanced Token Metering (always enabled)
+	logger.Info("🔧 Initializing enhanced metering components")
+	
+	// Initialize TokenCounter
+	m.tokenCounter = factories.CreateTokenCounter()
+	if m.tokenCounter != nil {
+		logger.Info("✅ Enhanced TokenCounter initialized")
+	} else {
+		return fmt.Errorf("failed to initialize enhanced TokenCounter")
 	}
+	
+	// Initialize BodyHandler with configured max body size
+	m.bodyHandler = factories.CreateBodyHandler(m.Config.MaxBodySize)
+	if m.bodyHandler != nil {
+		logger.Info("✅ Enhanced BodyHandler initialized")
+	} else {
+		return fmt.Errorf("failed to initialize enhanced BodyHandler")
+	}
+	
+	// Initialize optional advanced components
+	m.metricsCollector = factories.CreateMetricsCollector(m.Config)
+	if m.metricsCollector != nil {
+		logger.Info("✅ Enhanced MetricsCollector initialized")
+	} else {
+		logger.Warn("⚠️  MetricsCollector not available (advanced features disabled)")
+	}
+	
+	logger.Info("✅ Enhanced metering system initialized successfully")
+	
 	// Initialize quit channel for background goroutine management
 	m.quitChan = make(chan struct{})
 	if m.Config.Metering {
-		logger.Info("⚖️  Starting Metering...")
-		m.StartTokenReportingLoop(m.Config.MeteringInterval)
+		logger.Info("⚖️  Starting Enhanced Metering...")
+		// Initialize token accumulator
+		m.tokenAccumulator = NewTokenAccumulator()
+		
+		// Create resilient reporter with the accumulator
+		m.resilientReporter = NewResilientReporter(m.Config, m.tokenAccumulator)
+		if m.resilientReporter != nil {
+			m.resilientReporter.StartReportingLoop(m.Config.MeteringInterval)
+			logger.Info("✅ Enhanced resilient reporter with accumulator started")
+		} else {
+			logger.Warn("⚠️  Enhanced resilient reporter not available - token usage will be logged only")
+		}
 		m.meteringRunning = true
 	}
 	// BLOCK 4: Configuration Logging
@@ -252,7 +188,10 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		zap.String("permit_file_configured", m.Config.PermitFile),
 		zap.Bool("metering", m.Config.Metering),
 		zap.Duration("metering_interval", m.Config.MeteringInterval),
-		zap.String("metering_url", m.Config.MeteringURL))
+		zap.String("metering_url", m.Config.MeteringURL),
+		zap.String("token_counting_mode", m.Config.TokenCountingMode),
+		zap.Int64("max_body_size", m.Config.MaxBodySize),
+		zap.Bool("enable_metrics", m.Config.EnableMetrics))
 
 	return nil
 }
@@ -378,6 +317,12 @@ func (m *Middleware) Validate() error {
 //   - error: nil on success, error if request processing fails
 func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	logger := caddy.Log()
+	startTime := time.Now()
+	
+	// Record request metrics
+	if m.metricsCollector != nil {
+		m.metricsCollector.RecordRequest()
+	}
 	
 	// BLOCK 1: Request Logging
 	// Log incoming request details for debugging and audit purposes
@@ -394,6 +339,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		logger.Debug("Request rejected: missing Authorization header",
 			zap.String("remote_addr", r.RemoteAddr),
 			zap.String("path", r.URL.Path))
+		
+		// Record rejection metrics
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
+		}
+		
 		http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
 		return nil
 	}
@@ -407,6 +358,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		logger.Debug("Request rejected: invalid Authorization header format",
 			zap.String("remote_addr", r.RemoteAddr),
 			zap.String("auth_header_prefix", authHeader[:min(20, len(authHeader))]))
+		
+		// Record rejection metrics
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
+		}
+		
 		http.Error(w, "Invalid Authorization header format", http.StatusUnauthorized)
 		return nil
 	}
@@ -423,6 +380,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			zap.Error(err),
 			zap.String("remote_addr", r.RemoteAddr),
 			zap.String("path", r.URL.Path))
+		
+		// Record validation error
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordValidationError()
+		}
+		
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return nil
 	}
@@ -435,6 +398,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			zap.String("remote_addr", r.RemoteAddr),
 			zap.String("path", r.URL.Path),
 			zap.String("key_prefix", apiKey[:min(8, len(apiKey))]+"..."))
+		
+		// Record rejection metrics
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
+		}
+		
 		http.Error(w, "Invalid API key", http.StatusUnauthorized)
 		return nil
 	}
@@ -444,24 +413,55 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// logger.Debug("API key validation successful, forwarding request")
 	// return next.ServeHTTP(w, r)
 
-	// Read request body BEFORE forwarding to downstream handlers
-	requestBody := readRequestBody(r)
-	inputTokens := CountTokensHeuristic(requestBody)
+	// Record successful authorization
+	if m.metricsCollector != nil {
+		m.metricsCollector.RecordAuthorized()
+	}
 
-	wrappedWriter := NewTokenMeteringResponseWriter(w)
+	// Read request body BEFORE forwarding to downstream handlers
+	tokenCountStart := time.Now()
+	requestBody, contentType := m.readRequestBody(r)
+	inputTokens := m.countTokens(requestBody, contentType)
+
+	// Record token counting time
+	if m.metricsCollector != nil {
+		m.metricsCollector.RecordTokenCountTime(time.Since(tokenCountStart))
+	}
+
+	wrappedWriter := m.createResponseWriter(w)
 	err = next.ServeHTTP(wrappedWriter, r)
 	if err != nil {
 		return err
 	}
 
 	// Count response tokens
-	responseBody := wrappedWriter.Body()
-	outputTokens := CountTokensHeuristic(string(responseBody))
+	responseTokenCountStart := time.Now()
+	responseBody, responseContentType := m.extractResponseBody(wrappedWriter)
+	outputTokens := m.countTokens(responseBody, responseContentType)
 
-	// Hash and record usage
-	apiKeyHash := sha256.Sum256([]byte(apiKey))
-	hashHex := hex.EncodeToString(apiKeyHash[:])
-	m.accumulator.RecordUsage(hashHex, inputTokens, outputTokens)
+	// Record response token counting time
+	if m.metricsCollector != nil {
+		m.metricsCollector.RecordTokenCountTime(time.Since(responseTokenCountStart))
+		// Record token metrics
+		m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
+		// Record processing time
+		m.metricsCollector.RecordProcessingTime(time.Since(startTime))
+	}
+
+	// Record usage for reporting - create API key hash
+	if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
+		hasher := sha256.New()
+		hasher.Write([]byte(apiKey))
+		apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
+		
+		m.tokenAccumulator.RecordUsage(apiKeyHash, inputTokens, outputTokens)
+	}
+
+	// Log token usage for monitoring (enhanced system handles reporting internally)
+	caddy.Log().Info("Token usage recorded",
+		zap.Int("input_tokens", inputTokens),
+		zap.Int("output_tokens", outputTokens),
+		zap.String("endpoint", r.URL.Path))
 
 	return nil
 }
@@ -493,7 +493,7 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// BLOCK 1: Configuration Initialization
 	// Ensure we have a config object to populate
 	if m.Config == nil {
-		m.Config = defaultConfig()
+		m.Config = proxyconfig.DefaultConfig()
 		logger.Debug("Using default configuration")
 	}
 	
@@ -659,6 +659,74 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					
 					logger.Info("💻 Secret node configured successfully:", zap.String("secret_node", m.Config.SecretNode))
 
+				case "max_body_size":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					rawValue := expandEnvVars(d.Val())
+					if size, err := parseByteSize(rawValue); err == nil {
+						m.Config.MaxBodySize = size
+					} else {
+						return d.Errf("invalid max_body_size: %v", err)
+					}
+					logger.Info("📏 Max body size", zap.Int64("bytes", m.Config.MaxBodySize))
+
+				case "token_counting_mode":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					expandedValue := expandEnvVars(d.Val())
+					validModes := map[string]bool{
+						"heuristic": true, "fast": true, "accurate": true,
+					}
+					if !validModes[expandedValue] {
+						return d.Errf("invalid token_counting_mode: %s (valid: heuristic, fast, accurate)", expandedValue)
+					}
+					m.Config.TokenCountingMode = expandedValue
+					logger.Info("🔢 Token counting mode", zap.String("mode", m.Config.TokenCountingMode))
+
+				case "max_retries":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					rawValue := expandEnvVars(d.Val())
+					if retries, err := strconv.Atoi(rawValue); err == nil && retries >= 0 {
+						m.Config.MaxRetries = retries
+					} else {
+						return d.Errf("invalid max_retries: %v", err)
+					}
+					logger.Info("🔄 Max retries", zap.Int("retries", m.Config.MaxRetries))
+
+				case "retry_backoff":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					rawValue := expandEnvVars(d.Val())
+					if backoff, err := time.ParseDuration(rawValue); err == nil {
+						m.Config.RetryBackoff = backoff
+					} else {
+						return d.Errf("invalid retry_backoff: %v", err)
+					}
+					logger.Info("⏱️  Retry backoff", zap.Duration("backoff", m.Config.RetryBackoff))
+
+				case "enable_metrics":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					expandedValue := expandEnvVars(d.Val())
+					m.Config.EnableMetrics = map[string]bool{
+						"on": true, "true": true, "1": true, "yes": true,
+					}[strings.ToLower(strings.TrimSpace(expandedValue))]
+					logger.Info("📊 Enable metrics", zap.Bool("enabled", m.Config.EnableMetrics))
+
+				case "metrics_path":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					expandedValue := expandEnvVars(d.Val())
+					m.Config.MetricsPath = expandedValue
+					logger.Info("📍 Metrics path", zap.String("path", m.Config.MetricsPath))
+
 				default:
 					logger.Error("🔴 Unmarshal Caddyfile", zap.String("unknown subdirective", d.Val()))
 					// Unknown directive - return error
@@ -679,6 +747,114 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		zap.String("metering_url", m.Config.MeteringURL),
 	)
 	return nil
+}
+
+// parseByteSize parses byte size strings like "1MB", "500KB", etc.
+func parseByteSize(value string) (int64, error) {
+	value = strings.TrimSpace(strings.ToUpper(value))
+	
+	// Handle pure numbers (bytes)
+	if size, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return size, nil
+	}
+	
+	// Handle size with units
+	multipliers := map[string]int64{
+		"B":  1,
+		"KB": 1024,
+		"MB": 1024 * 1024,
+		"GB": 1024 * 1024 * 1024,
+	}
+	
+	for suffix, multiplier := range multipliers {
+		if strings.HasSuffix(value, suffix) {
+			numStr := strings.TrimSuffix(value, suffix)
+			if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+				return num * multiplier, nil
+			}
+		}
+	}
+	
+	return 0, fmt.Errorf("invalid byte size format: %s", value)
+}
+
+// countTokens counts tokens using the enhanced token counting system
+func (m *Middleware) countTokens(content, contentType string) int {
+	if content == "" {
+		return 0
+	}
+	
+	// Enhanced token counting only
+	if m.tokenCounter != nil {
+		tokens := m.tokenCounter.CountTokens(content, contentType)
+		
+		// Validate and adjust token count if needed
+		adjustedTokens := m.tokenCounter.ValidateTokenCount(tokens, len(content))
+		if adjustedTokens != tokens {
+			if m.metricsCollector != nil {
+				m.metricsCollector.RecordTokenCountError()
+			}
+			caddy.Log().Debug("Token count adjusted",
+				zap.Int("original", tokens),
+				zap.Int("adjusted", adjustedTokens),
+				zap.Int("content_length", len(content)))
+		}
+		
+		return adjustedTokens
+	}
+	
+	// If enhanced system is not available, log error and return 0
+	caddy.Log().Warn("Enhanced token counter not available, cannot count tokens",
+		zap.String("content_type", contentType),
+		zap.Int("content_length", len(content)))
+	return 0
+}
+
+// readRequestBody reads request body using the enhanced body handler
+func (m *Middleware) readRequestBody(r *http.Request) (content, contentType string) {
+	if m.bodyHandler != nil {
+		// Use enhanced body handler
+		bodyInfo, err := m.bodyHandler.SafeReadRequestBody(r)
+		if err != nil {
+			caddy.Log().Error("Enhanced body reading failed", zap.Error(err))
+			if m.metricsCollector != nil {
+				m.metricsCollector.RecordValidationError()
+			}
+			return "", r.Header.Get("Content-Type")
+		}
+		
+		// Record metrics if available
+		if m.metricsCollector != nil {
+			if bodyInfo.Error != nil {
+				m.metricsCollector.RecordTokenCountError()
+			} else {
+				m.metricsCollector.RecordCacheHit() // Successful operation
+			}
+		}
+		
+		return bodyInfo.Content, bodyInfo.ContentType
+	}
+	
+	// If enhanced system is not available, log error
+	caddy.Log().Warn("Enhanced body handler not available, cannot read request body")
+	return "", r.Header.Get("Content-Type")
+}
+
+// createResponseWriter creates the response writer for token metering
+func (m *Middleware) createResponseWriter(w http.ResponseWriter) http.ResponseWriter {
+	// Always use the token metering response writer
+	return NewTokenMeteringResponseWriter(w)
+}
+
+// extractResponseBody extracts response body and content type from wrapped writer
+func (m *Middleware) extractResponseBody(wrappedWriter http.ResponseWriter) (content, contentType string) {
+	// For now, always use simple response writer until circular dependency is resolved
+	if basicWriter, ok := wrappedWriter.(*TokenMeteringResponseWriter); ok {
+		return string(basicWriter.Body()), "application/json"
+	}
+	
+	// Should not reach here, but provide safe fallback
+	return "", "application/json"
 }
 
 // expandEnvVars expands environment variables in Caddyfile format {env.VAR_NAME}
@@ -758,304 +934,6 @@ func extractAPIKey(authHeader string) string {
 	return authHeader
 }
 
-// ValidateAPIKey performs comprehensive API key validation through multiple authentication sources.
-// This is the core authentication method that implements a tiered validation strategy:
-//
-// Validation Hierarchy (in order of precedence):
-// 1. Configured master key (immediate access)
-// 2. Master keys file (local file-based keys)
-// 3. Cached contract results (performance optimization)
-// 4. Fresh contract query (authoritative source)
-//
-// Parameters:
-//   - apiKey: The API key string to validate
-//
-// Returns:
-//   - bool: true if the API key is valid, false otherwise
-//   - error: nil on successful validation process, error if validation cannot be performed
-//
-// Note: A return of (false, nil) means the key is definitively invalid.
-//       A return of (false, error) means the validation process failed.
-func (v *APIKeyValidator) ValidateAPIKey(apiKey string) (bool, error) {
-	logger := caddy.Log()
-	
-	// BLOCK 1: Input Validation
-	// Ensure we have a non-empty API key to work with
-	if strings.TrimSpace(apiKey) == "" {
-		logger.Debug("API key validation failed: empty key")
-		return false, fmt.Errorf("empty API key")
-	}
-	
-	// Create safe logging prefix for debugging (only first 8 characters)
-	keyPrefix := apiKey[:min(8, len(apiKey))] + "..."
-	logger.Debug("Starting API key validation", zap.String("key_prefix", keyPrefix))
-	
-	// BLOCK 2: Master Key Check
-	// Check against the primary configured master key (highest priority)
-	if v.config.APIKey != "" && apiKey == v.config.APIKey {
-		logger.Debug("API key validated: matches configured master key")
-		return true, nil
-	}
-
-	// BLOCK 3: Master Keys File Check
-	// Check against additional master keys stored in a local file
-	isMasterKey, err := v.checkMasterKeys(apiKey)
-	if err != nil {
-		logger.Error("Master key check failed",
-			zap.Error(err),
-			zap.String("key_prefix", keyPrefix))
-		return false, fmt.Errorf("master key check failed: %w", err)
-	}
-	if isMasterKey {
-		logger.Debug("API key validated: found in master keys file")
-		return true, nil
-	}
-
-	// BLOCK 4: Cache Preparation
-	// Hash the API key for secure cache storage and lookup
-	// We store hashes instead of plain keys for security
-	hasher := sha256.New()
-	hasher.Write([]byte(apiKey))
-	apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
-
-	// BLOCK 5: Cache Lookup
-	// Check if we have a recent validation result cached
-	v.cacheMutex.RLock()
-	cached, found := v.cache[apiKeyHash]
-	isStale := time.Since(v.lastUpdate) > v.config.CacheTTL
-	cacheSize := len(v.cache)
-	v.cacheMutex.RUnlock()
-
-	logger.Debug("Cache lookup",
-		zap.String("hash_prefix", apiKeyHash[:min(16, len(apiKeyHash))]+"..."),
-		zap.Bool("found", found),
-		zap.Bool("stale", isStale),
-		zap.Int("cache_size", cacheSize),
-		zap.Duration("age", time.Since(v.lastUpdate)))
-
-	// BLOCK 6: Cache Hit Processing
-	// If we have a fresh cache entry, use it to avoid contract query
-	if found && !isStale {
-		logger.Debug("API key validation result from cache", zap.Bool("valid", cached))
-		return cached, nil
-	}
-
-	// BLOCK 7: Contract Query
-	// Cache miss or stale data - query the authoritative smart contract
-	logger.Debug("Updating API key cache from contract")
-	if err := v.updateAPIKeyCache(); err != nil {
-		logger.Error("Cache update failed",
-			zap.Error(err),
-			zap.String("contract_address", v.config.ContractAddress))
-		return false, fmt.Errorf("cache update failed: %w", err)
-	}
-
-	// BLOCK 8: Final Result
-	// Check the updated cache for the validation result
-	v.cacheMutex.RLock()
-	defer v.cacheMutex.RUnlock()
-	result := v.cache[apiKeyHash]
-	logger.Debug("API key validation result after cache update",
-		zap.Bool("valid", result),
-		zap.Int("new_cache_size", len(v.cache)))
-	return result, nil
-}
-
-// checkMasterKeys checks if the provided API key exists in the master keys file
-func (v *APIKeyValidator) checkMasterKeys(apiKey string) (bool, error) {
-	logger := caddy.Log()
-	
-	if v.config.MasterKeysFile == "" {
-		logger.Debug("No master keys file configured")
-		return false, nil
-	}
-	
-	logger.Debug("Checking master keys file", zap.String("file", v.config.MasterKeysFile))
-	
-	file, err := os.Open(v.config.MasterKeysFile)
-	if err != nil {
-		// If file doesn't exist, that's not an error
-		if os.IsNotExist(err) {
-			logger.Debug("Master keys file does not exist", zap.String("file", v.config.MasterKeysFile))
-			return false, nil
-		}
-		logger.Error("Failed to open master keys file",
-			zap.String("file", v.config.MasterKeysFile),
-			zap.Error(err))
-		return false, fmt.Errorf("failed to open master keys file: %w", err)
-	}
-	defer file.Close()
-
-	lineCount := 0
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lineCount++
-		nextMasterKey := strings.TrimSpace(scanner.Text())
-		if nextMasterKey != "" && nextMasterKey == apiKey {
-			logger.Debug("API key found in master keys file",
-				zap.String("file", v.config.MasterKeysFile),
-				zap.Int("line", lineCount))
-			return true, nil
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		logger.Error("Error reading master keys file",
-			zap.String("file", v.config.MasterKeysFile),
-			zap.Error(err))
-		return false, fmt.Errorf("error reading master keys file: %w", err)
-	}
-
-	logger.Debug("API key not found in master keys file",
-		zap.String("file", v.config.MasterKeysFile),
-		zap.Int("lines_checked", lineCount))
-	return false, nil
-}
-
-// updateAPIKeyCache queries the contract and updates the in-memory cache
-func (v *APIKeyValidator) updateAPIKeyCache() error {
-	logger := caddy.Log()
-	start := time.Now()
-	
-	logger.Debug("Starting cache update", zap.String("contract_address", v.config.ContractAddress))
-	
-	// Load permit from file or use default
-	var permit map[string]any
-	var err error
-	
-	if v.config.PermitFile != "" {
-		logger.Debug("Loading permit from file", zap.String("file", v.config.PermitFile))
-		permit, err = readPermitFromFile(v.config.PermitFile)
-		if err != nil {
-			logger.Error("Failed to read permit file",
-				zap.String("file", v.config.PermitFile),
-				zap.Error(err))
-			return fmt.Errorf("failed to read permit file: %w", err)
-		}
-	} else {
-		logger.Debug("Using default permit configuration")
-		// Use default permit if no file specified
-		permit = getDefaultPermit(v.config)
-	}
-
-	query := map[string]any{
-		"api_keys_with_permit": map[string]any{
-			"permit": permit,
-		},
-	}
-
-	logger.Debug("Querying contract for API keys")
-	result, err := querycontract.QueryContract(v.config.ContractAddress, query)
-	if err != nil {
-		logger.Error("Contract query failed",
-			zap.String("contract_address", v.config.ContractAddress),
-			zap.Error(err),
-			zap.Duration("duration", time.Since(start)))
-		return fmt.Errorf("contract query failed: %w", err)
-	}
-
-	apiKeys, ok := result["api_keys"].([]any)
-	if !ok {
-		logger.Error("Unexpected response format: api_keys field not found or wrong type",
-			zap.Any("response_keys", getResponseKeys(result)))
-		return fmt.Errorf("unexpected response format: api_keys not found")
-	}
-
-	newCache := make(map[string]bool)
-	validKeys := 0
-	skippedEntries := 0
-	
-	for i, entry := range apiKeys {
-		entryMap, ok := entry.(map[string]any)
-		if !ok {
-			skippedEntries++
-			logger.Debug("Skipping invalid entry", zap.Int("index", i))
-			continue
-		}
-		hashedKey, ok := entryMap["hashed_key"].(string)
-		if ok && hashedKey != "" {
-			newCache[hashedKey] = true
-			validKeys++
-		} else {
-			skippedEntries++
-			logger.Debug("Skipping entry with invalid hashed_key", zap.Int("index", i))
-		}
-	}
-
-	v.cacheMutex.Lock()
-	oldCacheSize := len(v.cache)
-	v.cache = newCache
-	v.lastUpdate = time.Now()
-	v.cacheMutex.Unlock()
-
-	duration := time.Since(start)
-	logger.Info("Cache update completed",
-		zap.Int("old_cache_size", oldCacheSize),
-		zap.Int("new_cache_size", len(newCache)),
-		zap.Int("valid_keys", validKeys),
-		zap.Int("skipped_entries", skippedEntries),
-		zap.Duration("duration", duration),
-		zap.String("contract_address", v.config.ContractAddress))
-
-	return nil
-}
-
-// getResponseKeys extracts the keys from a response map for debugging
-func getResponseKeys(response map[string]any) []string {
-	keys := make([]string, 0, len(response))
-	for k := range response {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-// getDefaultPermit returns the default permit configuration
-func getDefaultPermit(config *Config) map[string]any {
-	return map[string]any{
-		"params": map[string]any{
-			"permit_name":    "api_keys_permit",
-			"allowed_tokens": []any{config.ContractAddress},
-			"chain_id":       config.SecretChainID,
-			"permissions":    []any{},
-		},
-		"signature": map[string]any{
-			"pub_key": map[string]any{
-				"type":  "tendermint/PubKeySecp256k1",
-				"value": "Aur9D8RLqYMf3sBTiXdhH8mMI9bPHisdDa9y9jwW9RyT",
-			},
-		"signature": "TeNtblPmooqErLX3ECMKfAYJdVB5/BTULW00CGX5nDZ1iuvHUPY+fetdBCQ8NfmyPARzcH5QRkmC2hQG8+fJJw==",
-		},
-	}
-}
-
-// readPermitFromFile reads the permit from a JSON file
-func readPermitFromFile(filePath string) (map[string]any, error) {
-	logger := caddy.Log()
-	logger.Debug("Reading permit file", zap.String("file", filePath))
-	
-	file, err := os.Open(filePath)
-	if err != nil {
-		logger.Error("Failed to open permit file",
-			zap.String("file", filePath),
-			zap.Error(err))
-		return nil, fmt.Errorf("failed to open permit file: %w", err)
-	}
-	defer file.Close()
-
-	var permit map[string]any
-	if err := json.NewDecoder(file).Decode(&permit); err != nil {
-		logger.Error("Failed to decode permit file",
-			zap.String("file", filePath),
-			zap.Error(err))
-		return nil, fmt.Errorf("failed to decode permit file: %w", err)
-	}
-
-	logger.Debug("Permit file loaded successfully",
-		zap.String("file", filePath),
-		zap.Int("keys_count", len(permit)))
-	return permit, nil
-}
-
 // parseCaddyfile is the entry point for Caddyfile parsing of this middleware.
 // This function is registered with Caddy's directive system and is called
 // when the "secret_reverse_proxy" directive is encountered in a Caddyfile.
@@ -1100,27 +978,26 @@ func (m *Middleware) Cleanup() error {
 
 	// Stop any background token reporting goroutines
 	if m.meteringRunning && m.quitChan != nil {
-		logger.Debug("Stopping token reporting goroutine")
+		logger.Debug("Stopping legacy token reporting goroutine")
 		close(m.quitChan)
 		m.meteringRunning = false
-		logger.Debug("Token reporting goroutine stopped")
+		logger.Debug("Legacy token reporting goroutine stopped")
+	}
+	
+	// Stop the resilient reporter
+	if m.resilientReporter != nil {
+		logger.Debug("Stopping resilient reporter")
+		m.resilientReporter.Stop()
+		logger.Debug("Resilient reporter stopped")
 	}
 
 	// Clean up validator resources (if any)
 	if m.validator != nil {
 		logger.Debug("Cleaning up validator cache")
-		m.validator.cacheMutex.Lock()
-		// Clear the cache to free memory
-		m.validator.cache = make(map[string]bool)
-		m.validator.cacheMutex.Unlock()
-	}
+		m.validator.CleanupCache()
+		logger.Debug("Validator cache cleaned up")}
 
-	// Clean up accumulator resources
-	if m.accumulator != nil {
-		logger.Debug("Clearing token accumulator")
-		// Flush any remaining usage data before cleanup
-		m.accumulator.FlushUsage()
-	}
+	// Enhanced metering components handle their own cleanup
 
 	logger.Debug("Secret reverse proxy middleware cleanup completed")
 	return nil

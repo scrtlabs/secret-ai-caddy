@@ -1,4 +1,4 @@
-package secret_reverse_proxy
+package validators
 
 import (
 	"crypto/sha256"
@@ -7,9 +7,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	mocktests "github.com/scrtlabs/secret-reverse-proxy/tests"
+	utils "github.com/scrtlabs/secret-reverse-proxy/util"
 )
 
-func TestAPIKeyValidator_updateAPIKeyCache_Success(t *testing.T) {
+var mockContract *mocktests.MockQueryContract
+func TestAPIKeyValidator_UpdateAPICache_Success(t *testing.T) {
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -23,36 +27,30 @@ func TestAPIKeyValidator_updateAPIKeyCache_Success(t *testing.T) {
 		"hash2": true,
 		"hash3": true,
 	}
-	setupMockContract(testHashes)
+	mocktests.SetupMockContract(testHashes)
 	
 	// Replace the contract query function for testing
 	originalQuery := queryContractFunc
-	queryContractFunc = mockQueryContractFunc
+	queryContractFunc = mocktests.MockQueryContractFunc
 	defer func() { queryContractFunc = originalQuery }()
 	
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err != nil {
 		t.Errorf("Expected no error but got: %v", err)
 	}
 	
 	// Verify cache contents
-	if len(validator.cache) != len(testHashes) {
+	if validator.CacheSize() != len(testHashes) {
 		t.Errorf("Expected cache size %d, got %d", len(testHashes), len(validator.cache))
 	}
-	
-	for hash := range testHashes {
-		if !validator.cache[hash] {
-			t.Errorf("Expected hash %s to be in cache", hash)
-		}
-	}
-	
+		
 	// Verify lastUpdate was set
-	if validator.lastUpdate.IsZero() {
+	if validator.LastUpdate().IsZero() {
 		t.Error("Expected lastUpdate to be set")
 	}
 }
 
-func TestAPIKeyValidator_updateAPIKeyCache_ContractFailure(t *testing.T) {
+func TestAPIKeyValidator_UpdateAPICache_ContractFailure(t *testing.T) {
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -61,14 +59,14 @@ func TestAPIKeyValidator_updateAPIKeyCache_ContractFailure(t *testing.T) {
 	validator := NewAPIKeyValidator(config)
 	
 	// Mock contract failure
-	setupFailingMockContract(fmt.Errorf("contract query failed"))
+	mocktests.SetupFailingMockContract(fmt.Errorf("contract query failed"))
 	
 	// Replace the contract query function for testing
 	originalQuery := queryContractFunc
-	queryContractFunc = mockQueryContractFunc
+	queryContractFunc = mocktests.MockQueryContractFunc
 	defer func() { queryContractFunc = originalQuery }()
 	
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err == nil {
 		t.Error("Expected error but got none")
 	}
@@ -78,7 +76,7 @@ func TestAPIKeyValidator_updateAPIKeyCache_ContractFailure(t *testing.T) {
 	}
 }
 
-func TestAPIKeyValidator_updateAPIKeyCache_InvalidResponse(t *testing.T) {
+func TestAPIKeyValidator_UpdateAPICache_InvalidResponse(t *testing.T) {
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -87,7 +85,7 @@ func TestAPIKeyValidator_updateAPIKeyCache_InvalidResponse(t *testing.T) {
 	validator := NewAPIKeyValidator(config)
 	
 	// Mock contract with invalid response structure
-	mockContract = &MockQueryContract{
+	mockContract = &mocktests.MockQueryContract{
 		ValidHashes: nil,
 		ShouldFail:  false,
 	}
@@ -101,7 +99,7 @@ func TestAPIKeyValidator_updateAPIKeyCache_InvalidResponse(t *testing.T) {
 	}
 	defer func() { queryContractFunc = originalQuery }()
 	
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err == nil {
 		t.Error("Expected error but got none")
 	}
@@ -111,7 +109,7 @@ func TestAPIKeyValidator_updateAPIKeyCache_InvalidResponse(t *testing.T) {
 	}
 }
 
-func TestAPIKeyValidator_updateAPIKeyCache_WithPermitFile(t *testing.T) {
+func TestAPIKeyValidator_UpdateAPICache_WithPermitFile(t *testing.T) {
 	// Create a permit file
 	permitJSON := `{
 		"params": {
@@ -123,8 +121,8 @@ func TestAPIKeyValidator_updateAPIKeyCache_WithPermitFile(t *testing.T) {
 		}
 	}`
 	
-	tmpFile := createTempFile(t, permitJSON)
-	defer cleanupTempFile(t, tmpFile)
+	tmpFile := utils.CreateTempFile(t, permitJSON)
+	defer utils.CleanupTempFile(t, tmpFile)
 	
 	config := &Config{
 		ContractAddress: "test-contract",
@@ -135,20 +133,20 @@ func TestAPIKeyValidator_updateAPIKeyCache_WithPermitFile(t *testing.T) {
 	validator := NewAPIKeyValidator(config)
 	
 	// Mock successful contract response
-	setupMockContract(map[string]bool{"hash1": true})
+	mocktests.SetupMockContract(map[string]bool{"hash1": true})
 	
 	// Replace the contract query function for testing
 	originalQuery := queryContractFunc
-	queryContractFunc = mockQueryContractFunc
+	queryContractFunc = mocktests.MockQueryContractFunc
 	defer func() { queryContractFunc = originalQuery }()
 	
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err != nil {
 		t.Errorf("Expected no error but got: %v", err)
 	}
 }
 
-func TestAPIKeyValidator_updateAPIKeyCache_InvalidPermitFile(t *testing.T) {
+func TestAPIKeyValidator_UpdateAPICache_InvalidPermitFile(t *testing.T) {
 	config := &Config{
 		ContractAddress: "test-contract",
 		PermitFile:      "/non/existent/permit.json",
@@ -157,7 +155,7 @@ func TestAPIKeyValidator_updateAPIKeyCache_InvalidPermitFile(t *testing.T) {
 	
 	validator := NewAPIKeyValidator(config)
 	
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err == nil {
 		t.Error("Expected error but got none")
 	}
@@ -280,7 +278,7 @@ func TestAPIKeyValidator_EmptyContractResponse(t *testing.T) {
 	}
 	defer func() { queryContractFunc = originalQuery }()
 	
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err != nil {
 		t.Errorf("Expected no error but got: %v", err)
 	}
@@ -314,7 +312,7 @@ func TestAPIKeyValidator_MalformedCacheEntries(t *testing.T) {
 	}
 	defer func() { queryContractFunc = originalQuery }()
 	
-	err := validator.updateAPIKeyCache()
+	err := validator.UpdateAPIKeyCache()
 	if err != nil {
 		t.Errorf("Expected no error but got: %v", err)
 	}

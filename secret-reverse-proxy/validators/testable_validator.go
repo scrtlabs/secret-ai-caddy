@@ -1,4 +1,4 @@
-package secret_reverse_proxy
+package validators
 
 import (
 	"crypto/sha256"
@@ -83,7 +83,7 @@ func (v *TestableAPIKeyValidator) ValidateAPIKey(apiKey string) (bool, error) {
 func (v *TestableAPIKeyValidator) checkMasterKeys(apiKey string) (bool, error) {
 	// Use the same logic as the original validator
 	validator := &APIKeyValidator{config: v.config}
-	return validator.checkMasterKeys(apiKey)
+	return validator.CheckMasterKeys(apiKey)
 }
 
 // updateAPIKeyCache queries the contract and updates the in-memory cache
@@ -93,13 +93,13 @@ func (v *TestableAPIKeyValidator) updateAPIKeyCache() error {
 	var err error
 	
 	if v.config.PermitFile != "" {
-		permit, err = readPermitFromFile(v.config.PermitFile)
+		permit, err = ReadPermitFromFile(v.config.PermitFile)
 		if err != nil {
 			return fmt.Errorf("failed to read permit file: %w", err)
 		}
 	} else {
 		// Use default permit if no file specified
-		permit = getDefaultPermit(v.config)
+		permit = GetDefaultPermit(v.config)
 	}
 
 	query := map[string]any{
