@@ -330,6 +330,19 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		zap.String("method", r.Method),
 		zap.String("path", r.URL.Path),
 		zap.String("remote_addr", r.RemoteAddr))
+
+	// BLOCK 1.5: Metrics Endpoint Handling
+	// Check if this is a metrics request and handle it directly
+	if m.Config.EnableMetrics && r.URL.Path == m.Config.MetricsPath {
+		logger.Debug("Handling metrics endpoint request")
+		if m.metricsCollector != nil {
+			m.metricsCollector.ServeMetrics(w, r)
+			return nil
+		}
+		// Fallback if metrics collector is not available
+		http.Error(w, "Metrics not available", http.StatusServiceUnavailable)
+		return nil
+	}
 	
 	// BLOCK 2: Authorization Header Extraction
 	// Check if the request contains an Authorization header
