@@ -119,12 +119,26 @@ func (rr *ResilientReporter) processCurrentUsage() {
 func (rr *ResilientReporter) buildRecords(usage map[string]TokenUsage) []map[string]any {
 	records := make([]map[string]any, 0, len(usage))
 	for apiKeyHash, usageStats := range usage {
-		records = append(records, map[string]any{
+		record := map[string]any{
 			"api_key_hash":  apiKeyHash,
 			"input_tokens":  usageStats.InputTokens,
 			"output_tokens": usageStats.OutputTokens,
 			"timestamp":     usageStats.LastUpdatedAt.Unix(),
-		})
+		}
+		
+		// Add per-model usage data if available
+		if len(usageStats.ModelUsage) > 0 {
+			modelUsageData := make(map[string]map[string]any)
+			for modelName, modelUsage := range usageStats.ModelUsage {
+				modelUsageData[modelName] = map[string]any{
+					"input_tokens":  modelUsage.InputTokens,
+					"output_tokens": modelUsage.OutputTokens,
+				}
+			}
+			record["model_usage"] = modelUsageData
+		}
+		
+		records = append(records, record)
 	}
 	return records
 }
@@ -138,11 +152,18 @@ func (rr *ResilientReporter) submitWithRetry(records []map[string]any, attempt i
 	usageData := make(map[string]map[string]any)
 	for _, record := range records {
 		if apiKeyHash, ok := record["api_key_hash"].(string); ok {
-			usageData[apiKeyHash] = map[string]any{
+			apiKeyData := map[string]any{
 				"input_tokens":  record["input_tokens"],
 				"output_tokens": record["output_tokens"],
 				"timestamp":     record["timestamp"],
 			}
+			
+			// Include model usage data if available
+			if modelUsage, exists := record["model_usage"]; exists {
+				apiKeyData["model_usage"] = modelUsage
+			}
+			
+			usageData[apiKeyHash] = apiKeyData
 		}
 	}
 

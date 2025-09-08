@@ -139,7 +139,7 @@ The docker-compose setup includes:
 ```bash
 curl -H "Authorization: Bearer bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1" \
      -H "Content-Type: application/json" \
-     -d '{"prompt": "Hello, world!", "max_tokens": 100}' \
+     -d '{"model": "llama3.3:70b", "prompt": "Hello, world!", "max_tokens": 100}' \
      http://localhost:8085/
 ```
 
@@ -456,4 +456,4 @@ curl http://localhost:8085/metrics | jq
 For issues and questions:
 - **Documentation**: See [Architecture](./ARCHITECTURE.md) and [Metering](./METERING.md) guides
 - **Issues**: GitHub Issues tracker
-- **Security**: Contact security@scrtlabs.com for security-related issues
+- **Security**: Contact alexh@scrtlabs.com for security-related issues

@@ -18,6 +18,7 @@ package secret_reverse_proxy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -434,6 +435,10 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Read request body BEFORE forwarding to downstream handlers
 	tokenCountStart := time.Now()
 	requestBody, contentType := m.readRequestBody(r)
+	
+	// Detect model from request body
+	modelName := detectModelFromRequestBody(requestBody, contentType)
+	
 	inputTokens := m.countTokens(requestBody, contentType)
 
 	// Record token counting time
@@ -467,13 +472,14 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		hasher.Write([]byte(apiKey))
 		apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
 		
-		m.tokenAccumulator.RecordUsage(apiKeyHash, inputTokens, outputTokens)
+		m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens)
 	}
 
 	// Log token usage for monitoring (enhanced system handles reporting internally)
 	caddy.Log().Info("Token usage recorded",
 		zap.Int("input_tokens", inputTokens),
 		zap.Int("output_tokens", outputTokens),
+		zap.String("model", modelName),
 		zap.String("endpoint", r.URL.Path))
 
 	return nil
@@ -945,6 +951,38 @@ func extractAPIKey(authHeader string) string {
 	
 	// No recognized prefix - return the header as-is (custom format)
 	return authHeader
+}
+
+// detectModelFromRequestBody extracts the model name from JSON request body.
+// This function parses the request body as JSON and searches for a "model" field.
+//
+// Parameters:
+//   - requestBody: The request body content
+//   - contentType: The content type of the request
+//
+// Returns:
+//   - string: The detected model name, or "unknown" if not found or not JSON
+func detectModelFromRequestBody(requestBody, contentType string) string {
+	// Only process JSON content
+	if !strings.Contains(strings.ToLower(contentType), "application/json") {
+		return "unknown"
+	}
+	
+	// Parse JSON to extract model field
+	var jsonData map[string]any
+	if err := json.Unmarshal([]byte(requestBody), &jsonData); err != nil {
+		// Not valid JSON
+		return "unknown"
+	}
+	
+	// Look for model field
+	if model, exists := jsonData["model"]; exists {
+		if modelStr, ok := model.(string); ok && modelStr != "" {
+			return modelStr
+		}
+	}
+	
+	return "unknown"
 }
 
 // parseCaddyfile is the entry point for Caddyfile parsing of this middleware.
