@@ -23,6 +23,7 @@ services:
       - METERING=1
       - METERING_INTERVAL=1m
       - METERING_URL=https://preview-aidev.scrtlabs.com
+      - BLOCK_URLS=8085/api/pull
     volumes:
       - ./Caddyfile-test:/etc/caddy/Caddyfile
       - ./permit.json:/etc/caddy/permit.json

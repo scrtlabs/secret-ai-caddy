@@ -93,8 +93,16 @@ graph TB
 - **Token usage analytics** with input/output token breakdowns
 - **System health indicators** for operational monitoring
 
+### 🚫 URL Filtering & Security
+- **Pattern-based blocking** with configurable URL patterns via environment variables
+- **Early request filtering** for performance optimization (before API key validation)
+- **Comprehensive logging** of blocked requests with pattern matching details
+- **HTTP 403 Forbidden responses** for blocked requests with clear error messages
+- **Metrics integration** for tracking blocked request statistics
+
 ### 🚀 Production Features
 - **Environment variable support** for secure configuration management
+- **URL filtering** with configurable blocked URL patterns via BLOCK_URLS environment variable
 - **Graceful error handling** with detailed logging and audit trails
 - **Resource management** with configurable limits and cleanup procedures
 - **Docker-ready deployment** with multi-stage builds and health checks
@@ -165,6 +173,16 @@ curl -H "Authorization: Bearer bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzd
 **Metrics Check:**
 ```bash
 curl http://localhost:8085/metrics
+```
+
+**URL Filtering Test (Blocked):**
+```bash
+# Set environment variable for URL blocking
+export BLOCK_URLS="/admin,/config,/internal"
+
+# This request will be blocked with HTTP 403
+curl -H "Authorization: Bearer bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1" \
+     http://localhost:8085/admin/users
 ```
 
 ### Configuration Details
@@ -248,6 +266,7 @@ go test -v -run TestMetering
 | `METERING` | Enable/disable usage metering | `1` or `true` |
 | `METERING_INTERVAL` | Reporting interval | `5m`, `1h` |
 | `METERING_URL` | Endpoint for usage reports | `https://api.example.com` |
+| `BLOCK_URLS` | Comma-separated list of URL patterns to block | `/admin,/config,/internal` |
 
 ### Caddyfile Directives
 
@@ -285,6 +304,7 @@ docker run -d \
   -e METERING=true \
   -e METERING_INTERVAL="5m" \
   -e METERING_URL="https://your-metrics-api.com" \
+  -e BLOCK_URLS="/admin,/config,/internal" \
   secret-reverse-proxy:latest
 ```
 
@@ -321,6 +341,7 @@ services:
       - METERING=true
       - METERING_INTERVAL=5m
       - METERING_URL=${METERING_URL}
+      - BLOCK_URLS=${BLOCK_URLS}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - ./master_keys.txt:/etc/caddy/master_keys.txt
@@ -414,6 +435,25 @@ curl http://localhost:8085/metrics | jq
         -H "Content-Type: application/json" \
         -d '{"prompt": "test"}' \
         http://localhost:8085/
+   ```
+
+4. **URL Filtering Issues**
+   ```bash
+   # Check if BLOCK_URLS is set
+   docker exec caddy-reverse-proxy env | grep BLOCK_URLS
+   
+   # View filtering logs
+   docker logs caddy-reverse-proxy 2>&1 | grep -i "blocked"
+   
+   # Test blocked URL
+   curl -H "Authorization: Bearer YOUR_KEY" \
+        http://localhost:8085/admin/test
+   # Should return HTTP 403 Forbidden
+   
+   # Test allowed URL  
+   curl -H "Authorization: Bearer YOUR_KEY" \
+        http://localhost:8085/api/test
+   # Should proceed to API key validation
    ```
 
 ### Debug Configuration

@@ -345,6 +345,33 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		return nil
 	}
 	
+	// BLOCK 1.7: URL Filtering Check
+	// Check if the request URL matches any blocked patterns
+	if len(m.Config.BlockedURLs) > 0 {
+		// Build full request URL including host and port for filtering
+		requestURL := r.Host + r.URL.Path
+		if r.URL.RawQuery != "" {
+			requestURL += "?" + r.URL.RawQuery
+		}
+		
+		for _, blockedPattern := range m.Config.BlockedURLs {
+			if strings.Contains(requestURL, blockedPattern) {
+				logger.Info("Request blocked: URL contains blocked pattern",
+					zap.String("remote_addr", r.RemoteAddr),
+					zap.String("full_url", requestURL),
+					zap.String("blocked_pattern", blockedPattern))
+				
+				// Record rejection metrics
+				if m.metricsCollector != nil {
+					m.metricsCollector.RecordRejected()
+				}
+				
+				http.Error(w, "URL blocked by filter", http.StatusForbidden)
+				return nil
+			}
+		}
+	}
+
 	// BLOCK 2: Authorization Header Extraction
 	// Check if the request contains an Authorization header
 	authHeader := r.Header.Get("Authorization")
@@ -514,6 +541,27 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if m.Config == nil {
 		m.Config = proxyconfig.DefaultConfig()
 		logger.Debug("Using default configuration")
+	}
+	
+	// BLOCK 1.5: Environment Variable Processing
+	// Check for BLOCK_URLS environment variable and parse it
+	if blockURLsEnv := os.Getenv("BLOCK_URLS"); blockURLsEnv != "" {
+		// Parse comma-separated URLs from environment variable
+		blockedURLs := strings.Split(blockURLsEnv, ",")
+		for i, url := range blockedURLs {
+			blockedURLs[i] = strings.TrimSpace(url)
+		}
+		// Filter out empty strings
+		var filteredURLs []string
+		for _, url := range blockedURLs {
+			if url != "" {
+				filteredURLs = append(filteredURLs, url)
+			}
+		}
+		m.Config.BlockedURLs = filteredURLs
+		logger.Info("🚫 Blocked URLs configured from environment", 
+			zap.Strings("blocked_urls", m.Config.BlockedURLs),
+			zap.Int("count", len(m.Config.BlockedURLs)))
 	}
 	
 	logger.Info("UnmarshalCaddyfile called - parsing secret_reverse_proxy configuration")

@@ -44,6 +44,9 @@ type Config struct {
 	RetryBackoff       time.Duration `json:"retry_backoff,omitempty"`       // Base retry backoff duration
 	EnableMetrics      bool          `json:"enable_metrics,omitempty"`      // Enable metrics collection
 	MetricsPath        string        `json:"metrics_path,omitempty"`        // Metrics endpoint path
+	
+	// URL filtering options
+	BlockedURLs        []string      `json:"blocked_urls,omitempty"`        // List of blocked URL patterns
 }
 
 // Config interface implementation for enhanced metering
