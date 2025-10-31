@@ -3,7 +3,6 @@ package querycontract
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -14,10 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/miscreant/miscreant.go"
+	"github.com/scrtlabs/secret-reverse-proxy/utils"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
@@ -28,17 +27,6 @@ func getSecretNode() string {
 		return node
 	}
 	return "pulsar.lcd.secretnodes.com"
-}
-
-func getHTTPClient() *http.Client {
-	skipSSL := os.Getenv("SKIP_SSL_VALIDATION")
-	if strings.ToLower(skipSSL) == "true" {
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-		return &http.Client{Transport: tr}
-	}
-	return http.DefaultClient
 }
 
 func Trace() string {
@@ -131,7 +119,7 @@ func (w *WASMContext) getTxSenderKeyPair() ([]byte, []byte, error) {
 }
 
 func (w *WASMContext) getConsensusIOPubKey() ([]byte, error) {
-	client := getHTTPClient()
+	client := utils.GetHTTPClient()
 	resp, err := client.Get(fmt.Sprintf("https://%s/registration/v1beta1/tx-key", getSecretNode()))
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("failed to fetch consensus IO public key: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to fetch consensus IO public key: %w", err)
@@ -239,7 +227,7 @@ func fetchCodeHash(contractAddress string) (string, error) {
 	url := fmt.Sprintf("https://%s/compute/v1beta1/code_hash/by_contract_address/%s", getSecretNode(), contractAddress)
 	logger.Info("fetchCodeHash", zap.String("url", url))
 
-	client := getHTTPClient()
+	client := utils.GetHTTPClient()
 	resp, err := client.Get(url)
 	if err != nil {
 		return "", errors.New(fmt.Sprintf("failed to fetch code hash: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to fetch code hash: %w", err)
@@ -290,7 +278,7 @@ func QueryContract(contractAddress string, query map[string]interface{}) (map[st
 	encodedData := base64.URLEncoding.EncodeToString(encryptedData)
 	url := fmt.Sprintf("https://%s/compute/v1beta1/query/%s?query=%s", getSecretNode(), contractAddress, encodedData)
 	logger.Info("QueryContract", zap.String("url", url))
-	client := getHTTPClient()
+	client := utils.GetHTTPClient()
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("failed to query contract: %s", err) + "\n" + Trace()) //fmt.Errorf("failed to query contract: %w", err)

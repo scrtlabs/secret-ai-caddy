@@ -10,8 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	
+
 	"github.com/caddyserver/caddy/v2"
+	"github.com/scrtlabs/secret-reverse-proxy/utils"
 	"go.uber.org/zap"
 )
 
@@ -196,10 +197,9 @@ func (rr *ResilientReporter) submitWithRetry(records []map[string]any, attempt i
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Caddy-Secret-Reverse-Proxy-Enhanced/1.0")
 
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// Create HTTP client with timeout and SSL configuration
+	client := utils.GetHTTPClient()
+	client.Timeout = 30 * time.Second
 
 	// Send the request
 	resp, err := client.Do(req)
