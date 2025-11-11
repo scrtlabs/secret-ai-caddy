@@ -44,7 +44,11 @@ type Config struct {
 	RetryBackoff       time.Duration `json:"retry_backoff,omitempty"`       // Base retry backoff duration
 	EnableMetrics      bool          `json:"enable_metrics,omitempty"`      // Enable metrics collection
 	MetricsPath        string        `json:"metrics_path,omitempty"`        // Metrics endpoint path
-	
+
+	// Tokenizer configuration options
+	TokenizerCacheDir  string        `json:"tokenizer_cache_dir,omitempty"` // Directory for caching tokenizer files
+	PreloadModels      []string      `json:"preload_models,omitempty"`      // Models to preload on startup
+
 	// URL filtering options
 	BlockedURLs        []string      `json:"blocked_urls,omitempty"`        // List of blocked URL patterns
 }
@@ -95,5 +99,9 @@ func DefaultConfig() *Config {
 		RetryBackoff:       5 * time.Minute,     // 5 minute base backoff
 		EnableMetrics:      false,               // Disabled by default
 		MetricsPath:        "/metrics",          // Standard metrics path
+
+		// Tokenizer defaults
+		TokenizerCacheDir:  "/tmp/tokenizers",   // Default cache directory
+		PreloadModels:      []string{"llama-2", "mistral"}, // Common models to preload
 	}
 }

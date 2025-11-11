@@ -462,11 +462,11 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Read request body BEFORE forwarding to downstream handlers
 	tokenCountStart := time.Now()
 	requestBody, contentType := m.readRequestBody(r)
-	
+
 	// Detect model from request body
 	modelName := detectModelFromRequestBody(requestBody, contentType)
-	
-	inputTokens := m.countTokens(requestBody, contentType)
+
+	inputTokens := m.countTokens(requestBody, contentType, modelName)
 
 	// Record token counting time
 	if m.metricsCollector != nil {
@@ -482,7 +482,7 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Count response tokens
 	responseTokenCountStart := time.Now()
 	responseBody, responseContentType := m.extractResponseBody(wrappedWriter)
-	outputTokens := m.countTokens(responseBody, responseContentType)
+	outputTokens := m.countTokens(responseBody, responseContentType, modelName)
 
 	// Record response token counting time
 	if m.metricsCollector != nil {
@@ -845,16 +845,17 @@ func parseByteSize(value string) (int64, error) {
 	return 0, fmt.Errorf("invalid byte size format: %s", value)
 }
 
-// countTokens counts tokens using the enhanced token counting system
-func (m *Middleware) countTokens(content, contentType string) int {
+// countTokens counts tokens using the enhanced token counting system with model awareness
+func (m *Middleware) countTokens(content, contentType, model string) int {
 	if content == "" {
 		return 0
 	}
-	
-	// Enhanced token counting only
+
+	// Enhanced token counting with accurate model-specific tokenizers
 	if m.tokenCounter != nil {
-		tokens := m.tokenCounter.CountTokens(content, contentType)
-		
+		// Use new accurate method with model parameter
+		tokens := m.tokenCounter.CountTokensWithModel(content, contentType, model)
+
 		// Validate and adjust token count if needed
 		adjustedTokens := m.tokenCounter.ValidateTokenCount(tokens, len(content))
 		if adjustedTokens != tokens {
@@ -864,16 +865,18 @@ func (m *Middleware) countTokens(content, contentType string) int {
 			caddy.Log().Debug("Token count adjusted",
 				zap.Int("original", tokens),
 				zap.Int("adjusted", adjustedTokens),
-				zap.Int("content_length", len(content)))
+				zap.Int("content_length", len(content)),
+				zap.String("model", model))
 		}
-		
+
 		return adjustedTokens
 	}
-	
+
 	// If enhanced system is not available, log error and return 0
 	caddy.Log().Warn("Enhanced token counter not available, cannot count tokens",
 		zap.String("content_type", contentType),
-		zap.Int("content_length", len(content)))
+		zap.Int("content_length", len(content)),
+		zap.String("model", model))
 	return 0
 }
 

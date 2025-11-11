@@ -12,16 +12,28 @@ import (
 
 // TokenCounter provides accurate token counting for different content types
 type TokenCounter struct {
-	logger *zap.Logger
+	logger            *zap.Logger
+	accurateTokenizer *AccurateTokenizer
 }
 
 func NewTokenCounter() *TokenCounter {
+	// Initialize accurate tokenizer
+	accurateTok, err := NewAccurateTokenizer("/tmp/tokenizers")
+	if err != nil {
+		caddy.Log().Error("Failed to initialize accurate tokenizer, will use fallback", zap.Error(err))
+	} else {
+		// Preload common models in background
+		go accurateTok.PreloadCommonModels()
+	}
+
 	return &TokenCounter{
-		logger: caddy.Log(),
+		logger:            caddy.Log(),
+		accurateTokenizer: accurateTok,
 	}
 }
 
 // CountTokens intelligently counts tokens based on content type and structure
+// Deprecated: Use CountTokensWithModel for accurate counting
 func (tc *TokenCounter) CountTokens(content string, contentType string) int {
 	if content == "" {
 		return 0
@@ -41,6 +53,54 @@ func (tc *TokenCounter) CountTokens(content string, contentType string) int {
 	default:
 		return tc.countGenericTokens(content)
 	}
+}
+
+// CountTokensWithModel counts tokens accurately using model-specific tokenizers
+func (tc *TokenCounter) CountTokensWithModel(content string, contentType string, model string) int {
+	if content == "" {
+		return 0
+	}
+
+	// If we have an accurate tokenizer and a model name, use it
+	if tc.accurateTokenizer != nil && model != "" && model != "unknown" {
+		tokens, err := tc.accurateTokenizer.CountTokens(content, model)
+		if err != nil {
+			tc.logger.Debug("Failed to use accurate tokenizer, falling back to heuristic",
+				zap.String("model", model),
+				zap.Error(err))
+		} else {
+			tc.logger.Debug("Used accurate tokenizer",
+				zap.String("model", model),
+				zap.Int("tokens", tokens),
+				zap.Int("content_length", len(content)))
+			return tokens
+		}
+	}
+
+	// Fallback to old logic if accurate tokenizer not available or model unknown
+	// But use improved estimation (chars/4 instead of inflated heuristic)
+	return tc.improvedFallbackCount(content, contentType)
+}
+
+// improvedFallbackCount provides better estimation than old heuristic
+func (tc *TokenCounter) improvedFallbackCount(content string, contentType string) int {
+	// For JSON content, try to extract text first
+	if strings.Contains(contentType, "json") {
+		if tokens := tc.countJSONTokens(content); tokens > 0 {
+			return tokens
+		}
+	}
+
+	// Use simple chars/4 (more conservative than old chars/4 + words*1.33 average)
+	chars := utf8.RuneCountInString(strings.TrimSpace(content))
+	tokens := chars / 4
+
+	// Ensure at least 1 token for non-empty content
+	if tokens == 0 && len(content) > 0 {
+		tokens = 1
+	}
+
+	return tokens
 }
 
 // countJSONTokens extracts text from common AI API JSON structures
@@ -129,28 +189,25 @@ func (tc *TokenCounter) countJSONLikeTokens(content string) int {
 }
 
 // countTextTokens implements improved token counting for plain text
+// Note: This is now a simple chars/4 estimation to avoid inflation
 func (tc *TokenCounter) countTextTokens(text string) int {
 	if text == "" {
 		return 0
 	}
-	
+
 	// Clean and normalize text
 	cleaned := strings.TrimSpace(text)
 	cleaned = regexp.MustCompile(`\s+`).ReplaceAllString(cleaned, " ")
-	
-	// Use multiple estimation methods and take average
+
+	// Use simple chars/4 estimation (conservative approach)
 	charBasedTokens := utf8.RuneCountInString(cleaned) / 4
-	wordBasedTokens := int(float64(len(strings.Fields(cleaned))) * 1.33)
-	
-	// Weight towards the more conservative estimate
-	averageTokens := (charBasedTokens + wordBasedTokens) / 2
-	
+
 	// Apply minimum threshold
-	if averageTokens < 1 && len(cleaned) > 0 {
+	if charBasedTokens < 1 && len(cleaned) > 0 {
 		return 1
 	}
-	
-	return averageTokens
+
+	return charBasedTokens
 }
 
 // countGenericTokens fallback for unknown content types

@@ -8,6 +8,7 @@ import (
 // TokenCounter provides intelligent token counting functionality
 type TokenCounter interface {
 	CountTokens(content, contentType string) int
+	CountTokensWithModel(content, contentType, model string) int
 	ValidateTokenCount(tokens int, contentLength int) int
 }
 
