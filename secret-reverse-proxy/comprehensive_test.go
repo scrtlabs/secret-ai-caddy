@@ -487,11 +487,19 @@ func TestServeHTTP_WithProperMocking(t *testing.T) {
 
 // TestDefaultPermitStructure tests the default permit structure
 func TestDefaultPermitStructure(t *testing.T) {
+	// Set required env vars
+	t.Setenv("SECRETAI_PERMIT_TYPE", "tendermint/PubKeySecp256k1")
+	t.Setenv("SECRETAI_PERMIT_PUBKEY", "TestPubKeyValue")
+	t.Setenv("SECRETAI_PERMIT_SIG", "TestSigValue")
+
 	config := &Config{
 		ContractAddress: "secret1test123",
 		SecretChainID:   "secret-4",
 	}
-	permit := apikeyval.GetDefaultPermit(config)
+	permit, err := apikeyval.GetDefaultPermit(config)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
 
 	// Test complete structure
 	if permit == nil {

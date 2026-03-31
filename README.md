@@ -284,6 +284,8 @@ The `Caddyfile-test` demonstrates comprehensive configuration:
         secret_node {env.SECRET_NODE}
         contract_address {env.SECRET_CONTRACT}
         secret_chain_id {env.SECRET_CHAIN_ID}
+        # permit_file is optional if SECRETAI_PERMIT_TYPE, SECRETAI_PERMIT_PUBKEY,
+        # and SECRETAI_PERMIT_SIG env vars are set instead
         permit_file /etc/caddy/permit.json
 
         # Metering configuration
@@ -359,14 +361,18 @@ go test -v -run TestMetering
 | `METERING_INTERVAL` | Reporting interval | `5m`, `1h` |
 | `METERING_URL` | Endpoint for usage reports | `https://api.example.com` |
 | `BLOCK_URLS` | Comma-separated list of URL patterns to block | `/admin,/config,/internal` |
+| `SECRETAI_MASTER_KEYS` | Comma-separated list of master API keys. Used as an alternative (or in addition) to `master_keys_file`. | `key1,key2,key3` |
+| `SECRETAI_PERMIT_TYPE` | Permit public key type. Required when no `permit_file` is configured — used to construct a permit on the fly for retrieving API keys from KMS. | `tendermint/PubKeySecp256k1` |
+| `SECRETAI_PERMIT_PUBKEY` | Permit public key value. Required when no `permit_file` is configured. | `Aur9D8RLq...` |
+| `SECRETAI_PERMIT_SIG` | Permit signature. Required when no `permit_file` is configured. | `TeNtblPmo...` |
 
 ### Caddyfile Directives
 
 | Directive | Type | Description | Default |
 |-----------|------|-------------|---------|
 | `API_MASTER_KEY` | string | Primary master key | None |
-| `master_keys_file` | path | Additional keys file | `""` |
-| `permit_file` | path | Secret Network permit file | Uses default |
+| `master_keys_file` | path | Path to a file containing additional master keys (one per line). Optional — if not configured, `SECRETAI_MASTER_KEYS` env var can be used instead. | `""` |
+| `permit_file` | path | Path to a JSON file containing the Secret Network permit configuration used to retrieve Secret AI API Keys from KMS. Optional — if not configured, the system constructs a permit on the fly from `SECRETAI_PERMIT_TYPE`, `SECRETAI_PERMIT_PUBKEY`, and `SECRETAI_PERMIT_SIG` env vars. | None |
 | `contract_address` | string | Smart contract address | Required |
 | `secret_node` | string | Secret Network node | Required |
 | `secret_chain_id` | string | Chain ID | Required |

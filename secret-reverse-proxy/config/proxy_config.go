@@ -17,8 +17,9 @@ type Config struct {
 	MasterKeysFile string `json:"master_keys_file,omitempty"`
 	
 	// PermitFile is the path to a JSON file containing the Secret Network permit configuration.
-	// If not specified, a default hardcoded permit will be used.
-	// The permit defines blockchain authentication parameters for contract queries.
+	// If not specified, the permit is constructed from environment variables:
+	// SECRETAI_PERMIT_TYPE, SECRETAI_PERMIT_PUBKEY, and SECRETAI_PERMIT_SIG.
+	// Either PermitFile or all three env vars must be provided.
 	PermitFile string `json:"permit_file,omitempty"`
 	
 	// ContractAddress is the Secret Network smart contract address that stores valid API keys.

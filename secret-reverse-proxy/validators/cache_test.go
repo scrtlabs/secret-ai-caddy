@@ -13,7 +13,17 @@ import (
 )
 
 var mockContract *mocktests.MockQueryContract
+
+// setPermitEnvVars sets the required permit env vars for tests that call UpdateAPIKeyCache without a PermitFile
+func setPermitEnvVars(t *testing.T) {
+	t.Helper()
+	t.Setenv("SECRETAI_PERMIT_TYPE", "tendermint/PubKeySecp256k1")
+	t.Setenv("SECRETAI_PERMIT_PUBKEY", "TestPubKeyValue")
+	t.Setenv("SECRETAI_PERMIT_SIG", "TestSigValue")
+}
+
 func TestAPIKeyValidator_UpdateAPICache_Success(t *testing.T) {
+	setPermitEnvVars(t)
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -51,6 +61,7 @@ func TestAPIKeyValidator_UpdateAPICache_Success(t *testing.T) {
 }
 
 func TestAPIKeyValidator_UpdateAPICache_ContractFailure(t *testing.T) {
+	setPermitEnvVars(t)
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -77,6 +88,7 @@ func TestAPIKeyValidator_UpdateAPICache_ContractFailure(t *testing.T) {
 }
 
 func TestAPIKeyValidator_UpdateAPICache_InvalidResponse(t *testing.T) {
+	setPermitEnvVars(t)
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -262,6 +274,7 @@ func TestAPIKeyValidator_CacheKeyHashing(t *testing.T) {
 }
 
 func TestAPIKeyValidator_EmptyContractResponse(t *testing.T) {
+	setPermitEnvVars(t)
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -290,6 +303,7 @@ func TestAPIKeyValidator_EmptyContractResponse(t *testing.T) {
 }
 
 func TestAPIKeyValidator_MalformedCacheEntries(t *testing.T) {
+	setPermitEnvVars(t)
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,

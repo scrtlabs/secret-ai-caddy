@@ -144,6 +144,9 @@ func TestServeHTTP_ValidationErrorPaths(t *testing.T) {
 
 // TestCheckMasterKeys_ErrorConditions tests error conditions in checkMasterKeys
 func TestCheckMasterKeys_ErrorConditions(t *testing.T) {
+	// Clear env var so it doesn't interfere
+	t.Setenv("SECRETAI_MASTER_KEYS", "")
+
 	// Test with directory instead of file (should cause read error)
 	tmpDir, err := ioutil.TempDir("", "test-dir")
 	if err != nil {

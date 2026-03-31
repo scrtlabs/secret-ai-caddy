@@ -160,54 +160,73 @@ func (v *APIKeyValidator) CleanupCache() {
 	v.cacheMutex.Unlock()
 }
 
-// checkMasterKeys checks if the provided API key exists in the master keys file
+// CheckMasterKeys checks if the provided API key exists in the master keys file
+// or in the SECRETAI_MASTER_KEYS environment variable (comma-separated list).
+// The file is checked first; if no file is configured, the env var is checked.
 func (v *APIKeyValidator) CheckMasterKeys(apiKey string) (bool, error) {
 	logger := caddy.Log()
-	
-	if v.config.MasterKeysFile == "" {
-		logger.Debug("No master keys file configured")
-		return false, nil
-	}
-	
-	logger.Debug("Checking master keys file", zap.String("file", v.config.MasterKeysFile))
-	
-	file, err := os.Open(v.config.MasterKeysFile)
-	if err != nil {
-		// If file doesn't exist, that's not an error
-		if os.IsNotExist(err) {
+
+	// Check master keys file if configured
+	if v.config.MasterKeysFile != "" {
+		logger.Debug("Checking master keys file", zap.String("file", v.config.MasterKeysFile))
+
+		file, err := os.Open(v.config.MasterKeysFile)
+		if err != nil {
+			// If file doesn't exist, that's not an error — fall through to env var check
+			if !os.IsNotExist(err) {
+				logger.Error("Failed to open master keys file",
+					zap.String("file", v.config.MasterKeysFile),
+					zap.Error(err))
+				return false, fmt.Errorf("failed to open master keys file: %w", err)
+			}
 			logger.Debug("Master keys file does not exist", zap.String("file", v.config.MasterKeysFile))
-			return false, nil
-		}
-		logger.Error("Failed to open master keys file",
-			zap.String("file", v.config.MasterKeysFile),
-			zap.Error(err))
-		return false, fmt.Errorf("failed to open master keys file: %w", err)
-	}
-	defer file.Close()
+		} else {
+			defer file.Close()
 
-	lineCount := 0
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lineCount++
-		nextMasterKey := strings.TrimSpace(scanner.Text())
-		if nextMasterKey != "" && nextMasterKey == apiKey {
-			logger.Debug("API key found in master keys file",
+			lineCount := 0
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				lineCount++
+				nextMasterKey := strings.TrimSpace(scanner.Text())
+				if nextMasterKey != "" && nextMasterKey == apiKey {
+					logger.Debug("API key found in master keys file",
+						zap.String("file", v.config.MasterKeysFile),
+						zap.Int("line", lineCount))
+					return true, nil
+				}
+			}
+
+			if err := scanner.Err(); err != nil {
+				logger.Error("Error reading master keys file",
+					zap.String("file", v.config.MasterKeysFile),
+					zap.Error(err))
+				return false, fmt.Errorf("error reading master keys file: %w", err)
+			}
+
+			logger.Debug("API key not found in master keys file",
 				zap.String("file", v.config.MasterKeysFile),
-				zap.Int("line", lineCount))
-			return true, nil
+				zap.Int("lines_checked", lineCount))
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		logger.Error("Error reading master keys file",
-			zap.String("file", v.config.MasterKeysFile),
-			zap.Error(err))
-		return false, fmt.Errorf("error reading master keys file: %w", err)
+	// Check SECRETAI_MASTER_KEYS env var (comma-separated list)
+	envKeys := os.Getenv("SECRETAI_MASTER_KEYS")
+	if envKeys != "" {
+		logger.Debug("Checking SECRETAI_MASTER_KEYS env var")
+		for _, key := range strings.Split(envKeys, ",") {
+			key = strings.TrimSpace(key)
+			if key != "" && key == apiKey {
+				logger.Debug("API key found in SECRETAI_MASTER_KEYS env var")
+				return true, nil
+			}
+		}
+		logger.Debug("API key not found in SECRETAI_MASTER_KEYS env var")
 	}
 
-	logger.Debug("API key not found in master keys file",
-		zap.String("file", v.config.MasterKeysFile),
-		zap.Int("lines_checked", lineCount))
+	if v.config.MasterKeysFile == "" && envKeys == "" {
+		logger.Debug("No master keys file configured and SECRETAI_MASTER_KEYS env var not set")
+	}
+
 	return false, nil
 }
 
@@ -234,7 +253,11 @@ func (v *APIKeyValidator) UpdateAPIKeyCache() error {
 	} else {
 		logger.Debug("Using default permit configuration")
 		// Use default permit if no file specified
-		permit = GetDefaultPermit(v.config)
+		permit, err = GetDefaultPermit(v.config)
+		if err != nil {
+			logger.Error("Failed to get default permit", zap.Error(err))
+			return fmt.Errorf("failed to get default permit: %w", err)
+		}
 	}
 
 	query := map[string]any{
@@ -326,8 +349,28 @@ func NewAPIKeyValidator(config *Config) *APIKeyValidator {
 
 
 
-// getDefaultPermit returns the default permit configuration
-func GetDefaultPermit(config *Config) map[string]any {
+// GetDefaultPermit returns the default permit configuration using environment variables.
+// Required env vars: SECRETAI_PERMIT_TYPE, SECRETAI_PERMIT_PUBKEY, SECRETAI_PERMIT_SIG.
+// Returns an error if any of the required env vars are not set.
+func GetDefaultPermit(config *Config) (map[string]any, error) {
+	permitType := os.Getenv("SECRETAI_PERMIT_TYPE")
+	permitPubKey := os.Getenv("SECRETAI_PERMIT_PUBKEY")
+	permitSig := os.Getenv("SECRETAI_PERMIT_SIG")
+
+	if permitType == "" || permitPubKey == "" || permitSig == "" {
+		var missing []string
+		if permitType == "" {
+			missing = append(missing, "SECRETAI_PERMIT_TYPE")
+		}
+		if permitPubKey == "" {
+			missing = append(missing, "SECRETAI_PERMIT_PUBKEY")
+		}
+		if permitSig == "" {
+			missing = append(missing, "SECRETAI_PERMIT_SIG")
+		}
+		return nil, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+	}
+
 	return map[string]any{
 		"params": map[string]any{
 			"permit_name":    "api_keys_permit",
@@ -337,12 +380,12 @@ func GetDefaultPermit(config *Config) map[string]any {
 		},
 		"signature": map[string]any{
 			"pub_key": map[string]any{
-				"type":  "tendermint/PubKeySecp256k1",
-				"value": "Aur9D8RLqYMf3sBTiXdhH8mMI9bPHisdDa9y9jwW9RyT",
+				"type":  permitType,
+				"value": permitPubKey,
 			},
-		"signature": "TeNtblPmooqErLX3ECMKfAYJdVB5/BTULW00CGX5nDZ1iuvHUPY+fetdBCQ8NfmyPARzcH5QRkmC2hQG8+fJJw==",
+			"signature": permitSig,
 		},
-	}
+	}, nil
 }
 
 // readPermitFromFile reads the permit from a JSON file

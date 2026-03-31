@@ -101,6 +101,25 @@ func (Middleware) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// optionalConfigSource returns a log-friendly description for an optional config param.
+// If the config value is set, it returns it. If not, it checks whether the corresponding
+// env var(s) are set and reports that instead.
+func optionalConfigSource(configValue string, envVarNames ...string) string {
+	if configValue != "" {
+		return configValue
+	}
+	var setVars []string
+	for _, name := range envVarNames {
+		if os.Getenv(name) != "" {
+			setVars = append(setVars, name)
+		}
+	}
+	if len(setVars) > 0 {
+		return "(using env: " + strings.Join(setVars, ", ") + ")"
+	}
+	return "(not configured)"
+}
+
 // Provision implements caddy.Provisioner and is called by Caddy to set up the middleware.
 // This method is invoked during Caddy's configuration loading phase, before any requests
 // are processed. It initializes the middleware with configuration and creates the validator.
@@ -184,9 +203,9 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		zap.String("secret_chain_id", m.Config.SecretChainID),
 		zap.String("contract_address", m.Config.ContractAddress),
 		zap.Duration("cache_ttl", m.Config.CacheTTL),
-		zap.String("master_keys_file", m.Config.MasterKeysFile),
+		zap.String("master_keys", optionalConfigSource(m.Config.MasterKeysFile, "SECRETAI_MASTER_KEYS")),
 		zap.String("master_key_configured", m.Config.APIKey),
-		zap.String("permit_file_configured", m.Config.PermitFile),
+		zap.String("permit", optionalConfigSource(m.Config.PermitFile, "SECRETAI_PERMIT_TYPE", "SECRETAI_PERMIT_PUBKEY", "SECRETAI_PERMIT_SIG")),
 		zap.Bool("metering", m.Config.Metering),
 		zap.Duration("metering_interval", m.Config.MeteringInterval),
 		zap.String("metering_url", m.Config.MeteringURL),
@@ -224,8 +243,8 @@ func (m *Middleware) Validate() error {
 	// Log the complete configuration contents
 	logger.Info("Configuration contents",
 		zap.String("api_key", m.Config.APIKey),
-		zap.String("master_keys_file", m.Config.MasterKeysFile),
-		zap.String("permit_file", m.Config.PermitFile),
+		zap.String("master_keys", optionalConfigSource(m.Config.MasterKeysFile, "SECRETAI_MASTER_KEYS")),
+		zap.String("permit", optionalConfigSource(m.Config.PermitFile, "SECRETAI_PERMIT_TYPE", "SECRETAI_PERMIT_PUBKEY", "SECRETAI_PERMIT_SIG")),
 		zap.String("secret_node", m.Config.SecretNode),
 		zap.String("secret_chain_id", m.Config.SecretChainID),
 		zap.String("contract_address", m.Config.ContractAddress),
@@ -279,6 +298,27 @@ func (m *Middleware) Validate() error {
 				zap.String("file", m.Config.PermitFile),
 				zap.Error(err))
 		}
+	} else {
+		// No permit file configured — ensure the required env vars are set
+		permitType := os.Getenv("SECRETAI_PERMIT_TYPE")
+		permitPubKey := os.Getenv("SECRETAI_PERMIT_PUBKEY")
+		permitSig := os.Getenv("SECRETAI_PERMIT_SIG")
+		if permitType == "" || permitPubKey == "" || permitSig == "" {
+			var missing []string
+			if permitType == "" {
+				missing = append(missing, "SECRETAI_PERMIT_TYPE")
+			}
+			if permitPubKey == "" {
+				missing = append(missing, "SECRETAI_PERMIT_PUBKEY")
+			}
+			if permitSig == "" {
+				missing = append(missing, "SECRETAI_PERMIT_SIG")
+			}
+			err := fmt.Errorf("no permit_file configured and missing required environment variables: %s", strings.Join(missing, ", "))
+			logger.Error("Validation failed", zap.Error(err))
+			return err
+		}
+		logger.Info("No permit file configured, using permit env vars (SECRETAI_PERMIT_TYPE, SECRETAI_PERMIT_PUBKEY, SECRETAI_PERMIT_SIG)")
 	}
 	
 	if m.Config.Metering {
@@ -802,10 +842,10 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 		logger.Info("🔄 Finished processing block for token:", zap.String("token", d.Val()))
 	}
-	logger.Info("✅ Final configuration:", 
+	logger.Info("✅ Final configuration:",
 		zap.String("api_key", m.Config.APIKey),
-		zap.String("master_keys_file", m.Config.MasterKeysFile),
-		zap.String("permit_file", m.Config.PermitFile),
+		zap.String("master_keys", optionalConfigSource(m.Config.MasterKeysFile, "SECRETAI_MASTER_KEYS")),
+		zap.String("permit", optionalConfigSource(m.Config.PermitFile, "SECRETAI_PERMIT_TYPE", "SECRETAI_PERMIT_PUBKEY", "SECRETAI_PERMIT_SIG")),
 		zap.String("contract_address", m.Config.ContractAddress),
 		zap.String("secret_node", m.Config.SecretNode),
 		zap.String("secret_chain_id", m.Config.SecretChainID),

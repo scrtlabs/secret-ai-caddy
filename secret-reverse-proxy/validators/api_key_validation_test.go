@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 	utils "github.com/scrtlabs/secret-reverse-proxy/util"
-	mocktests "github.com/scrtlabs/secret-reverse-proxy/tests"
 )
 
 func TestAPIKeyValidator_ValidateAPIKey_MasterKey(t *testing.T) {
@@ -34,7 +33,7 @@ func TestAPIKeyValidator_ValidateAPIKey_MasterKey(t *testing.T) {
 			name:        "invalid master key",
 			apiKey:      "wrong-key",
 			expectValid: false,
-			expectError: false,
+			expectError: true, // Falls through to contract query which fails without permit config
 		},
 		{
 			name:        "empty key",
@@ -91,6 +90,7 @@ func TestAPIKeyValidator_ValidateAPIKey_MasterKeysFile(t *testing.T) {
 		name        string
 		apiKey      string
 		expectValid bool
+		expectError bool
 	}{
 		{
 			name:        "valid file key",
@@ -101,18 +101,26 @@ func TestAPIKeyValidator_ValidateAPIKey_MasterKeysFile(t *testing.T) {
 			name:        "invalid file key",
 			apiKey:      "not-in-file",
 			expectValid: false,
+			expectError: true, // Falls through to contract query which fails without permit config
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			valid, err := validator.ValidateAPIKey(tt.apiKey)
-			
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+				return
+			}
+
 			if err != nil {
 				t.Errorf("Expected no error but got: %v", err)
 				return
 			}
-			
+
 			if valid != tt.expectValid {
 				t.Errorf("Expected valid=%v, got valid=%v", tt.expectValid, valid)
 			}
@@ -121,6 +129,10 @@ func TestAPIKeyValidator_ValidateAPIKey_MasterKeysFile(t *testing.T) {
 }
 
 func TestAPIKeyValidator_ValidateAPIKey_Cache(t *testing.T) {
+	t.Setenv("SECRETAI_PERMIT_TYPE", "tendermint/PubKeySecp256k1")
+	t.Setenv("SECRETAI_PERMIT_PUBKEY", "TestPubKeyValue")
+	t.Setenv("SECRETAI_PERMIT_SIG", "TestSigValue")
+
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
@@ -146,15 +158,12 @@ func TestAPIKeyValidator_ValidateAPIKey_Cache(t *testing.T) {
 		t.Error("Expected valid=true from cache")
 	}
 	
-	// Test cache miss (key not in cache)
+	// Test cache miss (key not in cache) — triggers contract query which fails in test env
 	missingKey := "not-in-cache"
-	
-	// Set up mock contract to simulate contract query
-	mocktests.SetupMockContract(map[string]bool{})
-	
+
 	valid, err = validator.ValidateAPIKey(missingKey)
-	if err != nil {
-		t.Errorf("Expected no error but got: %v", err)
+	if err == nil {
+		t.Error("Expected error from contract query in test environment")
 	}
 	if valid {
 		t.Error("Expected valid=false for key not in contract")
@@ -162,6 +171,10 @@ func TestAPIKeyValidator_ValidateAPIKey_Cache(t *testing.T) {
 }
 
 func TestAPIKeyValidator_ValidateAPIKey_StaleCache(t *testing.T) {
+	t.Setenv("SECRETAI_PERMIT_TYPE", "tendermint/PubKeySecp256k1")
+	t.Setenv("SECRETAI_PERMIT_PUBKEY", "TestPubKeyValue")
+	t.Setenv("SECRETAI_PERMIT_SIG", "TestSigValue")
+
 	config := &Config{
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Millisecond * 10, // Very short TTL
@@ -177,62 +190,88 @@ func TestAPIKeyValidator_ValidateAPIKey_StaleCache(t *testing.T) {
 	
 	validator.cache[keyHash] = true
 	validator.lastUpdate = time.Now().Add(-time.Hour) // Old timestamp
-	
-	// Set up mock contract
-	mocktests.SetupMockContract(map[string]bool{
-		keyHash: true,
-	})
-	
+
 	// Sleep to ensure cache is stale
 	time.Sleep(time.Millisecond * 20)
-	
+
+	// Stale cache triggers contract query which fails in test env
 	valid, err := validator.ValidateAPIKey(testKey)
-	if err != nil {
-		t.Errorf("Expected no error but got: %v", err)
+	if err == nil {
+		t.Error("Expected error from contract query in test environment")
 	}
-	if !valid {
-		t.Error("Expected valid=true after cache refresh")
+	if valid {
+		t.Error("Expected valid=false when contract query fails")
 	}
 }
 
 func TestGetDefaultPermit(t *testing.T) {
+	// Set required env vars
+	t.Setenv("SECRETAI_PERMIT_TYPE", "tendermint/PubKeySecp256k1")
+	t.Setenv("SECRETAI_PERMIT_PUBKEY", "TestPubKeyValue")
+	t.Setenv("SECRETAI_PERMIT_SIG", "TestSigValue")
+
 	config := &Config{
 		ContractAddress: "secret1abc123",
 		SecretChainID:   "secret-4",
 	}
-	permit := GetDefaultPermit(config)
-	
+	permit, err := GetDefaultPermit(config)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
 	// Check structure
 	params, ok := permit["params"].(map[string]any)
 	if !ok {
 		t.Fatal("Expected params to be map[string]any")
 	}
-	
+
 	signature, ok := permit["signature"].(map[string]any)
 	if !ok {
 		t.Fatal("Expected signature to be map[string]any")
 	}
-	
+
 	// Check required fields
 	if params["permit_name"] != "api_keys_permit" {
 		t.Error("Expected permit_name to be 'api_keys_permit'")
 	}
-	
-	if params["chain_id"] != "pulsar-3" {
-		t.Error("Expected chain_id to be 'pulsar-3'")
+
+	if params["chain_id"] != "secret-4" {
+		t.Error("Expected chain_id to be 'secret-4'")
 	}
-	
+
 	pubKey, ok := signature["pub_key"].(map[string]any)
 	if !ok {
 		t.Fatal("Expected pub_key to be map[string]any")
 	}
-	
+
 	if pubKey["type"] != "tendermint/PubKeySecp256k1" {
 		t.Error("Expected pub_key type to be 'tendermint/PubKeySecp256k1'")
 	}
-	
-	if signature["signature"] == "" {
-		t.Error("Expected signature to be non-empty")
+
+	if pubKey["value"] != "TestPubKeyValue" {
+		t.Error("Expected pub_key value to be 'TestPubKeyValue'")
+	}
+
+	if signature["signature"] != "TestSigValue" {
+		t.Error("Expected signature to be 'TestSigValue'")
+	}
+}
+
+func TestGetDefaultPermitMissingEnvVars(t *testing.T) {
+	t.Setenv("SECRETAI_PERMIT_TYPE", "")
+	t.Setenv("SECRETAI_PERMIT_PUBKEY", "")
+	t.Setenv("SECRETAI_PERMIT_SIG", "")
+
+	config := &Config{
+		ContractAddress: "secret1abc123",
+		SecretChainID:   "secret-4",
+	}
+	permit, err := GetDefaultPermit(config)
+	if err == nil {
+		t.Fatal("Expected error when env vars are missing")
+	}
+	if permit != nil {
+		t.Fatal("Expected nil permit when env vars are missing")
 	}
 }
 

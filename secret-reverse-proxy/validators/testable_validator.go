@@ -99,7 +99,10 @@ func (v *TestableAPIKeyValidator) updateAPIKeyCache() error {
 		}
 	} else {
 		// Use default permit if no file specified
-		permit = GetDefaultPermit(v.config)
+		permit, err = GetDefaultPermit(v.config)
+		if err != nil {
+			return fmt.Errorf("failed to get default permit: %w", err)
+		}
 	}
 
 	query := map[string]any{

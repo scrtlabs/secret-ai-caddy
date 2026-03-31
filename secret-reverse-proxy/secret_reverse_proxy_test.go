@@ -313,38 +313,142 @@ func TestAPIKeyValidator_checkMasterKeys(t *testing.T) {
 			expectFound: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Clear env var so it doesn't interfere with file-based tests
+			t.Setenv("SECRETAI_MASTER_KEYS", "")
+
 			config := &Config{}
-			
+
 			if !tt.noFile {
 				tmpFile := utils.CreateTempFile(t, tt.fileContent)
 				defer utils.CleanupTempFile(t, tmpFile)
-				
+
 				if tt.name == "file does not exist" {
 					// Delete the file to simulate non-existence
 					os.Remove(tmpFile)
 				}
-				
+
 				config.MasterKeysFile = tmpFile
 			}
-			
+
 			validator := apikeyval.NewAPIKeyValidator(config)
-			
+
 			found, err := validator.CheckMasterKeys(tt.apiKey)
-			
+
 			if tt.expectError && err == nil {
 				t.Error("Expected error but got none")
 			}
 			if !tt.expectError && err != nil {
 				t.Errorf("Expected no error but got: %v", err)
 			}
-			
+
 			if found != tt.expectFound {
 				t.Errorf("Expected found=%v, got found=%v", tt.expectFound, found)
 			}
 		})
+	}
+}
+
+func TestAPIKeyValidator_checkMasterKeysEnvVar(t *testing.T) {
+	tests := []struct {
+		name        string
+		envValue    string
+		apiKey      string
+		expectFound bool
+	}{
+		{
+			name:        "key found in env var",
+			envValue:    "key1,key2,key3",
+			apiKey:      "key2",
+			expectFound: true,
+		},
+		{
+			name:        "key not found in env var",
+			envValue:    "key1,key2,key3",
+			apiKey:      "key4",
+			expectFound: false,
+		},
+		{
+			name:        "single key in env var",
+			envValue:    "only-key",
+			apiKey:      "only-key",
+			expectFound: true,
+		},
+		{
+			name:        "env var with spaces around keys",
+			envValue:    " key1 , key2 , key3 ",
+			apiKey:      "key2",
+			expectFound: true,
+		},
+		{
+			name:        "env var not set",
+			envValue:    "",
+			apiKey:      "any-key",
+			expectFound: false,
+		},
+		{
+			name:        "env var with empty entries",
+			envValue:    "key1,,key3,",
+			apiKey:      "key3",
+			expectFound: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SECRETAI_MASTER_KEYS", tt.envValue)
+
+			config := &Config{} // No MasterKeysFile
+			validator := apikeyval.NewAPIKeyValidator(config)
+
+			found, err := validator.CheckMasterKeys(tt.apiKey)
+			if err != nil {
+				t.Errorf("Expected no error but got: %v", err)
+			}
+			if found != tt.expectFound {
+				t.Errorf("Expected found=%v, got found=%v", tt.expectFound, found)
+			}
+		})
+	}
+}
+
+func TestAPIKeyValidator_checkMasterKeysFileAndEnvVar(t *testing.T) {
+	// When both file and env var are set, a key in either source should be found
+	t.Setenv("SECRETAI_MASTER_KEYS", "env-key1,env-key2")
+
+	tmpFile := utils.CreateTempFile(t, "file-key1\nfile-key2\n")
+	defer utils.CleanupTempFile(t, tmpFile)
+
+	config := &Config{MasterKeysFile: tmpFile}
+	validator := apikeyval.NewAPIKeyValidator(config)
+
+	// Key in file
+	found, err := validator.CheckMasterKeys("file-key1")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !found {
+		t.Error("Expected to find file-key1 from master keys file")
+	}
+
+	// Key in env var only
+	found, err = validator.CheckMasterKeys("env-key1")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !found {
+		t.Error("Expected to find env-key1 from SECRETAI_MASTER_KEYS env var")
+	}
+
+	// Key in neither
+	found, err = validator.CheckMasterKeys("unknown-key")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if found {
+		t.Error("Expected not to find unknown-key")
 	}
 }
 
