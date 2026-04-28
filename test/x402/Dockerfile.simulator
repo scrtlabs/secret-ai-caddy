@@ -1,0 +1,10 @@
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+COPY simulator.go .
+RUN go build -o simulator simulator.go
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/simulator /usr/bin/simulator
+EXPOSE 9100 9200
+CMD ["simulator"]

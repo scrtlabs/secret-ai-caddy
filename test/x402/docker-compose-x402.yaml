@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.simulator
+    container_name: x402-simulator
+    ports:
+      - "9100:9100"
+      - "9200:9200"
+    networks:
+      - x402net
+
+  caddy:
+    image: secret-reverse-proxy:latest
+    container_name: x402-caddy
+    ports:
+      - "8080:80"
+    environment:
+      # Legacy auth (required by validator — use dummy values for x402 testing)
+      - SECRET_API_MASTER_KEY=test-master-key-for-x402
+      - SECRET_NODE=https://lcd.secret.express
+      - SECRET_CHAIN_ID=secret-4
+      - SECRET_CONTRACT=secret1dummy
+      - SECRETAI_PERMIT_TYPE=allowance
+      - SECRETAI_PERMIT_PUBKEY=dummy-pubkey
+      - SECRETAI_PERMIT_SIG=dummy-sig
+      # x402 config
+      - X402_AGENT_KEY=test-x402-shared-secret
+      - X402_AGENT_ADDRESS=caddy-proxy-agent
+      - X402_SECRETVM_URL=http://simulator:9100
+      - X402_PAYMENT_URL=https://portal.example.com/fund
+    volumes:
+      - ./Caddyfile-x402:/etc/caddy/Caddyfile
+    networks:
+      - x402net
+    depends_on:
+      - simulator
+
+networks:
+  x402net:
+    driver: bridge

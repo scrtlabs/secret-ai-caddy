@@ -1,6 +1,6 @@
 # Secret AI Caddy - Advanced API Gateway
 
-A sophisticated Caddy middleware that provides secure API key authentication, intelligent token usage metering, and comprehensive metrics collection for AI/ML API gateways. The middleware validates API keys against multiple sources while tracking detailed usage statistics and reporting to blockchain-based smart contracts.
+A sophisticated Caddy middleware that provides secure API key authentication, intelligent token usage metering, x402 prepaid payment protocol, and comprehensive metrics collection for AI/ML API gateways. The middleware validates API keys against multiple sources while tracking detailed usage statistics and reporting to blockchain-based smart contracts.
 
 ## ⭐ What's New in v2.0
 
@@ -23,14 +23,16 @@ A sophisticated Caddy middleware that provides secure API key authentication, in
 This middleware implements a comprehensive API gateway solution designed for high-security AI/ML environments requiring:
 
 1. **Multi-tiered Authentication** - Master keys, file-based keys, and Secret Network smart contracts
-2. **Accurate Token Metering** - Model-specific token counting for precise billing and usage tracking
-3. **Comprehensive Metrics** - Performance monitoring, usage analytics, and operational insights
-4. **Blockchain Integration** - Decentralized usage reporting via Secret Network smart contracts
-5. **Production-Ready Security** - Encrypted communication, secure caching, and audit logging
+2. **x402 Payment Protocol** - Prepaid metering for AI agents with HMAC-signed requests, per-agent balances, and 402 payment challenges
+3. **Accurate Token Metering** - Model-specific token counting for precise billing and usage tracking
+4. **Comprehensive Metrics** - Performance monitoring, usage analytics, and operational insights
+5. **Blockchain Integration** - Decentralized usage reporting via Secret Network smart contracts
+6. **Production-Ready Security** - Encrypted communication, secure caching, and audit logging
 
 ## 📚 Documentation
 
 - **[📐 Architecture](./ARCHITECTURE.md)** - Complete system architecture and component design
+- **[💳 x402 Payment Protocol](./x402.md)** - Prepaid metering, agent authentication, and payment enforcement
 - **[⚖️ Metering & Metrics](./METERING.md)** - Token counting, usage tracking, and metrics collection
 
 ## 🏗️ Architecture Overview
@@ -39,49 +41,73 @@ This middleware implements a comprehensive API gateway solution designed for hig
 graph TB
     subgraph "Client Layer"
         C[AI/ML Clients<br/>with API Keys]
+        A[AI Agents<br/>with x402 Headers]
     end
-    
+
     subgraph "Caddy Gateway"
         subgraph "Middleware Pipeline"
+            ROUTE{Agent Headers?}
             AUTH[API Key Authentication]
+            X402[x402 Payment Path]
             METER[Token Metering]
             METRICS[Metrics Collection]
             PROXY[Reverse Proxy]
         end
     end
-    
+
     subgraph "Authentication Sources"
         MK[Master Keys]
         MKF[Master Keys File]
         CACHE[Cached Results]
         SC[Secret Network<br/>Smart Contract]
     end
-    
+
+    subgraph "x402 Components"
+        VERIFY[Auth Verifier<br/>HMAC-SHA256]
+        QUOTE[Quote Engine]
+        LEDGER[Spendable Ledger]
+        SETTLE[Settlement Engine]
+        CHALLENGE[402 Challenge Builder]
+        RECON[Reconciler]
+        SVM[SecretVM Client]
+    end
+
     subgraph "AI/ML Services"
         AI1[OpenAI API]
         AI2[Ollama]
         AI3[TorchServe]
         AI4[Custom ML APIs]
     end
-    
+
     subgraph "Reporting & Analytics"
         BLOCKCHAIN[Secret Network<br/>Usage Reporting]
         METRICS_API[Metrics Endpoint<br/>/metrics]
     end
-    
-    C -->|HTTP + API Key| AUTH
+
+    C -->|HTTP + API Key| ROUTE
+    A -->|HTTP + Agent Headers| ROUTE
+    ROUTE -->|No| AUTH
+    ROUTE -->|Yes| X402
     AUTH --> MK
-    AUTH --> MKF  
+    AUTH --> MKF
     AUTH --> CACHE
     AUTH -->|Cache Miss| SC
-    AUTH -->|✓ Authorized| METER
+    AUTH -->|Authorized| METER
+    X402 --> VERIFY
+    VERIFY --> QUOTE
+    QUOTE --> LEDGER
+    LEDGER -->|Insufficient| CHALLENGE
+    LEDGER -->|Reserved| METER
     METER -->|Count Tokens| METRICS
     METER --> PROXY
     PROXY --> AI1
     PROXY --> AI2
     PROXY --> AI3
     PROXY --> AI4
-    
+    SETTLE --> LEDGER
+    RECON --> SVM
+    RECON --> LEDGER
+
     METRICS -->|Usage Data| BLOCKCHAIN
     METRICS --> METRICS_API
 ```
@@ -157,6 +183,18 @@ Any model available on HuggingFace with a `tokenizer.json` file can be used.
 - **Token usage analytics** with input/output token breakdowns
 - **System health indicators** for operational monitoring
 
+### 💳 x402 Payment Protocol
+- **Agent authentication** via HMAC-SHA256 signed requests with replay protection
+- **Prepaid metering** with reserve-then-settle pattern — agents are never overcharged
+- **In-memory ledger** with per-agent balances, fine-grained locking for high concurrency
+- **402 Payment Required** responses with machine-readable challenge payloads
+- **Background reconciliation** syncing balances from SecretVM billing backend
+- **Lazy hydration** on cold start — no false 402 rejections after Caddy restart
+- **Per-model pricing** with configurable pricing tables (JSON file or built-in defaults)
+- **Coexistence** with legacy API key auth — both paths work simultaneously
+
+See [x402.md](./x402.md) for full documentation.
+
 ### 🚫 URL Filtering & Security
 - **Pattern-based blocking** with configurable URL patterns via environment variables
 - **Early request filtering** for performance optimization (before API key validation)
@@ -174,7 +212,7 @@ Any model available on HuggingFace with a `tokenizer.json` file can be used.
 ## 🛠️ Building and Testing
 
 ### Prerequisites
-- Go 1.24+
+- Go 1.26+
 - Docker & Docker Compose
 - Git
 
@@ -188,7 +226,7 @@ docker build -t secret-reverse-proxy:latest .
 ```
 
 The Dockerfile:
-1. **Builder Stage**: Uses Go 1.24+ to install xcaddy and build Caddy with the secret-reverse-proxy module
+1. **Builder Stage**: Uses Go 1.26+ to install xcaddy and build Caddy with the secret-reverse-proxy module
 2. **Runtime Stage**: Creates lightweight Alpine-based runtime with security hardening
 3. **Security Features**: Non-root user, minimal dependencies, health checks
 
@@ -316,6 +354,27 @@ The `Caddyfile-test` demonstrates comprehensive configuration:
 }
 ```
 
+### x402 Payment Protocol Testing
+
+The x402 test suite uses Docker containers with a SecretVM simulation server and mock AI upstream:
+
+```bash
+# Build Caddy image
+docker build -t secret-reverse-proxy:latest .
+
+# Start x402 test environment
+cd test/x402
+docker compose -f docker-compose-x402.yaml up -d --build
+
+# Run end-to-end tests (14 tests)
+bash test_x402.sh
+
+# Clean up
+docker compose -f docker-compose-x402.yaml down
+```
+
+The test script verifies: funded/unfunded agents, invalid signatures, stale timestamps, legacy API key coexistence, fund-then-retry flow, balance drain, and metrics. See [x402.md](./x402.md) for details.
+
 ### Development Testing
 
 #### Unit Tests
@@ -340,10 +399,13 @@ go tool cover -html=coverage.out
 # Test API key validation
 go test -v ./validators/
 
+# Test x402 payment protocol
+go test -v ./x402/...
+
 # Test token counting
 go test -v -run TestTokenCounter
 
-# Test metering functionality  
+# Test metering functionality
 go test -v -run TestMetering
 ```
 
@@ -365,6 +427,10 @@ go test -v -run TestMetering
 | `SECRETAI_PERMIT_TYPE` | Permit public key type. Required when no `permit_file` is configured — used to construct a permit on the fly for retrieving API keys from KMS. | `tendermint/PubKeySecp256k1` |
 | `SECRETAI_PERMIT_PUBKEY` | Permit public key value. Required when no `permit_file` is configured. | `Aur9D8RLq...` |
 | `SECRETAI_PERMIT_SIG` | Permit signature. Required when no `permit_file` is configured. | `TeNtblPmo...` |
+| `X402_AGENT_KEY` | Shared HMAC secret for x402 agent signature verification | `your-shared-secret` |
+| `X402_AGENT_ADDRESS` | Caddy proxy's agent identity for SecretVM API calls | `caddy-proxy-agent` |
+| `X402_SECRETVM_URL` | SecretVM billing backend base URL | `http://secretvm:9100` |
+| `X402_PAYMENT_URL` | Payment portal URL returned in 402 challenges | `https://portal.example.com/fund` |
 
 ### Caddyfile Directives
 
@@ -387,6 +453,17 @@ go test -v -run TestMetering
 | `retry_backoff` | duration | Retry delay | `5m` |
 | `enable_metrics` | boolean | Enable metrics collection | `false` |
 | `metrics_path` | string | Metrics HTTP endpoint | `/metrics` |
+| `x402_enabled` | boolean | Enable x402 payment protocol | `false` |
+| `x402_agent_key` | string | Shared HMAC key for agent auth | Required if x402 enabled |
+| `x402_agent_address` | string | Caddy's agent address for SecretVM | Required if x402 enabled |
+| `x402_secretvm_url` | string | SecretVM API base URL | Required if x402 enabled |
+| `x402_payment_url` | string | Payment URL in 402 challenges | Required if x402 enabled |
+| `x402_timestamp_skew` | duration | Max timestamp drift | `5m` |
+| `x402_reconcile_interval` | duration | Balance sync interval | `30s` |
+| `x402_default_output_budget` | int | Default max output tokens | `4096` |
+| `x402_pricing_file` | path | Per-model pricing JSON | built-in defaults |
+| `x402_currency` | string | Unit of account | `uscrt` |
+| `x402_reservation_ttl` | duration | Max reservation lifetime | `5m` |
 
 ## 🚀 Production Deployment
 

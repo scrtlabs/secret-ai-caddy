@@ -4,7 +4,7 @@
 # =====================================
 
 # Use Go 1.24+ image as builder to handle all Go version requirements
-FROM golang:1.25-alpine AS caddy-builder
+FROM golang:1.26-alpine AS caddy-builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -23,7 +23,7 @@ RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
 # Build Caddy with secret reverse proxy module using local path
 WORKDIR /tmp/build
-RUN xcaddy build v2.11.1 \
+RUN xcaddy build v2.11.2 \
     --with github.com/scrtlabs/secret-reverse-proxy=./secret-reverse-proxy/
 
 # =====================================

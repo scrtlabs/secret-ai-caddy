@@ -4,8 +4,8 @@ Detailed step-by-step implementation plan for adding x402 support to the Secret 
 
 ## Prerequisites
 
-- Caddy v2.11.1 (done)
-- Go 1.25 (done)
+- Caddy v2.11.2 (done)
+- Go 1.26.2 (done)
 - Familiarity with [architecture.md](./architecture.md)
 
 ## Phase Overview
@@ -103,6 +103,8 @@ type PricingConfig struct {
 }
 
 // Sentinel errors.
+import "errors"
+
 var (
     ErrInsufficientBalance = errors.New("insufficient balance")
     ErrReservationNotFound = errors.New("reservation not found")
@@ -194,6 +196,9 @@ type SecretVMClient interface {
     GetBalance(agentAddress string) (balance int64, err error)
     AddFunds(agentAddress string, amount int64) error
     GetVMStatus(vmID string) (status string, err error)
+    // ListAgents returns all agent addresses with funded balances.
+    // Used by the Reconciler on startup to pre-populate the ledger.
+    ListAgents() ([]string, error)
 }
 
 // Reconciler syncs balances from billing backend to ledger.
@@ -260,9 +265,9 @@ type ledgerImpl struct {
 
 **Methods to implement:**
 - `Credit` — lock agent, add to balance, update timestamp.
-- `Reserve` — lock agent, check `balance - sumReservations >= amount`, create reservation, return ID.
-- `Commit` — lock agent, find reservation, deduct `actualAmount` from balance, delete reservation.
-- `Release` — lock agent, find reservation, delete it (balance unchanged since we track reservations separately).
+- `Reserve` — lock agent, check `balance >= amount`, deduct `amount` from balance, create reservation, return ID.
+- `Commit` — lock agent, find reservation, refund `reservation.Amount - actualAmount` to balance, delete reservation.
+- `Release` — lock agent, find reservation, refund `reservation.Amount` to balance, delete reservation.
 - `GetBalance` — read-lock top map, lock agent, return snapshot.
 - `Snapshot` — read-lock, iterate, build copy.
 
@@ -428,6 +433,7 @@ func (c *secretVMClient) buildSignedRequest(method, path string, body []byte) (*
 - `GetBalance` — `GET /api/agent/balance`, parse JSON response.
 - `AddFunds` — `POST /api/agent/add-funds`, handle 402 retry with payment headers.
 - `GetVMStatus` — `GET /api/agent/vm/:id`, parse status field.
+- `ListAgents` — `GET /api/agent/list` (or equivalent), returns all funded agent addresses. Used by Reconciler on startup for bulk ledger population.
 
 **HTTP client:** Use a shared `http.Client` with reasonable timeouts (10s connect, 30s total).
 
@@ -455,7 +461,7 @@ func (c *secretVMClient) buildSignedRequest(method, path string, body []byte) (*
    e. If delta < 0, log warning (possible overspend, needs investigation).
 3. On stop signal, exit cleanly.
 
-**`ForceSync`:** Same logic but for a single agent, called synchronously.
+**`ForceSync` implementation:** Same delta logic but for a single agent, called synchronously. Critically, this also handles **lazy hydration** — if the agent has no ledger entry yet (cold start / first request), `ForceSync` fetches the agent's balance from the billing backend and credits the ledger, creating the entry. This ensures agents are not incorrectly rejected with 402 after a Caddy restart.
 
 **Error handling:** Individual agent sync failures are logged but don't halt the loop. A persistent failure counter triggers an alert-level log after N consecutive failures.
 
@@ -490,14 +496,21 @@ New method on `Middleware`:
 
 ```go
 func (m *Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-    // 1. Read body (reuse existing BodyHandler)
-    bodyInfo, err := m.bodyHandler.SafeReadRequestBody(r)
+    // 1. Read the FULL raw body for signature verification.
+    //    We read the complete body here (not via SafeReadRequestBody which
+    //    truncates at MaxBodySize) because the HMAC signature covers the
+    //    exact body bytes sent by the client. Truncation would cause
+    //    signature verification to fail on large requests.
+    rawBody, err := io.ReadAll(r.Body)
     if err != nil {
-        return caddyhttp.Error(http.StatusBadRequest, err)
+        return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("failed to read request body: %w", err))
     }
+    r.Body.Close()
+    // Restore body for downstream handlers (upstream forwarding + token counting)
+    r.Body = io.NopCloser(bytes.NewReader(rawBody))
 
-    // 2. Verify agent signature
-    agentAddress, err := m.authVerifier.Verify(r, []byte(bodyInfo.Content))
+    // 2. Verify agent signature against the full raw body
+    agentAddress, err := m.authVerifier.Verify(r, rawBody)
     if err != nil {
         if errors.Is(err, x402.ErrInvalidSignature) || errors.Is(err, x402.ErrStaleTimestamp) {
             return caddyhttp.Error(http.StatusUnauthorized, err)
@@ -505,14 +518,22 @@ func (m *Middleware) serveX402(w http.ResponseWriter, r *http.Request, next cadd
         return caddyhttp.Error(http.StatusInternalServerError, err)
     }
 
-    // 3. Detect model and count input tokens
+    // 3. Now use BodyHandler for token counting (may truncate large bodies,
+    //    which is fine — truncation only affects token count accuracy, not
+    //    signature verification or upstream forwarding).
+    bodyInfo, err := m.bodyHandler.SafeReadRequestBody(r)
+    if err != nil {
+        return caddyhttp.Error(http.StatusBadRequest, err)
+    }
+
+    // 4. Detect model and count input tokens
     model := detectModelFromRequestBody(bodyInfo.Content, bodyInfo.ContentType)
     inputTokens := 0
     if m.tokenCounter != nil {
         inputTokens = m.tokenCounter.CountTokensWithModel(bodyInfo.Content, bodyInfo.ContentType, model)
     }
 
-    // 4. Determine output budget
+    // 5. Determine output budget
     maxOutput := m.Config.X402DefaultOutputBudget
     if bodyInfo.ParsedJSON != nil {
         if mt, ok := bodyInfo.ParsedJSON["max_tokens"]; ok {
@@ -522,33 +543,50 @@ func (m *Middleware) serveX402(w http.ResponseWriter, r *http.Request, next cadd
         }
     }
 
-    // 5. Get quote
+    // 6. Get quote
     quote, err := m.quoteEngine.Estimate(model, inputTokens, maxOutput)
     if err != nil {
         m.logger.Error("Quote estimation failed", zap.Error(err))
         return caddyhttp.Error(http.StatusInternalServerError, err)
     }
 
-    // 6. Reserve
+    // 7. Reserve — with lazy hydration for cold start.
+    //    If the agent has no ledger entry (e.g. after Caddy restart), we
+    //    ForceSync their balance from the billing backend before rejecting.
     reservationID, err := m.ledger.Reserve(agentAddress, quote.TotalCost)
     if err != nil {
         if errors.Is(err, x402.ErrInsufficientBalance) {
-            return m.challengeBuilder.Build402Response(w, agentAddress, quote.TotalCost)
+            // Lazy hydration: if the agent has no ledger entry, sync from
+            // billing backend and retry the reservation once.
+            entry, _ := m.ledger.GetBalance(agentAddress)
+            if entry == nil && m.reconciler != nil {
+                if syncErr := m.reconciler.ForceSync(agentAddress); syncErr != nil {
+                    m.logger.Warn("ForceSync failed during lazy hydration",
+                        zap.String("agent", agentAddress), zap.Error(syncErr))
+                }
+                // Retry reservation after hydration
+                reservationID, err = m.ledger.Reserve(agentAddress, quote.TotalCost)
+            }
+            // If still insufficient after hydration (or no hydration needed), issue 402
+            if err != nil {
+                return m.challengeBuilder.Build402Response(w, agentAddress, quote.TotalCost)
+            }
+        } else {
+            return caddyhttp.Error(http.StatusInternalServerError, err)
         }
-        return caddyhttp.Error(http.StatusInternalServerError, err)
     }
 
-    // 7. Forward to upstream with response capture
+    // 8. Forward to upstream with response capture
     tw := NewTokenMeteringResponseWriter(w)
     err = next.ServeHTTP(tw, r)
 
-    // 8. Handle upstream errors
+    // 9. Handle upstream errors
     if err != nil || tw.Status() >= 500 {
         m.settlementEngine.Cancel(reservationID)
         return err
     }
 
-    // 9. Count output tokens
+    // 10. Count output tokens
     outputTokens := 0
     if m.tokenCounter != nil {
         respBody := tw.Body()
@@ -556,20 +594,20 @@ func (m *Middleware) serveX402(w http.ResponseWriter, r *http.Request, next cadd
         outputTokens = m.tokenCounter.CountTokensWithModel(string(respBody), respContentType, model)
     }
 
-    // 10. Settle
+    // 11. Settle
     result, err := m.settlementEngine.Settle(reservationID, inputTokens, outputTokens, model)
     if err != nil {
         m.logger.Error("Settlement failed", zap.Error(err), zap.String("reservation", reservationID))
         // Fail-open: response already sent to client
     }
 
-    // 11. Record usage through existing pipeline
+    // 12. Record usage through existing pipeline
     if m.tokenAccumulator != nil && result != nil {
         apiKeyHash := hashString(agentAddress)
         m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, model, inputTokens, outputTokens)
     }
 
-    // 12. Record metrics
+    // 13. Record metrics
     if m.metricsCollector != nil {
         m.metricsCollector.RecordRequest()
         m.metricsCollector.RecordAuthorized()

@@ -99,32 +99,35 @@ type QuoteEngine interface {
 **Purpose:** In-memory, thread-safe store of per-agent spendable balances. This is the single authority Caddy consults on the hot path.
 
 **Responsibilities:**
-- Track current balance per agent address.
-- Track total reserved (uncommitted) amount per agent.
+- Track available (spendable) balance per agent address — this is the amount not currently held by any reservation.
 - Support atomic credit (top-up sync), reserve, commit, and release operations.
 - Provide a read-only snapshot for the metrics endpoint.
+
+**Balance semantics:** `Balance` represents the **available** funds (excluding any reserved amounts). When a reservation is created, `Balance` is decremented by the reserved amount. When a reservation is released (cancelled), `Balance` is incremented back. When a reservation is committed, the difference between the reserved amount and the actual charge is refunded to `Balance`. The `Reserved` field in `LedgerEntry` is a read-only sum of all outstanding reservation amounts, computed on demand for observability.
 
 **Interface:**
 ```go
 type LedgerEntry struct {
-    Balance    int64     // available (not reserved)
-    Reserved   int64     // sum of outstanding reservations
+    Balance    int64     // available funds (not including reserved amounts)
+    Reserved   int64     // sum of outstanding reservations (read-only, for observability)
     UpdatedAt  time.Time
 }
 
 type SpendableLedger interface {
-    // Credit adds funds to an agent's balance (called by Reconciler).
+    // Credit adds funds to an agent's available balance (called by Reconciler).
     Credit(agentAddress string, amount int64) error
 
     // Reserve attempts to hold `amount` from the agent's available balance.
+    // Checks `balance >= amount`, deducts from balance, creates reservation.
     // Returns a reservation ID or an ErrInsufficientBalance.
     Reserve(agentAddress string, amount int64) (reservationID string, err error)
 
-    // Commit finalizes a reservation, charging `actualAmount` and refunding
-    // the difference (reserve - actual) back to available balance.
+    // Commit finalizes a reservation. Refunds `reservedAmount - actualAmount`
+    // back to the agent's available balance, then deletes the reservation.
     Commit(reservationID string, actualAmount int64) error
 
-    // Release cancels a reservation, returning the full reserved amount.
+    // Release cancels a reservation, returning the full reserved amount
+    // back to the agent's available balance.
     Release(reservationID string) error
 
     // GetBalance returns the current balance and reserved total for an agent.
@@ -137,7 +140,7 @@ type SpendableLedger interface {
 
 **Concurrency:** Uses `sync.RWMutex` for balance reads and a fine-grained per-agent lock for reserve/commit/release to avoid global contention under high RPS.
 
-**Persistence:** The ledger is volatile. On restart, the Reconciler re-syncs balances from the billing backend. This is acceptable because reservations are short-lived (request duration) and the billing backend is the durable source of truth.
+**Persistence:** The ledger is volatile. On restart, the Reconciler re-syncs balances from the billing backend and agents are lazily hydrated on first request (see §3.8). This is acceptable because reservations are short-lived (request duration) and the billing backend is the durable source of truth.
 
 ### 3.4 ReservationStore
 
@@ -235,6 +238,9 @@ type SecretVMClient interface {
     GetBalance(agentAddress string) (balance int64, err error)
     AddFunds(agentAddress string, amount int64) error
     GetVMStatus(vmID string) (status string, err error)
+    // ListAgents returns all agent addresses with funded balances.
+    // Used by the Reconciler on startup to pre-populate the ledger.
+    ListAgents() ([]string, error)
 }
 ```
 
@@ -246,9 +252,10 @@ type SecretVMClient interface {
 
 **Responsibilities:**
 - On startup: fetch balances for all known agents and credit the ledger.
-- Periodically (configurable interval, default 30s): re-sync balances.
+- Periodically (configurable interval, default 30s): re-sync balances for agents already in the ledger.
 - Listen for credit events from the billing backend (webhook or polling).
 - Log discrepancies between ledger state and upstream balance.
+- **Lazy hydration:** When `ForceSync` is called for an agent not yet in the ledger, fetch their balance from the billing backend and credit the ledger. This handles the cold-start problem — after a restart the ledger is empty, so the first request from any agent triggers a `ForceSync` before a 402 is issued.
 
 **Interface:**
 ```go
@@ -256,6 +263,8 @@ type Reconciler interface {
     Start(interval time.Duration)
     Stop()
     // ForceSync triggers an immediate reconciliation for a specific agent.
+    // If the agent is not yet in the ledger, fetches their balance from
+    // the billing backend and credits the ledger (lazy hydration).
     ForceSync(agentAddress string) error
 }
 ```
@@ -347,6 +356,8 @@ For streaming endpoints (`/chat/completions` with `stream: true`), the flow has 
 
 2. **Chunk-level metering:** The `TokenMeteringResponseWriter` already buffers response bytes. For streaming, we continue to buffer and count after the stream ends. We do **not** do mid-stream balance checks — the initial reservation covers the maximum output. If the actual output is less, the difference is refunded at settlement.
 
+3. **Memory bound:** To prevent unbounded memory growth on large streaming responses, the response writer applies a configurable buffer cap (default: `MaxBodySize`, typically 5MB). Token counting operates on the buffered portion; if the response exceeds the cap, the buffer is marked as truncated and output tokens are estimated from the buffered content. This trades accuracy for safety on very large responses.
+
 This avoids the complexity of mid-stream cancellation while still bounding cost exposure via the reservation cap.
 
 ## 6. Configuration Additions
@@ -416,7 +427,7 @@ secret_reverse_proxy {
 |----------|----------|
 | Invalid agent signature | 401 Unauthorized |
 | Stale timestamp (> skew window) | 401 Unauthorized |
-| Unknown agent (no ledger entry) | 402 Payment Required (with funding instructions) |
+| Unknown agent (no ledger entry) | Lazy hydration: ForceSync from billing backend, retry reserve; if still insufficient → 402 Payment Required |
 | Insufficient balance | 402 Payment Required |
 | Upstream error (5xx) | Release reservation (no charge), forward error to client |
 | Upstream timeout | Release reservation, 504 to client |

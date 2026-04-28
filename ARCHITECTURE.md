@@ -98,12 +98,20 @@ classDiagram
         -tokenAccumulator: *TokenAccumulator
         -resilientReporter: *ResilientReporter
         -metricsCollector: MetricsCollector
+        -authVerifier: *x402.AuthVerifierImpl
+        -quoteEngine: *x402.QuoteEngineImpl
+        -ledger: *x402.LedgerImpl
+        -settlementEngine: *x402.SettlementEngineImpl
+        -challengeBuilder: *x402.ChallengeBuilderImpl
+        -secretVMClient: *x402.SecretVMClientImpl
+        -reconciler: *x402.ReconcilerImpl
         +CaddyModule() ModuleInfo
         +Provision(ctx: Context) error
         +Validate() error
         +ServeHTTP(w, r, next) error
         +UnmarshalCaddyfile(d) error
         +Cleanup() error
+        -serveX402(w, r, next) error
     }
     
     class Config {
@@ -230,6 +238,92 @@ classDiagram
     ResilientReporter --> TokenAccumulator
     QueryContract --> WASMContext
 ```
+
+## x402 Payment Protocol Architecture
+
+The x402 subsystem adds prepaid metering and payment enforcement for AI agent requests. It runs as a parallel authentication path — requests with `X-Agent-Address` headers take the x402 path; all other requests use legacy API key validation.
+
+### x402 Component Map
+
+```
+secret-reverse-proxy/
+├── x402/
+│   ├── types.go              # Shared types, errors, header constants
+│   ├── auth_verifier.go      # HMAC-SHA256 signature verification
+│   ├── quote_engine.go       # Per-model cost estimation
+│   ├── ledger.go             # In-memory per-agent balance store
+│   ├── challenge.go          # 402 Payment Required response builder
+│   ├── settlement.go         # Post-response charge + refund
+│   ├── secretvm_client.go    # Authenticated SecretVM API client
+│   └── reconciler.go         # Background balance sync from billing backend
+```
+
+### x402 Request Flow
+
+```mermaid
+sequenceDiagram
+    participant Client as Agent
+    participant Caddy as Caddy (serveX402)
+    participant Ledger as SpendableLedger
+    participant Upstream as AI Backend
+    participant Reconciler as Reconciler
+
+    Client->>Caddy: POST /v1/chat/completions<br/>X-Agent-Address + Signature + Timestamp
+    Caddy->>Caddy: Verify HMAC-SHA256 signature
+    alt Invalid signature or stale timestamp
+        Caddy-->>Client: 401 Unauthorized
+    end
+    Caddy->>Caddy: Estimate cost (QuoteEngine)
+    Caddy->>Ledger: Reserve(agent, estimatedCost)
+    alt Insufficient balance
+        Caddy->>Reconciler: ForceSync(agent) [lazy hydration]
+        Caddy->>Ledger: Retry Reserve
+        alt Still insufficient
+            Caddy-->>Client: 402 Payment Required (challenge JSON)
+        end
+    end
+    Caddy->>Upstream: Forward request
+    Upstream-->>Caddy: Response
+    Caddy->>Caddy: Count actual output tokens
+    Caddy->>Ledger: Commit(reservation, actualCost)<br/>Refund unused reserve
+    Caddy-->>Client: 200 OK + response
+```
+
+### Balance Semantics
+
+The `SpendableLedger` uses an **available balance** model:
+
+- `Balance` = funds available for new reservations (excludes reserved amounts)
+- `Reserve` deducts from balance immediately
+- `Release` refunds the full reserved amount to balance
+- `Commit` refunds `(reserved - actual)` to balance
+- `Reserved` is a read-only sum of outstanding reservations, for observability
+
+Concurrency: `sync.RWMutex` for the top-level agent map, plus a per-agent `sync.Mutex` for reserve/commit/release to avoid global contention.
+
+### Reconciler & Cold Start
+
+The Reconciler runs as a background goroutine:
+- On startup: discovers all funded agents via `SecretVMClient.ListAgents()` and syncs balances
+- Periodically: re-syncs known agents (configurable interval, default 30s)
+- Lazy hydration: `ForceSync(agent)` handles the first request from an unknown agent after a restart
+
+### Interaction with Existing Components
+
+| Existing Component | Change |
+|--------------------|--------|
+| `Config` | Added 11 `X402*` fields (all optional, backward compatible) |
+| `ServeHTTP` | Added `IsAgentRequest` branch before legacy API key path |
+| `TokenCounter` | Reused by QuoteEngine for input token estimation |
+| `BodyHandler` | Reused for request body reading |
+| `TokenAccumulator` | x402 records usage through it |
+| `MetricsCollector` | x402 records authorized/token metrics through it |
+| `Provision` | Initializes x402 components when enabled |
+| `Cleanup` | Stops Reconciler and ledger cleanup |
+| `Validate` | Validates required x402 fields when enabled |
+| `UnmarshalCaddyfile` | Parses 11 `x402_*` directives |
+
+For full x402 documentation see [x402.md](./x402.md). For detailed design documents see [design/x402/](./design/x402/).
 
 ## Enhanced Token Metering System
 

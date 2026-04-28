@@ -16,10 +16,13 @@
 package secret_reverse_proxy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -32,9 +35,10 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
-	
+
 	"github.com/scrtlabs/secret-reverse-proxy/factories"
 	"github.com/scrtlabs/secret-reverse-proxy/interfaces"
+	"github.com/scrtlabs/secret-reverse-proxy/x402"
 	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
 	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
 )
@@ -81,6 +85,15 @@ type Middleware struct {
 	tokenAccumulator  *TokenAccumulator
 	resilientReporter *ResilientReporter
 	metricsCollector  interfaces.MetricsCollector
+
+	// x402 components (nil when x402 is disabled)
+	authVerifier     *x402.AuthVerifierImpl
+	quoteEngine      *x402.QuoteEngineImpl
+	ledger           *x402.LedgerImpl
+	settlementEngine *x402.SettlementEngineImpl
+	challengeBuilder *x402.ChallengeBuilderImpl
+	secretVMClient   *x402.SecretVMClientImpl
+	reconciler       *x402.ReconcilerImpl
 }
 
 // CaddyModule returns the module information required by Caddy's module system.
@@ -196,6 +209,58 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		}
 		m.meteringRunning = true
 	}
+	// BLOCK 3.5: x402 Payment Protocol Initialization
+	if m.Config.X402Enabled {
+		logger.Info("Initializing x402 payment protocol components")
+
+		// Apply defaults for x402 config
+		if m.Config.X402TimestampSkew == 0 {
+			m.Config.X402TimestampSkew = 5 * time.Minute
+		}
+		if m.Config.X402ReconcileInterval == 0 {
+			m.Config.X402ReconcileInterval = 30 * time.Second
+		}
+		if m.Config.X402DefaultOutputBudget == 0 {
+			m.Config.X402DefaultOutputBudget = 4096
+		}
+		if m.Config.X402Currency == "" {
+			m.Config.X402Currency = "uscrt"
+		}
+		if m.Config.X402ReservationTTL == 0 {
+			m.Config.X402ReservationTTL = 5 * time.Minute
+		}
+
+		m.authVerifier = x402.NewAuthVerifier(m.Config.X402AgentKey, m.Config.X402TimestampSkew, logger)
+
+		pricing, err := x402.LoadPricing(m.Config.X402PricingFile)
+		if err != nil {
+			return fmt.Errorf("failed to load x402 pricing: %w", err)
+		}
+		m.quoteEngine = x402.NewQuoteEngine(pricing, m.Config.X402Currency, logger)
+
+		m.ledger = x402.NewSpendableLedger(m.Config.X402ReservationTTL, logger)
+		m.ledger.StartCleanup(1 * time.Minute)
+
+		m.challengeBuilder = x402.NewChallengeBuilder(m.Config.X402PaymentURL, m.Config.X402Currency)
+
+		m.settlementEngine = x402.NewSettlementEngine(m.ledger, m.quoteEngine, logger)
+
+		m.secretVMClient = x402.NewSecretVMClient(
+			m.Config.X402SecretVMURL,
+			m.Config.X402AgentKey,
+			m.Config.X402AgentAddress,
+			logger,
+		)
+
+		m.reconciler = x402.NewReconciler(m.ledger, m.secretVMClient, logger)
+		m.reconciler.Start(m.Config.X402ReconcileInterval)
+
+		logger.Info("x402 payment protocol initialized",
+			zap.String("agent_address", m.Config.X402AgentAddress),
+			zap.String("secretvm_url", m.Config.X402SecretVMURL),
+			zap.Duration("reconcile_interval", m.Config.X402ReconcileInterval))
+	}
+
 	// BLOCK 4: Configuration Logging
 	// Log configuration details for debugging (excluding sensitive data)
 	logger.Info("Secret reverse proxy middleware provisioned",
@@ -335,7 +400,23 @@ func (m *Middleware) Validate() error {
 		}
 	}
 
-	logger.Info("✅ Configuration validation successful")
+	// x402 validation
+	if m.Config.X402Enabled {
+		if m.Config.X402AgentKey == "" {
+			return fmt.Errorf("x402_agent_key is required when x402 is enabled")
+		}
+		if m.Config.X402AgentAddress == "" {
+			return fmt.Errorf("x402_agent_address is required when x402 is enabled")
+		}
+		if m.Config.X402SecretVMURL == "" {
+			return fmt.Errorf("x402_secretvm_url is required when x402 is enabled")
+		}
+		if m.Config.X402PaymentURL == "" {
+			return fmt.Errorf("x402_payment_url is required when x402 is enabled")
+		}
+	}
+
+	logger.Info("Configuration validation successful")
 	return nil
 }
 
@@ -385,6 +466,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		return nil
 	}
 	
+	// BLOCK 1.6: x402 Agent Authentication Path
+	// If the request carries x-agent-* headers and x402 is enabled, use the x402 path
+	if m.authVerifier != nil && m.authVerifier.IsAgentRequest(r) {
+		return m.serveX402(w, r, next)
+	}
+
 	// BLOCK 1.7: URL Filtering Check
 	// Check if the request URL matches any blocked patterns
 	if len(m.Config.BlockedURLs) > 0 {
@@ -834,8 +921,99 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					m.Config.MetricsPath = expandedValue
 					logger.Info("📍 Metrics path", zap.String("path", m.Config.MetricsPath))
 
+				// x402 Payment Protocol directives
+				case "x402_enabled":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					expandedValue := expandEnvVars(d.Val())
+					m.Config.X402Enabled = map[string]bool{
+						"on": true, "true": true, "1": true, "yes": true,
+					}[strings.ToLower(strings.TrimSpace(expandedValue))]
+					logger.Info("x402 enabled", zap.Bool("enabled", m.Config.X402Enabled))
+
+				case "x402_agent_key":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					m.Config.X402AgentKey = expandEnvVars(d.Val())
+					logger.Info("x402 agent key configured")
+
+				case "x402_agent_address":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					m.Config.X402AgentAddress = expandEnvVars(d.Val())
+					logger.Info("x402 agent address configured", zap.String("address", m.Config.X402AgentAddress))
+
+				case "x402_secretvm_url":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					m.Config.X402SecretVMURL = expandEnvVars(d.Val())
+					logger.Info("x402 SecretVM URL configured", zap.String("url", m.Config.X402SecretVMURL))
+
+				case "x402_payment_url":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					m.Config.X402PaymentURL = expandEnvVars(d.Val())
+					logger.Info("x402 payment URL configured", zap.String("url", m.Config.X402PaymentURL))
+
+				case "x402_timestamp_skew":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					duration, err := time.ParseDuration(expandEnvVars(d.Val()))
+					if err != nil {
+						return d.Errf("invalid x402_timestamp_skew: %v", err)
+					}
+					m.Config.X402TimestampSkew = duration
+
+				case "x402_reconcile_interval":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					duration, err := time.ParseDuration(expandEnvVars(d.Val()))
+					if err != nil {
+						return d.Errf("invalid x402_reconcile_interval: %v", err)
+					}
+					m.Config.X402ReconcileInterval = duration
+
+				case "x402_default_output_budget":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					budget, err := strconv.Atoi(expandEnvVars(d.Val()))
+					if err != nil || budget <= 0 {
+						return d.Errf("invalid x402_default_output_budget: %v", err)
+					}
+					m.Config.X402DefaultOutputBudget = budget
+
+				case "x402_pricing_file":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					m.Config.X402PricingFile = expandEnvVars(d.Val())
+
+				case "x402_currency":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					m.Config.X402Currency = expandEnvVars(d.Val())
+
+				case "x402_reservation_ttl":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					duration, err := time.ParseDuration(expandEnvVars(d.Val()))
+					if err != nil {
+						return d.Errf("invalid x402_reservation_ttl: %v", err)
+					}
+					m.Config.X402ReservationTTL = duration
+
 				default:
-					logger.Error("🔴 Unmarshal Caddyfile", zap.String("unknown subdirective", d.Val()))
+					logger.Error("Unmarshal Caddyfile: unknown subdirective", zap.String("directive", d.Val()))
 					// Unknown directive - return error
 					return d.Errf("unknown subdirective: %s", d.Val())
 			}
@@ -854,6 +1032,133 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		zap.String("metering_url", m.Config.MeteringURL),
 	)
 	return nil
+}
+
+// serveX402 handles requests authenticated via x-agent-* headers using the x402 payment protocol.
+func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	logger := caddy.Log()
+
+	// 1. Read the FULL raw body for signature verification.
+	//    We read the complete body here (not via SafeReadRequestBody which
+	//    truncates at MaxBodySize) because the HMAC signature covers the
+	//    exact body bytes sent by the client.
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("failed to read request body: %w", err))
+	}
+	r.Body.Close()
+	// Restore body for downstream handlers
+	r.Body = io.NopCloser(bytes.NewReader(rawBody))
+
+	// 2. Verify agent signature against the full raw body
+	agentAddress, err := m.authVerifier.Verify(r, rawBody)
+	if err != nil {
+		if errors.Is(err, x402.ErrInvalidSignature) || errors.Is(err, x402.ErrStaleTimestamp) {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return nil
+		}
+		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
+	// 3. Use BodyHandler for token counting (may truncate large bodies,
+	//    which is fine for token counting accuracy)
+	bodyInfo, err := m.bodyHandler.SafeReadRequestBody(r)
+	if err != nil {
+		return caddyhttp.Error(http.StatusBadRequest, err)
+	}
+
+	// 4. Detect model and count input tokens
+	model := detectModelFromRequestBody(bodyInfo.Content, bodyInfo.ContentType)
+	inputTokens := 0
+	if m.tokenCounter != nil {
+		inputTokens = m.tokenCounter.CountTokensWithModel(bodyInfo.Content, bodyInfo.ContentType, model)
+	}
+
+	// 5. Determine output budget
+	maxOutput := m.Config.X402DefaultOutputBudget
+	if bodyInfo.ParsedJSON != nil {
+		if mt, ok := bodyInfo.ParsedJSON["max_tokens"]; ok {
+			if mtInt, ok := mt.(float64); ok && int(mtInt) > 0 {
+				maxOutput = int(mtInt)
+			}
+		}
+	}
+
+	// 6. Get quote
+	quote, err := m.quoteEngine.Estimate(model, inputTokens, maxOutput)
+	if err != nil {
+		logger.Error("Quote estimation failed", zap.Error(err))
+		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
+	// 7. Reserve — with lazy hydration for cold start
+	reservationID, err := m.ledger.Reserve(agentAddress, quote.TotalCost)
+	if err != nil {
+		if errors.Is(err, x402.ErrInsufficientBalance) {
+			// Lazy hydration: if the agent has no ledger entry, sync from
+			// billing backend and retry the reservation once.
+			entry, _ := m.ledger.GetBalance(agentAddress)
+			if entry == nil && m.reconciler != nil {
+				if syncErr := m.reconciler.ForceSync(agentAddress); syncErr != nil {
+					logger.Warn("ForceSync failed during lazy hydration",
+						zap.String("agent", agentAddress), zap.Error(syncErr))
+				}
+				// Retry reservation after hydration
+				reservationID, err = m.ledger.Reserve(agentAddress, quote.TotalCost)
+			}
+			// If still insufficient after hydration, issue 402
+			if err != nil {
+				return m.challengeBuilder.Build402Response(w, agentAddress, quote.TotalCost)
+			}
+		} else {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+	}
+
+	// 8. Forward to upstream with response capture
+	tw := NewTokenMeteringResponseWriter(w)
+	err = next.ServeHTTP(tw, r)
+
+	// 9. Handle upstream errors — release reservation, don't charge
+	if err != nil || tw.Status() >= 500 {
+		m.settlementEngine.Cancel(reservationID)
+		return err
+	}
+
+	// 10. Count output tokens
+	outputTokens := 0
+	if m.tokenCounter != nil {
+		respBody := tw.Body()
+		respContentType := tw.Header().Get("Content-Type")
+		outputTokens = m.tokenCounter.CountTokensWithModel(string(respBody), respContentType, model)
+	}
+
+	// 11. Settle
+	result, settleErr := m.settlementEngine.Settle(reservationID, inputTokens, outputTokens, model)
+	if settleErr != nil {
+		logger.Error("Settlement failed", zap.Error(settleErr), zap.String("reservation", reservationID))
+		// Fail-open: response already sent to client
+	}
+
+	// 12. Record usage through existing pipeline
+	if m.tokenAccumulator != nil && result != nil {
+		apiKeyHash := hashString(agentAddress)
+		m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, model, inputTokens, outputTokens)
+	}
+
+	// 13. Record metrics
+	if m.metricsCollector != nil {
+		m.metricsCollector.RecordAuthorized()
+		m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
+	}
+
+	return nil
+}
+
+// hashString returns a hex-encoded SHA-256 hash of the input string.
+func hashString(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
 }
 
 // parseByteSize parses byte size strings like "1MB", "500KB", etc.
@@ -1140,6 +1445,14 @@ func (m *Middleware) Cleanup() error {
 		logger.Debug("Validator cache cleaned up")}
 
 	// Enhanced metering components handle their own cleanup
+
+	// x402 cleanup
+	if m.reconciler != nil {
+		m.reconciler.Stop()
+	}
+	if m.ledger != nil {
+		m.ledger.StopCleanup()
+	}
 
 	logger.Debug("Secret reverse proxy middleware cleanup completed")
 	return nil

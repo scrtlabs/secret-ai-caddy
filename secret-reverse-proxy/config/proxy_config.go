@@ -52,6 +52,19 @@ type Config struct {
 
 	// URL filtering options
 	BlockedURLs        []string      `json:"blocked_urls,omitempty"`        // List of blocked URL patterns
+
+	// x402 Payment Protocol
+	X402Enabled             bool          `json:"x402_enabled,omitempty"`
+	X402AgentKey            string        `json:"x402_agent_key,omitempty"`
+	X402AgentAddress        string        `json:"x402_agent_address,omitempty"`
+	X402SecretVMURL         string        `json:"x402_secretvm_url,omitempty"`
+	X402PaymentURL          string        `json:"x402_payment_url,omitempty"`
+	X402TimestampSkew       time.Duration `json:"x402_timestamp_skew,omitempty"`
+	X402ReconcileInterval   time.Duration `json:"x402_reconcile_interval,omitempty"`
+	X402DefaultOutputBudget int           `json:"x402_default_output_budget,omitempty"`
+	X402PricingFile         string        `json:"x402_pricing_file,omitempty"`
+	X402Currency            string        `json:"x402_currency,omitempty"`
+	X402ReservationTTL      time.Duration `json:"x402_reservation_ttl,omitempty"`
 }
 
 // Config interface implementation for enhanced metering
