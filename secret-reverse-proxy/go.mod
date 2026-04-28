@@ -6,6 +6,7 @@ require (
 	github.com/caddyserver/caddy/v2 v2.11.2
 	github.com/eliben/go-sentencepiece v0.6.0
 	github.com/miscreant/miscreant.go v0.0.0-20200214223636-26d376326b75
+	github.com/rs/xid v1.6.0
 	github.com/sugarme/tokenizer v0.3.0
 	go.uber.org/zap v1.27.1
 	golang.org/x/crypto v0.48.0
@@ -85,7 +86,6 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/rs/xid v1.6.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/schollz/progressbar/v2 v2.15.0 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
@@ -132,7 +132,7 @@ require (
 	google.golang.org/api v0.266.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260128011058-8636f8732409 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260203192932-546029d2fa20 // indirect
-	google.golang.org/grpc v1.79.1 // indirect
+	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.5.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	howett.net/plist v1.0.0 // indirect
