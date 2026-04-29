@@ -70,6 +70,13 @@
 			retry_backoff 300s
 			enable_metrics true
 			metrics_path /metrics
+
+			# x402 Payment Protocol (disabled by default, enable via env vars)
+			x402_enabled {env.X402_ENABLED}
+			x402_agent_key {env.X402_AGENT_KEY}
+			x402_agent_address {env.X402_AGENT_ADDRESS}
+			x402_secretvm_url {env.X402_SECRETVM_URL}
+			x402_payment_url {env.X402_PAYMENT_URL}
 		}
 		
 		reverse_proxy echo-server:80 {

@@ -24,6 +24,12 @@ services:
       - METERING_INTERVAL=1m
       - METERING_URL=https://preview-aidev.scrtlabs.com
       - BLOCK_URLS=8085/api/pull
+      # x402 Payment Protocol (disabled by default)
+      - X402_ENABLED=${X402_ENABLED:-false}
+      - X402_AGENT_KEY=${X402_AGENT_KEY:-}
+      - X402_AGENT_ADDRESS=${X402_AGENT_ADDRESS:-}
+      - X402_SECRETVM_URL=${X402_SECRETVM_URL:-}
+      - X402_PAYMENT_URL=${X402_PAYMENT_URL:-}
     volumes:
       - ./Caddyfile-test:/etc/caddy/Caddyfile
       - ./permit.json:/etc/caddy/permit.json
