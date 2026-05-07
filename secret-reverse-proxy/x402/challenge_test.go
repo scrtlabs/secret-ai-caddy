@@ -7,45 +7,78 @@ import (
 )
 
 func TestChallengeBuilder_Build402Response(t *testing.T) {
-	cb := NewChallengeBuilder("https://portal.example.com/fund", "uscrt")
+	cb := NewChallengeBuilder("https://portal.example.com/api/agent/add-funds")
+
 	w := httptest.NewRecorder()
-
-	err := cb.Build402Response(w, "agent-123", 5000)
+	err := cb.Build402Response(w, 0, 10000)
 	if err != nil {
-		t.Fatalf("Build402Response failed: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Check status code
 	if w.Code != 402 {
-		t.Fatalf("expected status 402, got %d", w.Code)
+		t.Errorf("expected status 402, got %d", w.Code)
 	}
 
-	// Check headers
-	if w.Header().Get("Content-Type") != "application/json" {
-		t.Fatalf("expected Content-Type application/json, got %s", w.Header().Get("Content-Type"))
-	}
-	if w.Header().Get("X-Payment-Required") != "true" {
-		t.Fatal("expected X-Payment-Required header")
+	if w.Header().Get("Payment-Required") != "x402" {
+		t.Errorf("expected Payment-Required header 'x402', got %q", w.Header().Get("Payment-Required"))
 	}
 
-	// Check body
 	var challenge Challenge
-	if err := json.Unmarshal(w.Body.Bytes(), &challenge); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
+	if err := json.NewDecoder(w.Body).Decode(&challenge); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
 	}
-	if challenge.AgentAddress != "agent-123" {
-		t.Fatalf("expected agent-123, got %s", challenge.AgentAddress)
+
+	if challenge.Error != "Insufficient balance" {
+		t.Errorf("unexpected error: %q", challenge.Error)
 	}
-	if challenge.RequiredAmount != 5000 {
-		t.Fatalf("expected required amount 5000, got %d", challenge.RequiredAmount)
+	if challenge.BalanceUSDC != "0.000000" {
+		t.Errorf("expected balance_usdc '0.000000', got %q", challenge.BalanceUSDC)
 	}
-	if challenge.Currency != "uscrt" {
-		t.Fatalf("expected currency uscrt, got %s", challenge.Currency)
+	if challenge.RequiredUSDC != "0.010000" {
+		t.Errorf("expected required_usdc '0.010000', got %q", challenge.RequiredUSDC)
 	}
-	if challenge.PaymentURL != "https://portal.example.com/fund" {
-		t.Fatalf("expected payment URL, got %s", challenge.PaymentURL)
+	if challenge.TopupAmountUSDC != "0.010000" {
+		t.Errorf("expected topup_amount_usdc '0.010000', got %q", challenge.TopupAmountUSDC)
 	}
-	if challenge.ChallengeRef == "" {
-		t.Fatal("expected non-empty challenge ref")
+	if challenge.TopupURL != "https://portal.example.com/api/agent/add-funds" {
+		t.Errorf("unexpected topup_url: %q", challenge.TopupURL)
+	}
+}
+
+func TestChallengeBuilder_PartialBalance(t *testing.T) {
+	cb := NewChallengeBuilder("https://portal.example.com/api/agent/add-funds")
+
+	w := httptest.NewRecorder()
+	_ = cb.Build402Response(w, 5000, 10000)
+
+	var challenge Challenge
+	json.NewDecoder(w.Body).Decode(&challenge)
+
+	if challenge.TopupAmountUSDC != "0.005000" {
+		t.Errorf("expected topup_amount_usdc '0.005000', got %q", challenge.TopupAmountUSDC)
+	}
+	if challenge.BalanceUSDC != "0.005000" {
+		t.Errorf("expected balance_usdc '0.005000', got %q", challenge.BalanceUSDC)
+	}
+}
+
+func TestMinorToUSDC(t *testing.T) {
+	tests := []struct {
+		minor    int64
+		expected string
+	}{
+		{0, "0.000000"},
+		{1, "0.000001"},
+		{10000, "0.010000"},
+		{20000, "0.020000"},
+		{1000000, "1.000000"},
+		{1500000, "1.500000"},
+	}
+
+	for _, tc := range tests {
+		got := minorToUSDC(tc.minor)
+		if got != tc.expected {
+			t.Errorf("minorToUSDC(%d) = %q, want %q", tc.minor, got, tc.expected)
+		}
 	}
 }

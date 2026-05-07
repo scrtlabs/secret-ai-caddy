@@ -119,95 +119,15 @@ type Config interface {
 	GetMetricsPath() string
 }
 
-// x402 interfaces
+// x402 interfaces (portal-based)
 
-// AuthVerifier validates x-agent-* headers.
-type AuthVerifier interface {
-	IsAgentRequest(r *http.Request) bool
-	Verify(r *http.Request, body []byte) (agentAddress string, err error)
-}
-
-// QuoteEngine estimates request cost.
-type QuoteEngine interface {
-	Estimate(model string, inputTokens int, maxOutputTokens int) (*Quote, error)
-}
-
-// SpendableLedger manages per-agent balances.
-type SpendableLedger interface {
-	Credit(agentAddress string, amount int64) error
-	Reserve(agentAddress string, amount int64) (reservationID string, err error)
-	Commit(reservationID string, actualAmount int64) error
-	Release(reservationID string) error
-	GetBalance(agentAddress string) (*LedgerEntry, error)
-	Snapshot() map[string]LedgerEntry
-}
-
-// SettlementEngine finalizes reservations.
-type SettlementEngine interface {
-	Settle(reservationID string, inputTokens, outputTokens int, model string) (*SettlementResult, error)
-	Cancel(reservationID string) error
+// PortalClient communicates with DevPortal for balance checks and usage reporting.
+type PortalClient interface {
+	GetBalance(apiKey string) (balance int64, err error)
+	ReportUsage(apiKey, model string, inputTokens, outputTokens int) error
 }
 
 // ChallengeBuilder constructs 402 responses.
 type ChallengeBuilder interface {
-	Build402Response(w http.ResponseWriter, agentAddress string, requiredAmount int64) error
-}
-
-// SecretVMClient communicates with SecretVM agent APIs.
-type SecretVMClient interface {
-	GetBalance(agentAddress string) (balance int64, err error)
-	AddFunds(agentAddress string, amount int64) error
-	GetVMStatus(vmID string) (status string, err error)
-	ListAgents() ([]string, error)
-}
-
-// Reconciler syncs balances from billing backend to ledger.
-type Reconciler interface {
-	Start(interval time.Duration)
-	Stop()
-	ForceSync(agentAddress string) error
-}
-
-// x402 MetricsCollector extensions
-
-// X402MetricsCollector extends MetricsCollector with x402-specific metrics.
-type X402MetricsCollector interface {
-	MetricsCollector
-	RecordReservation()
-	RecordReservationDenied()
-	RecordSettlement(estimatedCost, actualCost int64)
-	RecordChallenge()
-	RecordReconciliation(success bool)
-}
-
-// x402 types used in interfaces
-
-// Quote is the cost estimate returned by the QuoteEngine.
-type Quote struct {
-	EstimatedInputTokens  int
-	EstimatedOutputTokens int
-	InputCost             int64
-	OutputCost            int64
-	TotalCost             int64
-	Model                 string
-	Currency              string
-}
-
-// LedgerEntry is the per-agent balance state.
-type LedgerEntry struct {
-	Balance   int64
-	Reserved  int64
-	UpdatedAt time.Time
-}
-
-// SettlementResult is the outcome of finalizing a reservation.
-type SettlementResult struct {
-	ReservationID string
-	AgentAddress  string
-	EstimatedCost int64
-	ActualCost    int64
-	Refunded      int64
-	InputTokens   int
-	OutputTokens  int
-	Model         string
+	Build402Response(w http.ResponseWriter, balanceMinor, requiredMinor int64) error
 }

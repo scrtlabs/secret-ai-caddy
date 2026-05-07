@@ -4,33 +4,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-
-	"github.com/rs/xid"
 )
 
-// ChallengeBuilderImpl constructs 402 Payment Required responses.
-type ChallengeBuilderImpl struct {
-	paymentURL string
-	currency   string
+// ChallengeBuilder constructs 402 Payment Required responses.
+type ChallengeBuilder struct {
+	topupURL string
 }
 
 // NewChallengeBuilder creates a new ChallengeBuilder.
-func NewChallengeBuilder(paymentURL, currency string) *ChallengeBuilderImpl {
-	return &ChallengeBuilderImpl{
-		paymentURL: paymentURL,
-		currency:   currency,
+func NewChallengeBuilder(topupURL string) *ChallengeBuilder {
+	return &ChallengeBuilder{
+		topupURL: topupURL,
 	}
 }
 
-// Build402Response writes a 402 Payment Required response to the writer.
-func (cb *ChallengeBuilderImpl) Build402Response(w http.ResponseWriter, agentAddress string, requiredAmount int64) error {
+// Build402Response writes a 402 Payment Required response.
+// balanceMinor and requiredMinor are in USDC minor units (6 decimals).
+func (cb *ChallengeBuilder) Build402Response(w http.ResponseWriter, balanceMinor, requiredMinor int64) error {
+	deficit := requiredMinor - balanceMinor
+	if deficit < 0 {
+		deficit = 0
+	}
+
 	challenge := Challenge{
-		AgentAddress:   agentAddress,
-		RequiredAmount: requiredAmount,
-		Currency:       cb.currency,
-		PaymentURL:     cb.paymentURL,
-		ChallengeRef:   xid.New().String(),
-		Message:        fmt.Sprintf("Insufficient balance. Please add at least %d %s to continue.", requiredAmount, cb.currency),
+		Error:           "Insufficient balance",
+		BalanceUSDC:     minorToUSDC(balanceMinor),
+		RequiredUSDC:    minorToUSDC(requiredMinor),
+		TopupURL:        cb.topupURL,
+		TopupAmountUSDC: minorToUSDC(deficit),
 	}
 
 	body, err := json.Marshal(challenge)
@@ -40,8 +41,19 @@ func (cb *ChallengeBuilderImpl) Build402Response(w http.ResponseWriter, agentAdd
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Payment-Required", "true")
+	w.Header().Set("Payment-Required", "x402")
 	w.WriteHeader(http.StatusPaymentRequired)
 	_, err = w.Write(body)
 	return err
+}
+
+// minorToUSDC converts USDC minor units (6 decimals) to a human-readable string.
+// e.g. 20000 -> "0.02", 10000 -> "0.01", 0 -> "0.00"
+func minorToUSDC(minor int64) string {
+	whole := minor / 1_000_000
+	frac := minor % 1_000_000
+	if frac < 0 {
+		frac = -frac
+	}
+	return fmt.Sprintf("%d.%06d", whole, frac)
 }

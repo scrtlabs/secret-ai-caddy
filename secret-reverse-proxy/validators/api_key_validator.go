@@ -163,6 +163,22 @@ func (v *APIKeyValidator) CleanupCache() {
 // CheckMasterKeys checks if the provided API key exists in the master keys file
 // or in the SECRETAI_MASTER_KEYS environment variable (comma-separated list).
 // The file is checked first; if no file is configured, the env var is checked.
+// IsMasterKey checks only the master key (tier 1) and master keys file (tier 2).
+// Unlike ValidateAPIKey, this skips the cache and contract query, making it fast.
+func (v *APIKeyValidator) IsMasterKey(apiKey string) bool {
+	if strings.TrimSpace(apiKey) == "" {
+		return false
+	}
+	if v.config.APIKey != "" && apiKey == v.config.APIKey {
+		return true
+	}
+	isMaster, err := v.CheckMasterKeys(apiKey)
+	if err != nil {
+		return false
+	}
+	return isMaster
+}
+
 func (v *APIKeyValidator) CheckMasterKeys(apiKey string) (bool, error) {
 	logger := caddy.Log()
 

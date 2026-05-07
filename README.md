@@ -23,7 +23,7 @@ A sophisticated Caddy middleware that provides secure API key authentication, in
 This middleware implements a comprehensive API gateway solution designed for high-security AI/ML environments requiring:
 
 1. **Multi-tiered Authentication** - Master keys, file-based keys, and Secret Network smart contracts
-2. **x402 Payment Protocol** - Prepaid metering for AI agents with HMAC-signed requests, per-agent balances, and 402 payment challenges
+2. **x402 Payment Protocol** - Portal-based prepaid billing for AI agents with DevPortal balance checks, 402 payment challenges, and async usage reporting
 3. **Accurate Token Metering** - Model-specific token counting for precise billing and usage tracking
 4. **Comprehensive Metrics** - Performance monitoring, usage analytics, and operational insights
 5. **Blockchain Integration** - Decentralized usage reporting via Secret Network smart contracts
@@ -32,7 +32,7 @@ This middleware implements a comprehensive API gateway solution designed for hig
 ## 📚 Documentation
 
 - **[📐 Architecture](./ARCHITECTURE.md)** - Complete system architecture and component design
-- **[💳 x402 Payment Protocol](./x402.md)** - Prepaid metering, agent authentication, and payment enforcement
+- **[💳 x402 Payment Protocol](./x402_Caddy_Implementation.md)** - Portal-based balance checking, 402 challenges, and usage reporting
 - **[⚖️ Metering & Metrics](./METERING.md)** - Token counting, usage tracking, and metrics collection
 
 ## 🏗️ Architecture Overview
@@ -41,14 +41,14 @@ This middleware implements a comprehensive API gateway solution designed for hig
 graph TB
     subgraph "Client Layer"
         C[AI/ML Clients<br/>with API Keys]
-        A[AI Agents<br/>with x402 Headers]
+        A[AI Agents<br/>with Bearer Tokens]
     end
 
     subgraph "Caddy Gateway"
         subgraph "Middleware Pipeline"
-            ROUTE{Agent Headers?}
+            ROUTE{Master Key?}
             AUTH[API Key Authentication]
-            X402[x402 Payment Path]
+            X402[x402 Portal Path]
             METER[Token Metering]
             METRICS[Metrics Collection]
             PROXY[Reverse Proxy]
@@ -63,13 +63,15 @@ graph TB
     end
 
     subgraph "x402 Components"
-        VERIFY[Auth Verifier<br/>HMAC-SHA256]
-        QUOTE[Quote Engine]
-        LEDGER[Spendable Ledger]
-        SETTLE[Settlement Engine]
+        PORTAL[Portal Client]
         CHALLENGE[402 Challenge Builder]
-        RECON[Reconciler]
-        SVM[SecretVM Client]
+        REPORT[Async Usage Reporter]
+    end
+
+    subgraph "DevPortal"
+        BAL[Balance API]
+        USAGE[Usage Reporting API]
+        PAY[Payment Processing]
     end
 
     subgraph "AI/ML Services"
@@ -85,28 +87,26 @@ graph TB
     end
 
     C -->|HTTP + API Key| ROUTE
-    A -->|HTTP + Agent Headers| ROUTE
-    ROUTE -->|No| AUTH
-    ROUTE -->|Yes| X402
+    A -->|HTTP + Bearer Token| ROUTE
+    ROUTE -->|Yes| AUTH
+    ROUTE -->|No, x402 enabled| X402
     AUTH --> MK
     AUTH --> MKF
     AUTH --> CACHE
     AUTH -->|Cache Miss| SC
     AUTH -->|Authorized| METER
-    X402 --> VERIFY
-    VERIFY --> QUOTE
-    QUOTE --> LEDGER
-    LEDGER -->|Insufficient| CHALLENGE
-    LEDGER -->|Reserved| METER
+    X402 --> PORTAL
+    PORTAL -->|Check Balance| BAL
+    PORTAL -->|Insufficient| CHALLENGE
+    PORTAL -->|Sufficient| METER
     METER -->|Count Tokens| METRICS
     METER --> PROXY
     PROXY --> AI1
     PROXY --> AI2
     PROXY --> AI3
     PROXY --> AI4
-    SETTLE --> LEDGER
-    RECON --> SVM
-    RECON --> LEDGER
+    REPORT -->|Token Counts| USAGE
+    A -->|Top Up| PAY
 
     METRICS -->|Usage Data| BLOCKCHAIN
     METRICS --> METRICS_API
@@ -183,17 +183,17 @@ Any model available on HuggingFace with a `tokenizer.json` file can be used.
 - **Token usage analytics** with input/output token breakdowns
 - **System health indicators** for operational monitoring
 
-### 💳 x402 Payment Protocol
-- **Agent authentication** via HMAC-SHA256 signed requests with replay protection
-- **Prepaid metering** with reserve-then-settle pattern — agents are never overcharged
-- **In-memory ledger** with per-agent balances, fine-grained locking for high concurrency
-- **402 Payment Required** responses with machine-readable challenge payloads
-- **Background reconciliation** syncing balances from SecretVM billing backend
-- **Lazy hydration** on cold start — no false 402 rejections after Caddy restart
-- **Per-model pricing** with configurable pricing tables (JSON file or built-in defaults)
-- **Coexistence** with legacy API key auth — both paths work simultaneously
+### 💳 x402 Payment Protocol (Portal-Based)
+- **Stateless proxy** — Caddy delegates all balance management to DevPortal
+- **Per-request balance check** via DevPortal API with service-key authentication
+- **402 Payment Required** responses with USDC-denominated challenge payloads and topup URLs
+- **Async usage reporting** — token counts sent to DevPortal without blocking the response
+- **Fail-closed** — returns 503 when DevPortal is unreachable (no unpaid usage)
+- **Master key bypass** — admin/operator keys skip portal balance checks
+- **Configurable threshold** — minimum balance required to serve requests (`x402_min_balance_usdc`)
+- **Portal owns pricing** — Caddy reports raw token counts, DevPortal computes cost
 
-See [x402.md](./x402.md) for full documentation.
+See [x402_Caddy_Implementation.md](./x402_Caddy_Implementation.md) for full documentation and [x402-portal.md](./x402-portal.md) for the end-to-end payment flow design.
 
 ### 🚫 URL Filtering & Security
 - **Pattern-based blocking** with configurable URL patterns via environment variables
@@ -356,24 +356,19 @@ The `Caddyfile-test` demonstrates comprehensive configuration:
 
 ### x402 Payment Protocol Testing
 
-The x402 test suite uses Docker containers with a SecretVM simulation server and mock AI upstream:
+The x402 test suite includes unit tests and integration tests with a mock DevPortal:
 
 ```bash
-# Build Caddy image
-docker build -t secret-reverse-proxy:latest .
+cd secret-reverse-proxy
 
-# Start x402 test environment
-cd test/x402
-docker compose -f docker-compose-x402.yaml up -d --build
+# Run x402 unit tests (portal client, challenge builder, USDC conversion)
+go test -v ./x402/
 
-# Run end-to-end tests (14 tests)
-bash test_x402.sh
-
-# Clean up
-docker compose -f docker-compose-x402.yaml down
+# Run x402 integration tests (full middleware flow with mock portal)
+go test -v -run TestX402
 ```
 
-The test script verifies: funded/unfunded agents, invalid signatures, stale timestamps, legacy API key coexistence, fund-then-retry flow, balance drain, and metrics. See [x402.md](./x402.md) for details.
+The integration tests verify: insufficient balance (402), sufficient balance (200 + usage report), master key bypass, portal unreachable (503), and partial balance deficit calculation. See [x402_Caddy_Implementation.md](./x402_Caddy_Implementation.md) for the full test plan including Docker-based end-to-end testing.
 
 ### Development Testing
 
@@ -427,10 +422,8 @@ go test -v -run TestMetering
 | `SECRETAI_PERMIT_TYPE` | Permit public key type. Required when no `permit_file` is configured — used to construct a permit on the fly for retrieving API keys from KMS. | `tendermint/PubKeySecp256k1` |
 | `SECRETAI_PERMIT_PUBKEY` | Permit public key value. Required when no `permit_file` is configured. | `Aur9D8RLq...` |
 | `SECRETAI_PERMIT_SIG` | Permit signature. Required when no `permit_file` is configured. | `TeNtblPmo...` |
-| `X402_AGENT_KEY` | Shared HMAC secret for x402 agent signature verification | `your-shared-secret` |
-| `X402_AGENT_ADDRESS` | Caddy proxy's agent identity for SecretVM API calls | `caddy-proxy-agent` |
-| `X402_SECRETVM_URL` | SecretVM billing backend base URL | `http://secretvm:9100` |
-| `X402_PAYMENT_URL` | Payment portal URL returned in 402 challenges | `https://portal.example.com/fund` |
+| `DEVPORTAL_URL` | DevPortal base URL for balance checks and usage reporting | `https://devportal.example.com` |
+| `DEVPORTAL_SERVICE_KEY` | Shared secret for Caddy-to-DevPortal service authentication | `caddy-secret-key-123` |
 
 ### Caddyfile Directives
 
@@ -453,17 +446,11 @@ go test -v -run TestMetering
 | `retry_backoff` | duration | Retry delay | `5m` |
 | `enable_metrics` | boolean | Enable metrics collection | `false` |
 | `metrics_path` | string | Metrics HTTP endpoint | `/metrics` |
-| `x402_enabled` | boolean | Enable x402 payment protocol | `false` |
-| `x402_agent_key` | string | Shared HMAC key for agent auth | Required if x402 enabled |
-| `x402_agent_address` | string | Caddy's agent address for SecretVM | Required if x402 enabled |
-| `x402_secretvm_url` | string | SecretVM API base URL | Required if x402 enabled |
-| `x402_payment_url` | string | Payment URL in 402 challenges | Required if x402 enabled |
-| `x402_timestamp_skew` | duration | Max timestamp drift | `5m` |
-| `x402_reconcile_interval` | duration | Balance sync interval | `30s` |
-| `x402_default_output_budget` | int | Default max output tokens | `4096` |
-| `x402_pricing_file` | path | Per-model pricing JSON | built-in defaults |
-| `x402_currency` | string | Unit of account | `uscrt` |
-| `x402_reservation_ttl` | duration | Max reservation lifetime | `5m` |
+| `x402_enabled` | boolean | Enable portal-based x402 payment protocol | `false` |
+| `devportal_url` | string | DevPortal base URL | Required if x402 enabled |
+| `devportal_service_key` | string | Shared secret for service-to-service auth | Required if x402 enabled |
+| `x402_min_balance_usdc` | string | Minimum agent balance in USDC (e.g., `"0.01"`) | Required if x402 enabled |
+| `x402_topup_url` | string | Override topup URL in 402 responses | `{devportal_url}/api/agent/add-funds` |
 
 ## 🚀 Production Deployment
 
