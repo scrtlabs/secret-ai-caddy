@@ -1,0 +1,7 @@
+# Secrets — never commit
+.env
+
+# TLS certificates
+certs/*.pem
+certs/*.crt
+certs/*.key

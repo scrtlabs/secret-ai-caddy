@@ -1,6 +1,15 @@
 # Local secrets and test credentials — do not commit
 local/
 
+# Master keys file — contains real credentials
+master_keys.txt
+
 # Caddy runtime data
 data/
 config/autosave.json
+
+# caddy-mock-llm secrets
+caddy-mock-llm/.env
+caddy-mock-llm/certs/*.pem
+caddy-mock-llm/certs/*.crt
+caddy-mock-llm/certs/*.key

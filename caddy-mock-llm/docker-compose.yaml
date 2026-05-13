@@ -1,0 +1,61 @@
+services:
+
+  # Mock LLM backend — simulates SecretAI/Ollama API
+  # Image: ghcr.io/scrtlabs/secretai-mock-llm:latest
+  # To publish: docker compose build mock-llm && docker compose push mock-llm
+  mock-llm:
+    image: ghcr.io/scrtlabs/secretai-mock-llm:latest
+    build:
+      context: ./mock-llm
+    container_name: secretai-mock-llm
+    restart: unless-stopped
+    networks:
+      - secretai_network
+
+  caddy:
+    image: ghcr.io/scrtlabs/secret-ai-caddy:latest
+    container_name: secretai-caddy
+    ports:
+      - "21434:21434"
+    env_file:
+      - .env
+    environment:
+      - SKIP_SSL_VALIDATION=false
+      - SECRET_NODE=rpc12.scrtlabs.com
+      - SECRET_CHAIN_ID=secret-4
+      - SECRET_CONTRACT=secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm
+      - METERING=1
+      - METERING_INTERVAL=${METERING_INTERVAL:-1m}
+      - METERING_URL=${DEVPORTAL_URL}
+      - BLOCK_URLS=21434/api/pull
+      - X402_ENABLED=${X402_ENABLED:-true}
+      - DEVPORTAL_URL=${DEVPORTAL_URL}
+      - DEVPORTAL_SERVICE_KEY=${DEVPORTAL_SERVICE_KEY}
+      - X402_MIN_BALANCE_USD=${X402_MIN_BALANCE_USD:-0.001}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CERT_DIR:-./certs}:/etc/caddy/certs:ro
+      - caddy_data:/data
+    networks:
+      - secretai_network
+    depends_on:
+      - mock-llm
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-k", "https://localhost:21434/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+networks:
+  secretai_network:
+    driver: bridge
+
+volumes:
+  caddy_data:

@@ -1,0 +1,81 @@
+{
+	order secret_reverse_proxy first
+	log {
+		output stdout
+		format console
+		level INFO
+	}
+}
+
+:21434 {
+	# TLS — place your certs in the ./certs/ folder:
+	#   fullchain.pem  → certificate chain
+	#   privkey.pem    → private key
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+
+	# CORS preflight
+	@cors_preflight method OPTIONS
+	handle @cors_preflight {
+		@has_origin header Origin *
+		header @has_origin {
+			Access-Control-Allow-Origin {header.origin}
+			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Max-Age "86400"
+			Vary "Origin"
+		}
+		respond "" 204
+	}
+
+	# Main handler
+	handle {
+		@has_origin header Origin *
+		header @has_origin {
+			Access-Control-Allow-Origin {header.origin}
+			Access-Control-Allow-Credentials "true"
+			Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+			Access-Control-Allow-Headers "*"
+			Access-Control-Expose-Headers "*"
+			Vary "Origin"
+		}
+
+		secret_reverse_proxy {
+			API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+			secret_node {env.SECRET_NODE}
+			contract_address {env.SECRET_CONTRACT}
+			secret_chain_id {env.SECRET_CHAIN_ID}
+			metering {env.METERING}
+			metering_interval {env.METERING_INTERVAL}
+			metering_url {env.METERING_URL}
+
+			max_body_size 2097152
+			token_counting_mode accurate
+			max_retries 5
+			retry_backoff 300s
+			enable_metrics true
+			metrics_path /metrics
+
+			x402_enabled {env.X402_ENABLED}
+			devportal_url {env.DEVPORTAL_URL}
+			devportal_service_key {env.DEVPORTAL_SERVICE_KEY}
+			x402_min_balance_usd {env.X402_MIN_BALANCE_USD}
+		}
+
+		reverse_proxy mock-llm:80 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Port {server_port}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Security headers
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		X-XSS-Protection "1; mode=block"
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

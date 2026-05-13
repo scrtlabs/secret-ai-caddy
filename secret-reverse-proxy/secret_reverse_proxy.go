@@ -235,7 +235,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		zap.String("contract_address", m.Config.ContractAddress),
 		zap.Duration("cache_ttl", m.Config.CacheTTL),
 		zap.String("master_keys", optionalConfigSource(m.Config.MasterKeysFile, "SECRETAI_MASTER_KEYS")),
-		zap.String("master_key_configured", m.Config.APIKey),
+		zap.Bool("master_key_configured", m.Config.APIKey != ""),
 		zap.String("permit", optionalConfigSource(m.Config.PermitFile, "SECRETAI_PERMIT_TYPE", "SECRETAI_PERMIT_PUBKEY", "SECRETAI_PERMIT_SIG")),
 		zap.Bool("metering", m.Config.Metering),
 		zap.Duration("metering_interval", m.Config.MeteringInterval),
@@ -273,7 +273,7 @@ func (m *Middleware) Validate() error {
 
 	// Log the complete configuration contents
 	logger.Info("Configuration contents",
-		zap.String("api_key", m.Config.APIKey),
+		zap.Bool("api_key_set", m.Config.APIKey != ""),
 		zap.String("master_keys", optionalConfigSource(m.Config.MasterKeysFile, "SECRETAI_MASTER_KEYS")),
 		zap.String("permit", optionalConfigSource(m.Config.PermitFile, "SECRETAI_PERMIT_TYPE", "SECRETAI_PERMIT_PUBKEY", "SECRETAI_PERMIT_SIG")),
 		zap.String("secret_node", m.Config.SecretNode),
@@ -583,21 +583,25 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		m.metricsCollector.RecordProcessingTime(time.Since(startTime))
 	}
 
-	// Record usage for reporting - create API key hash
-	if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
-		hasher := sha256.New()
-		hasher.Write([]byte(apiKey))
-		apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
+	// Record usage for reporting — only for LLM requests (model must be known).
+	// Non-LLM endpoints (GET /v1/models, GET /api/tags, /api/version, etc.) produce
+	// output tokens from their JSON responses but should never be billed.
+	if modelName != "unknown" {
+		if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
+			hasher := sha256.New()
+			hasher.Write([]byte(apiKey))
+			apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
 
-		m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens)
+			m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens)
+		}
+
+		// Log token usage for monitoring (enhanced system handles reporting internally)
+		caddy.Log().Info("Token usage recorded",
+			zap.Int("input_tokens", inputTokens),
+			zap.Int("output_tokens", outputTokens),
+			zap.String("model", modelName),
+			zap.String("endpoint", r.URL.Path))
 	}
-
-	// Log token usage for monitoring (enhanced system handles reporting internally)
-	caddy.Log().Info("Token usage recorded",
-		zap.Int("input_tokens", inputTokens),
-		zap.Int("output_tokens", outputTokens),
-		zap.String("model", modelName),
-		zap.String("endpoint", r.URL.Path))
 
 	return nil
 }
@@ -716,13 +720,16 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 
 				rawValue := d.Val()
-				logger.Info("Raw API_MASTER_KEY value:", zap.String("raw", rawValue))
 
 				// Expand environment variables if present
 				expandedValue := expandEnvVars(rawValue)
 				m.Config.APIKey = expandedValue
 
-				logger.Info("🔑 Primary master key configured successfully:", zap.String("API_MASTER_KEY", m.Config.APIKey))
+				if m.Config.APIKey != "" {
+					logger.Info("🔑 Primary master key configured successfully")
+				} else {
+					logger.Warn("⚠️  API_MASTER_KEY directive present but value is empty")
+				}
 
 			case "master_keys_file":
 				// Additional master keys file path
@@ -951,7 +958,7 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		logger.Info("🔄 Finished processing block for token:", zap.String("token", d.Val()))
 	}
 	logger.Info("✅ Final configuration:",
-		zap.String("api_key", m.Config.APIKey),
+		zap.Bool("api_key_set", m.Config.APIKey != ""),
 		zap.String("master_keys", optionalConfigSource(m.Config.MasterKeysFile, "SECRETAI_MASTER_KEYS")),
 		zap.String("permit", optionalConfigSource(m.Config.PermitFile, "SECRETAI_PERMIT_TYPE", "SECRETAI_PERMIT_PUBKEY", "SECRETAI_PERMIT_SIG")),
 		zap.String("contract_address", m.Config.ContractAddress),
@@ -1064,8 +1071,14 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	reportTimestamp := time.Now().Unix()
 	go func() {
 		if reportErr := m.portalClient.ReportUsage(walletAddr, model, inputTokens, outputTokens, reportTimestamp); reportErr != nil {
-			logger.Error("Failed to report usage to portal",
+			logger.Error("x402: failed to report usage to portal",
 				zap.Error(reportErr),
+				zap.String("wallet", walletAddr),
+				zap.String("model", model),
+				zap.Int("input_tokens", inputTokens),
+				zap.Int("output_tokens", outputTokens))
+		} else {
+			logger.Info("x402: usage reported to portal",
 				zap.String("wallet", walletAddr),
 				zap.String("model", model),
 				zap.Int("input_tokens", inputTokens),
@@ -1079,11 +1092,10 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 		m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
 	}
 
-	// 12. Record usage in accumulator for legacy metering pipeline
-	if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
-		walletHash := hashString(walletAddr)
-		m.tokenAccumulator.RecordUsageWithModel(walletHash, model, inputTokens, outputTokens)
-	}
+	// NOTE: do NOT record into tokenAccumulator here.
+	// tokenAccumulator feeds ResilientReporter which identifies records by api_key_hash (legacy user path).
+	// For x402 agents usage is already reported above via portalClient.ReportUsage (step 10).
+	// Adding it to the accumulator would cause double-billing on the portal.
 
 	return nil
 }
