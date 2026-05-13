@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 )
 
 // ChallengeBuilder constructs 402 Payment Required responses.
@@ -19,19 +20,19 @@ func NewChallengeBuilder(topupURL string) *ChallengeBuilder {
 }
 
 // Build402Response writes a 402 Payment Required response.
-// balanceMinor and requiredMinor are in USDC minor units (6 decimals).
-func (cb *ChallengeBuilder) Build402Response(w http.ResponseWriter, balanceMinor, requiredMinor int64) error {
-	deficit := requiredMinor - balanceMinor
+// balance and required are USD amounts as float64, e.g. 0.02 = $0.02.
+func (cb *ChallengeBuilder) Build402Response(w http.ResponseWriter, balance, required float64) error {
+	deficit := required - balance
 	if deficit < 0 {
 		deficit = 0
 	}
 
 	challenge := Challenge{
-		Error:           "Insufficient balance",
-		BalanceUSDC:     minorToUSDC(balanceMinor),
-		RequiredUSDC:    minorToUSDC(requiredMinor),
-		TopupURL:        cb.topupURL,
-		TopupAmountUSDC: minorToUSDC(deficit),
+		Error:          "Insufficient balance",
+		BalanceUSD:     formatUSD(balance),
+		RequiredUSD:    formatUSD(required),
+		TopupURL:       cb.topupURL,
+		TopupAmountUSD: formatUSD(deficit),
 	}
 
 	body, err := json.Marshal(challenge)
@@ -47,13 +48,7 @@ func (cb *ChallengeBuilder) Build402Response(w http.ResponseWriter, balanceMinor
 	return err
 }
 
-// minorToUSDC converts USDC minor units (6 decimals) to a human-readable string.
-// e.g. 20000 -> "0.02", 10000 -> "0.01", 0 -> "0.00"
-func minorToUSDC(minor int64) string {
-	whole := minor / 1_000_000
-	frac := minor % 1_000_000
-	if frac < 0 {
-		frac = -frac
-	}
-	return fmt.Sprintf("%d.%06d", whole, frac)
+// formatUSD formats a USD float64 to a 6-decimal string, e.g. 0.02 → "0.020000".
+func formatUSD(v float64) string {
+	return strconv.FormatFloat(v, 'f', 6, 64)
 }

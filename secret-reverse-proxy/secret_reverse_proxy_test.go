@@ -9,22 +9,21 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
-	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
 	utils "github.com/scrtlabs/secret-reverse-proxy/util"
+	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
 )
-
 
 func TestDefaultConfig(t *testing.T) {
 	config := proxyconfig.DefaultConfig()
-	
+
 	if config.MasterKeysFile != "master_keys.txt" {
 		t.Errorf("Expected MasterKeysFile to be 'master_keys.txt', got %s", config.MasterKeysFile)
 	}
-	
-	if config.ContractAddress != "secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr" {
+
+	if config.ContractAddress != "secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm" {
 		t.Errorf("Expected default contract address, got %s", config.ContractAddress)
 	}
-	
+
 	if config.CacheTTL != 30*time.Minute {
 		t.Errorf("Expected CacheTTL to be 30 minutes, got %v", config.CacheTTL)
 	}
@@ -36,26 +35,26 @@ func TestNewAPIKeyValidator(t *testing.T) {
 		ContractAddress: "test-contract",
 		CacheTTL:        time.Hour,
 	}
-	
+
 	validator := apikeyval.NewAPIKeyValidator(config)
 	if validator == nil {
 		t.Fatal("Expected validator to be created, got nil")
-	}	
+	}
 }
 
 func TestMiddleware_CaddyModule(t *testing.T) {
 	m := Middleware{}
 	moduleInfo := m.CaddyModule()
-	
+
 	expectedID := caddy.ModuleID("http.handlers.secret_reverse_proxy")
 	if moduleInfo.ID != expectedID {
 		t.Errorf("Expected module ID %s, got %s", expectedID, moduleInfo.ID)
 	}
-	
+
 	if moduleInfo.New == nil {
 		t.Error("Expected New function to be defined")
 	}
-	
+
 	// Test that New() returns a new Middleware instance
 	newModule := moduleInfo.New()
 	if _, ok := newModule.(*Middleware); !ok {
@@ -87,29 +86,29 @@ func TestMiddleware_Provision(t *testing.T) {
 			expectDefaults: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := &Middleware{
 				Config: tt.initialConfig,
 			}
-			
+
 			ctx := caddy.Context{}
 			err := m.Provision(ctx)
-			
+
 			if tt.expectError && err == nil {
 				t.Error("Expected error but got none")
 			}
 			if !tt.expectError && err != nil {
 				t.Errorf("Expected no error but got: %v", err)
 			}
-			
+
 			if tt.expectDefaults {
-				if m.Config.ContractAddress != "secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr" {
+				if m.Config.ContractAddress != "secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm" {
 					t.Error("Expected default config to be applied")
 				}
 			}
-			
+
 			if m.validator == nil {
 				t.Error("Expected validator to be created")
 			}
@@ -165,15 +164,15 @@ func TestMiddleware_Validate(t *testing.T) {
 			expectError: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := &Middleware{
 				Config: tt.config,
 			}
-			
+
 			err := m.Validate()
-			
+
 			if tt.expectError {
 				if err == nil {
 					t.Error("Expected error but got none")
@@ -226,7 +225,7 @@ func TestExtractAPIKey(t *testing.T) {
 			expected:   "basic abc123",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractAPIKey(tt.authHeader)
@@ -250,7 +249,7 @@ func TestMin(t *testing.T) {
 		{"mixed signs", -2, 3, -2},
 		{"zero", 0, 5, 0},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := min(tt.a, tt.b)
@@ -263,12 +262,12 @@ func TestMin(t *testing.T) {
 
 func TestAPIKeyValidator_checkMasterKeys(t *testing.T) {
 	tests := []struct {
-		name         string
-		fileContent  string
-		apiKey       string
-		expectFound  bool
-		expectError  bool
-		noFile       bool
+		name        string
+		fileContent string
+		apiKey      string
+		expectFound bool
+		expectError bool
+		noFile      bool
 	}{
 		{
 			name:        "key found in file",
@@ -541,26 +540,26 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 			expectError: true,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := caddyfile.NewTestDispenser(tt.caddyfile)
-			
+
 			m := &Middleware{}
 			err := m.UnmarshalCaddyfile(d)
-			
+
 			if tt.expectError {
 				if err == nil {
 					t.Error("Expected error but got none")
 				}
 				return
 			}
-			
+
 			if err != nil {
 				t.Errorf("Expected no error but got: %v", err)
 				return
 			}
-			
+
 			if tt.validate != nil {
 				tt.validate(t, m)
 			}

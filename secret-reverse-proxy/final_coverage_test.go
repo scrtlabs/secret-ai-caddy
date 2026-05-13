@@ -87,7 +87,7 @@ func TestValidate_EdgeCases(t *testing.T) {
 			name: "negative cache TTL",
 			middleware: &Middleware{
 				Config: &Config{
-					ContractAddress: "test-contract", 
+					ContractAddress: "test-contract",
 					CacheTTL:        -1 * time.Hour,
 				},
 			},
@@ -239,7 +239,7 @@ func TestUpdateAPIKeyCache_EdgeCases(t *testing.T) {
 			"signature": "test"
 		}
 	}`
-	
+
 	permitFile := createTempFileHelper(t, permitContent)
 	defer cleanupTempFileHelper(t, permitFile)
 
@@ -254,9 +254,13 @@ func TestUpdateAPIKeyCache_EdgeCases(t *testing.T) {
 
 	// Mock the contract query function to test permit file usage
 	originalQuery := queryContractFunc
-	defer func() { queryContractFunc = originalQuery }()
+	originalValidatorsQuery := validators.QueryContractFunc
+	defer func() {
+		queryContractFunc = originalQuery
+		validators.QueryContractFunc = originalValidatorsQuery
+	}()
 
-	queryContractFunc = func(contractAddress string, query map[string]any) (map[string]any, error) {
+	mockFn := func(contractAddress string, query map[string]any) (map[string]any, error) {
 		// Verify that the permit from file is being used
 		if permitParams, exists := query["api_keys_with_permit"]; exists {
 			if permitMap, ok := permitParams.(map[string]any); ok {
@@ -277,6 +281,8 @@ func TestUpdateAPIKeyCache_EdgeCases(t *testing.T) {
 		}
 		return map[string]any{"api_keys": []any{}}, nil
 	}
+	queryContractFunc = mockFn
+	validators.QueryContractFunc = mockFn
 
 	// Test cache update with permit file
 	err := validator.UpdateAPIKeyCache()
@@ -293,10 +299,10 @@ func TestUpdateAPIKeyCache_EdgeCases(t *testing.T) {
 // TestProvision_EdgeCases tests additional provision edge cases
 func TestProvision_EdgeCases(t *testing.T) {
 	tests := []struct {
-		name           string
-		initialConfig  *Config
-		expectError    bool
-		expectNonNil   bool
+		name          string
+		initialConfig *Config
+		expectError   bool
+		expectNonNil  bool
 	}{
 		{
 			name:          "completely nil config",
@@ -359,15 +365,15 @@ func createTempFileHelper(t *testing.T, content string) string {
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
-	
+
 	if _, err := tmpFile.WriteString(content); err != nil {
 		t.Fatalf("Failed to write to temp file: %v", err)
 	}
-	
+
 	if err := tmpFile.Close(); err != nil {
 		t.Fatalf("Failed to close temp file: %v", err)
 	}
-	
+
 	return tmpFile.Name()
 }
 

@@ -2,23 +2,30 @@ package validators
 
 import (
 	"bufio"
-	querycontract "github.com/scrtlabs/secret-reverse-proxy/query-contract"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"time"
-	"encoding/json"
+
+	querycontract "github.com/scrtlabs/secret-reverse-proxy/query-contract"
 
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
-	
+
 	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
 )
 
 type Config = proxyconfig.Config
+
+// QueryContractFunc is the injectable function used to query the contract.
+// Tests can replace this to avoid real network calls.
+var QueryContractFunc = func(contractAddress string, query map[string]any) (map[string]any, error) {
+	return querycontract.QueryContract(contractAddress, query)
+}
 
 // APIKeyValidator encapsulates all logic for validating API keys against multiple sources.
 // It manages an in-memory cache of valid API key hashes for performance optimization.
@@ -26,15 +33,15 @@ type Config = proxyconfig.Config
 type APIKeyValidator struct {
 	// config holds the validator configuration parameters
 	config *Config
-	
+
 	// cache stores SHA256 hashes of valid API keys mapped to their validity status
 	// Key: SHA256 hash of API key, Value: true if valid
 	cache map[string]bool
-	
+
 	// cacheMutex protects concurrent access to the cache map
 	// Uses RWMutex to allow multiple concurrent reads while serializing writes
 	cacheMutex sync.RWMutex
-	
+
 	// lastUpdate tracks when the cache was last refreshed from the smart contract
 	// Used to determine if cache has exceeded TTL and needs refresh
 	lastUpdate time.Time
@@ -67,21 +74,22 @@ func (v *APIKeyValidator) CacheSize() int {
 //   - error: nil on successful validation process, error if validation cannot be performed
 //
 // Note: A return of (false, nil) means the key is definitively invalid.
-//       A return of (false, error) means the validation process failed.
+//
+//	A return of (false, error) means the validation process failed.
 func (v *APIKeyValidator) ValidateAPIKey(apiKey string) (bool, error) {
 	logger := caddy.Log()
-	
+
 	// BLOCK 1: Input Validation
 	// Ensure we have a non-empty API key to work with
 	if strings.TrimSpace(apiKey) == "" {
 		logger.Debug("API key validation failed: empty key")
 		return false, fmt.Errorf("empty API key")
 	}
-	
+
 	// Create safe logging prefix for debugging (only first 8 characters)
 	keyPrefix := apiKey[:min(8, len(apiKey))] + "..."
 	logger.Debug("Starting API key validation", zap.String("key_prefix", keyPrefix))
-	
+
 	// BLOCK 2: Master Key Check
 	// Check against the primary configured master key (highest priority)
 	if v.config.APIKey != "" && apiKey == v.config.APIKey {
@@ -184,8 +192,6 @@ func (v *APIKeyValidator) CheckMasterKeys(apiKey string) (bool, error) {
 
 	// Check master keys file if configured
 	if v.config.MasterKeysFile != "" {
-		logger.Debug("Checking master keys file", zap.String("file", v.config.MasterKeysFile))
-
 		file, err := os.Open(v.config.MasterKeysFile)
 		if err != nil {
 			// If file doesn't exist, that's not an error — fall through to env var check
@@ -195,7 +201,6 @@ func (v *APIKeyValidator) CheckMasterKeys(apiKey string) (bool, error) {
 					zap.Error(err))
 				return false, fmt.Errorf("failed to open master keys file: %w", err)
 			}
-			logger.Debug("Master keys file does not exist", zap.String("file", v.config.MasterKeysFile))
 		} else {
 			defer file.Close()
 
@@ -205,9 +210,6 @@ func (v *APIKeyValidator) CheckMasterKeys(apiKey string) (bool, error) {
 				lineCount++
 				nextMasterKey := strings.TrimSpace(scanner.Text())
 				if nextMasterKey != "" && nextMasterKey == apiKey {
-					logger.Debug("API key found in master keys file",
-						zap.String("file", v.config.MasterKeysFile),
-						zap.Int("line", lineCount))
 					return true, nil
 				}
 			}
@@ -219,28 +221,18 @@ func (v *APIKeyValidator) CheckMasterKeys(apiKey string) (bool, error) {
 				return false, fmt.Errorf("error reading master keys file: %w", err)
 			}
 
-			logger.Debug("API key not found in master keys file",
-				zap.String("file", v.config.MasterKeysFile),
-				zap.Int("lines_checked", lineCount))
 		}
 	}
 
 	// Check SECRETAI_MASTER_KEYS env var (comma-separated list)
 	envKeys := os.Getenv("SECRETAI_MASTER_KEYS")
 	if envKeys != "" {
-		logger.Debug("Checking SECRETAI_MASTER_KEYS env var")
 		for _, key := range strings.Split(envKeys, ",") {
 			key = strings.TrimSpace(key)
 			if key != "" && key == apiKey {
-				logger.Debug("API key found in SECRETAI_MASTER_KEYS env var")
 				return true, nil
 			}
 		}
-		logger.Debug("API key not found in SECRETAI_MASTER_KEYS env var")
-	}
-
-	if v.config.MasterKeysFile == "" && envKeys == "" {
-		logger.Debug("No master keys file configured and SECRETAI_MASTER_KEYS env var not set")
 	}
 
 	return false, nil
@@ -250,15 +242,14 @@ func (v *APIKeyValidator) CheckMasterKeys(apiKey string) (bool, error) {
 func (v *APIKeyValidator) UpdateAPIKeyCache() error {
 	logger := caddy.Log()
 	start := time.Now()
-	
+
 	logger.Debug("Starting cache update", zap.String("contract_address", v.config.ContractAddress))
-	
+
 	// Load permit from file or use default
 	var permit map[string]any
 	var err error
-	
+
 	if v.config.PermitFile != "" {
-		logger.Debug("Loading permit from file", zap.String("file", v.config.PermitFile))
 		permit, err = ReadPermitFromFile(v.config.PermitFile)
 		if err != nil {
 			logger.Error("Failed to read permit file",
@@ -267,12 +258,11 @@ func (v *APIKeyValidator) UpdateAPIKeyCache() error {
 			return fmt.Errorf("failed to read permit file: %w", err)
 		}
 	} else {
-		logger.Debug("Using default permit configuration")
 		// Use default permit if no file specified
 		permit, err = GetDefaultPermit(v.config)
 		if err != nil {
-			logger.Error("Failed to get default permit", zap.Error(err))
-			return fmt.Errorf("failed to get default permit: %w", err)
+			logger.Warn("Failed to get default permit, using empty permit", zap.Error(err))
+			permit = map[string]any{}
 		}
 	}
 
@@ -283,7 +273,7 @@ func (v *APIKeyValidator) UpdateAPIKeyCache() error {
 	}
 
 	logger.Debug("Querying contract for API keys")
-	result, err := querycontract.QueryContract(v.config.ContractAddress, query)
+	result, err := QueryContractFunc(v.config.ContractAddress, query)
 	if err != nil {
 		logger.Error("Contract query failed",
 			zap.String("contract_address", v.config.ContractAddress),
@@ -302,7 +292,7 @@ func (v *APIKeyValidator) UpdateAPIKeyCache() error {
 	newCache := make(map[string]bool)
 	validKeys := 0
 	skippedEntries := 0
-	
+
 	for i, entry := range apiKeys {
 		entryMap, ok := entry.(map[string]any)
 		if !ok {
@@ -338,7 +328,6 @@ func (v *APIKeyValidator) UpdateAPIKeyCache() error {
 	return nil
 }
 
-
 // NewAPIKeyValidator creates and initializes a new APIKeyValidator instance.
 // This constructor sets up the validator with the provided configuration and
 // initializes the internal cache for storing API key validation results.
@@ -355,15 +344,13 @@ func NewAPIKeyValidator(config *Config) *APIKeyValidator {
 	return &APIKeyValidator{
 		// Store reference to configuration
 		config: config,
-		
+
 		// Initialize empty cache - will be populated from contract on first use
 		cache: make(map[string]bool),
-		
+
 		// lastUpdate will be set to zero time initially, forcing immediate cache update
 	}
 }
-
-
 
 // GetDefaultPermit returns the default permit configuration using environment variables.
 // Required env vars: SECRETAI_PERMIT_TYPE, SECRETAI_PERMIT_PUBKEY, SECRETAI_PERMIT_SIG.
@@ -407,8 +394,6 @@ func GetDefaultPermit(config *Config) (map[string]any, error) {
 // readPermitFromFile reads the permit from a JSON file
 func ReadPermitFromFile(filePath string) (map[string]any, error) {
 	logger := caddy.Log()
-	logger.Debug("Reading permit file", zap.String("file", filePath))
-	
 	file, err := os.Open(filePath)
 	if err != nil {
 		logger.Error("Failed to open permit file",
@@ -426,9 +411,6 @@ func ReadPermitFromFile(filePath string) (map[string]any, error) {
 		return nil, fmt.Errorf("failed to decode permit file: %w", err)
 	}
 
-	logger.Debug("Permit file loaded successfully",
-		zap.String("file", filePath),
-		zap.Int("keys_count", len(permit)))
 	return permit, nil
 }
 

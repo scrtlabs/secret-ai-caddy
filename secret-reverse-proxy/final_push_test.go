@@ -118,9 +118,9 @@ func TestServeHTTP_ValidationErrorPaths(t *testing.T) {
 		t.Errorf("ServeHTTP should not return error: %v", err)
 	}
 
-	// Should return 500 due to validation error
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("Expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	// Should return 401 due to validation error (fail closed)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
 	}
 
 	if mockNext.called {
@@ -262,15 +262,15 @@ func createTempFileHelper2(t *testing.T, content string) string {
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
-	
+
 	if _, err := tmpFile.WriteString(content); err != nil {
 		t.Fatalf("Failed to write to temp file: %v", err)
 	}
-	
+
 	if err := tmpFile.Close(); err != nil {
 		t.Fatalf("Failed to close temp file: %v", err)
 	}
-	
+
 	return tmpFile.Name()
 }
 

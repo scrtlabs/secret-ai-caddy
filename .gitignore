@@ -1,0 +1,6 @@
+# Local secrets and test credentials — do not commit
+local/
+
+# Caddy runtime data
+data/
+config/autosave.json

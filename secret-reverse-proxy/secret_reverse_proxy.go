@@ -16,11 +16,13 @@
 package secret_reverse_proxy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -34,11 +36,11 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 
+	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
 	"github.com/scrtlabs/secret-reverse-proxy/factories"
 	"github.com/scrtlabs/secret-reverse-proxy/interfaces"
-	"github.com/scrtlabs/secret-reverse-proxy/x402"
-	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
 	apikeyval "github.com/scrtlabs/secret-reverse-proxy/validators"
+	"github.com/scrtlabs/secret-reverse-proxy/x402"
 )
 
 type Config = proxyconfig.Config
@@ -52,7 +54,7 @@ type APIKeyValidator = apikeyval.APIKeyValidator
 func init() {
 	// Register this middleware as a Caddy module so it can be loaded
 	caddy.RegisterModule(&Middleware{})
-	
+
 	// Register the Caddyfile directive "secret_reverse_proxy" and its parser
 	// This allows users to configure the middleware in their Caddyfile with block syntax
 	httpcaddyfile.RegisterHandlerDirective("secret_reverse_proxy", parseCaddyfile)
@@ -65,18 +67,17 @@ type Middleware struct {
 	// Config holds the middleware configuration loaded from Caddyfile
 	// Made public with JSON tags so Caddy can marshal/unmarshal it properly
 	Config *Config `json:"config,omitempty"`
-	
+
 	// validator performs the actual API key validation logic
 	// Initialized during the Provision phase
 	validator *APIKeyValidator
 
-	
 	// quitChan is used to signal the background token reporting goroutine to stop
 	quitChan chan struct{}
-	
+
 	// meteringRunning tracks whether the token reporting goroutine is active
 	meteringRunning bool
-	
+
 	// Enhanced metering components (only initialized when EnhancedMetering is enabled)
 	tokenCounter      interfaces.TokenCounter
 	bodyHandler       interfaces.BodyHandler
@@ -87,7 +88,7 @@ type Middleware struct {
 	// x402 portal-based components (nil when x402 is disabled)
 	portalClient     *x402.PortalClient
 	challengeBuilder *x402.ChallengeBuilder
-	x402MinBalance   int64 // minimum balance in USDC minor units
+	x402MinBalance   float64 // minimum balance in USD
 }
 
 // CaddyModule returns the module information required by Caddy's module system.
@@ -101,7 +102,7 @@ func (Middleware) CaddyModule() caddy.ModuleInfo {
 		// Unique module ID within Caddy's HTTP handler namespace
 		// Format: namespace.category.module_name
 		ID: "http.handlers.secret_reverse_proxy",
-		
+
 		// Constructor function that returns a new instance of this middleware
 		// Called by Caddy when creating middleware instances
 		New: func() caddy.Module { return new(Middleware) },
@@ -141,15 +142,14 @@ func optionalConfigSource(configValue string, envVarNames ...string) string {
 func (m *Middleware) Provision(ctx caddy.Context) error {
 	logger := caddy.Log()
 	logger.Debug("Provisioning secret reverse proxy middleware")
-	
+
 	// BLOCK 1: Configuration Setup
 	// Ensure we have a valid configuration, using defaults if none provided
 	if m.Config == nil {
-		logger.Error("🔴 Nil configuration")
-		// raise an error if no configuration is provided
-		return fmt.Errorf("nil configuration")
+		m.Config = proxyconfig.DefaultConfig()
+		logger.Info("No configuration provided, using defaults")
 	}
-	
+
 	// BLOCK 2: Validator Initialization
 	// Create the API key validator that will handle authentication logic
 	m.validator = apikeyval.NewAPIKeyValidator(m.Config)
@@ -159,7 +159,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 
 	// BLOCK 3: Enhanced Token Metering (always enabled)
 	logger.Info("🔧 Initializing enhanced metering components")
-	
+
 	// Initialize TokenCounter
 	m.tokenCounter = factories.CreateTokenCounter()
 	if m.tokenCounter != nil {
@@ -167,7 +167,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	} else {
 		return fmt.Errorf("failed to initialize enhanced TokenCounter")
 	}
-	
+
 	// Initialize BodyHandler with configured max body size
 	m.bodyHandler = factories.CreateBodyHandler(m.Config.MaxBodySize)
 	if m.bodyHandler != nil {
@@ -175,7 +175,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	} else {
 		return fmt.Errorf("failed to initialize enhanced BodyHandler")
 	}
-	
+
 	// Initialize optional advanced components
 	m.metricsCollector = factories.CreateMetricsCollector(m.Config)
 	if m.metricsCollector != nil {
@@ -183,16 +183,16 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 	} else {
 		logger.Warn("⚠️  MetricsCollector not available (advanced features disabled)")
 	}
-	
+
 	logger.Info("✅ Enhanced metering system initialized successfully")
-	
+
 	// Initialize quit channel for background goroutine management
 	m.quitChan = make(chan struct{})
 	if m.Config.Metering {
 		logger.Info("⚖️  Starting Enhanced Metering...")
 		// Initialize token accumulator
 		m.tokenAccumulator = NewTokenAccumulator()
-		
+
 		// Create resilient reporter with the accumulator
 		m.resilientReporter = NewResilientReporter(m.Config, m.tokenAccumulator)
 		if m.resilientReporter != nil {
@@ -220,16 +220,11 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 		}
 		m.challengeBuilder = x402.NewChallengeBuilder(topupURL)
 
-		// Parse min balance threshold from USDC string to minor units
-		minBalance, err := parseUSDCToMinor(m.Config.X402MinBalanceUSDC)
-		if err != nil {
-			return fmt.Errorf("invalid x402_min_balance_usdc %q: %w", m.Config.X402MinBalanceUSDC, err)
-		}
-		m.x402MinBalance = minBalance
+		m.x402MinBalance = m.Config.X402MinBalanceUSD
 
 		logger.Info("x402 portal-based payment protocol initialized",
 			zap.String("devportal_url", m.Config.DevPortalURL),
-			zap.Int64("min_balance_minor", m.x402MinBalance))
+			zap.Float64("min_balance_usd", m.x402MinBalance))
 	}
 
 	// BLOCK 4: Configuration Logging
@@ -267,7 +262,7 @@ func (m *Middleware) Provision(ctx caddy.Context) error {
 func (m *Middleware) Validate() error {
 	logger := caddy.Log()
 	logger.Debug("Validating secret reverse proxy middleware configuration")
-	
+
 	// BLOCK 1: Basic Configuration Validation
 	// Ensure we have a configuration object to work with
 	if m.Config == nil {
@@ -275,7 +270,7 @@ func (m *Middleware) Validate() error {
 		logger.Error("Validation failed", zap.Error(err))
 		return err
 	}
-	
+
 	// Log the complete configuration contents
 	logger.Info("Configuration contents",
 		zap.String("api_key", m.Config.APIKey),
@@ -290,34 +285,21 @@ func (m *Middleware) Validate() error {
 		zap.Duration("metering_interval", m.Config.MeteringInterval),
 		zap.String("metering_url", m.Config.MeteringURL))
 
-	
 	// BLOCK 2: Required Field Validation
 	// Check that essential configuration parameters are provided
 
-	if m.Config.SecretNode == "" {
-		err := fmt.Errorf("secret node is required")
-		logger.Error("Validation failed", zap.Error(err))
-		return err
-	}
-
-	if m.Config.SecretChainID == "" {
-		err := fmt.Errorf("secret chain id is required")
-		logger.Error("Validation failed", zap.Error(err))
-		return err
-	}
-
-	if m.Config.ContractAddress == "" {
+	if strings.TrimSpace(m.Config.ContractAddress) == "" {
 		err := fmt.Errorf("contract address is required")
 		logger.Error("Validation failed", zap.Error(err))
 		return err
 	}
-	
+
 	if m.Config.CacheTTL <= 0 {
 		err := fmt.Errorf("cache TTL must be positive, got %v", m.Config.CacheTTL)
 		logger.Error("Validation failed", zap.Error(err))
 		return err
 	}
-	
+
 	// BLOCK 3: File Access Validation
 	// Verify that specified files are accessible (warn but don't fail)
 	if m.Config.MasterKeysFile != "" {
@@ -327,7 +309,7 @@ func (m *Middleware) Validate() error {
 				zap.Error(err))
 		}
 	}
-	
+
 	if m.Config.PermitFile != "" {
 		if _, err := os.Stat(m.Config.PermitFile); err != nil {
 			logger.Warn("Permit file access issue",
@@ -350,13 +332,14 @@ func (m *Middleware) Validate() error {
 			if permitSig == "" {
 				missing = append(missing, "SECRETAI_PERMIT_SIG")
 			}
-			err := fmt.Errorf("no permit_file configured and missing required environment variables: %s", strings.Join(missing, ", "))
-			logger.Error("Validation failed", zap.Error(err))
-			return err
+			if len(missing) > 0 {
+				logger.Warn("Permit not fully configured, contract queries may fail",
+					zap.Strings("missing_vars", missing))
+			}
 		}
 		logger.Info("No permit file configured, using permit env vars (SECRETAI_PERMIT_TYPE, SECRETAI_PERMIT_PUBKEY, SECRETAI_PERMIT_SIG)")
 	}
-	
+
 	if m.Config.Metering {
 		if m.Config.MeteringURL == "" {
 			err := fmt.Errorf("metering URL is required")
@@ -379,8 +362,8 @@ func (m *Middleware) Validate() error {
 		if m.Config.DevPortalServiceKey == "" {
 			return fmt.Errorf("devportal_service_key is required when x402 is enabled")
 		}
-		if m.Config.X402MinBalanceUSDC == "" {
-			return fmt.Errorf("x402_min_balance_usdc is required when x402 is enabled")
+		if m.Config.X402MinBalanceUSD <= 0 {
+			return fmt.Errorf("x402_min_balance_usd must be positive when x402 is enabled")
 		}
 	}
 
@@ -408,12 +391,12 @@ func (m *Middleware) Validate() error {
 func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	logger := caddy.Log()
 	startTime := time.Now()
-	
+
 	// Record request metrics
 	if m.metricsCollector != nil {
 		m.metricsCollector.RecordRequest()
 	}
-	
+
 	// BLOCK 1: Request Logging
 	// Log incoming request details for debugging and audit purposes
 	logger.Debug("Processing request through secret reverse proxy middleware",
@@ -433,10 +416,15 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		http.Error(w, "Metrics not available", http.StatusServiceUnavailable)
 		return nil
 	}
-	
+
 	// BLOCK 1.6: x402 Portal-Based Payment Path
-	// When x402 is enabled, non-master-key requests are checked against the portal.
-	// The actual check happens after master key validation below — see BLOCK 5.
+	// Requests carrying x-agent-address take the x402 path (EIP-191 signature + portal balance).
+	// Legacy Bearer-token path is unchanged below.
+	if m.Config.X402Enabled && m.portalClient != nil {
+		if walletAddr := r.Header.Get("X-Agent-Address"); walletAddr != "" {
+			return m.serveX402(w, r, next, walletAddr)
+		}
+	}
 
 	// BLOCK 1.7: URL Filtering Check
 	// Check if the request URL matches any blocked patterns
@@ -446,19 +434,19 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		if r.URL.RawQuery != "" {
 			requestURL += "?" + r.URL.RawQuery
 		}
-		
+
 		for _, blockedPattern := range m.Config.BlockedURLs {
 			if strings.Contains(requestURL, blockedPattern) {
 				logger.Info("Request blocked: URL contains blocked pattern",
 					zap.String("remote_addr", r.RemoteAddr),
 					zap.String("full_url", requestURL),
 					zap.String("blocked_pattern", blockedPattern))
-				
+
 				// Record rejection metrics
 				if m.metricsCollector != nil {
 					m.metricsCollector.RecordRejected()
 				}
-				
+
 				http.Error(w, "URL blocked by filter", http.StatusForbidden)
 				return nil
 			}
@@ -473,12 +461,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		logger.Debug("Request rejected: missing Authorization header",
 			zap.String("remote_addr", r.RemoteAddr),
 			zap.String("path", r.URL.Path))
-		
+
 		// Record rejection metrics
 		if m.metricsCollector != nil {
 			m.metricsCollector.RecordRejected()
 		}
-		
+
 		http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
 		return nil
 	}
@@ -492,53 +480,43 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		logger.Debug("Request rejected: invalid Authorization header format",
 			zap.String("remote_addr", r.RemoteAddr),
 			zap.String("auth_header_prefix", authHeader[:min(20, len(authHeader))]))
-		
+
 		// Record rejection metrics
 		if m.metricsCollector != nil {
 			m.metricsCollector.RecordRejected()
 		}
-		
+
 		http.Error(w, "Invalid Authorization header format", http.StatusUnauthorized)
 		return nil
 	}
 
-	// BLOCK 4: x402 Portal Path (when enabled)
-	// If x402 is enabled and the key is NOT a master key, route through portal balance check.
-	if m.Config.X402Enabled && m.portalClient != nil {
-		if !m.validator.IsMasterKey(apiKey) {
-			return m.serveX402(w, r, next, apiKey)
+	// BLOCK 4: Standard API Key Validation (legacy path)
+	logger.Debug("Validating API key",
+		zap.String("key_prefix", apiKey[:min(8, len(apiKey))]+"..."))
+
+	isValid, err := m.validator.ValidateAPIKey(apiKey)
+	if err != nil {
+		logger.Warn("API key validation failed, denying access",
+			zap.Error(err),
+			zap.String("remote_addr", r.RemoteAddr),
+			zap.String("path", r.URL.Path))
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
 		}
-		// Master key — fall through to normal forwarding
-		logger.Debug("x402: master key detected, bypassing portal balance check")
-	} else {
-		// BLOCK 4a: Standard API Key Validation (x402 disabled)
-		logger.Debug("Validating API key",
+		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		return nil
+	}
+
+	if !isValid {
+		logger.Info("Request rejected: invalid API key",
+			zap.String("remote_addr", r.RemoteAddr),
+			zap.String("path", r.URL.Path),
 			zap.String("key_prefix", apiKey[:min(8, len(apiKey))]+"..."))
-
-		isValid, err := m.validator.ValidateAPIKey(apiKey)
-		if err != nil {
-			logger.Error("API key validation failed",
-				zap.Error(err),
-				zap.String("remote_addr", r.RemoteAddr),
-				zap.String("path", r.URL.Path))
-			if m.metricsCollector != nil {
-				m.metricsCollector.RecordValidationError()
-			}
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return nil
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
 		}
-
-		if !isValid {
-			logger.Info("Request rejected: invalid API key",
-				zap.String("remote_addr", r.RemoteAddr),
-				zap.String("path", r.URL.Path),
-				zap.String("key_prefix", apiKey[:min(8, len(apiKey))]+"..."))
-			if m.metricsCollector != nil {
-				m.metricsCollector.RecordRejected()
-			}
-			http.Error(w, "Invalid API key", http.StatusUnauthorized)
-			return nil
-		}
+		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		return nil
 	}
 
 	// BLOCK 6: Request Forwarding
@@ -558,6 +536,26 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Detect model from request body
 	modelName := detectModelFromRequestBody(requestBody, contentType)
 
+	// Pre-request balance check for legacy users (only for LLM requests that have a model field)
+	if m.Config.X402Enabled && m.portalClient != nil && modelName != "unknown" {
+		hasher := sha256.New()
+		hasher.Write([]byte(apiKey))
+		userApiKeyHash := hex.EncodeToString(hasher.Sum(nil))
+		userBalance, balanceErr := m.portalClient.GetUserBalance(userApiKeyHash)
+		if balanceErr != nil {
+			// Fail-open: if portal is unreachable, allow the request (key was already validated)
+			logger.Warn("User balance check failed, allowing request",
+				zap.Error(balanceErr),
+				zap.String("api_key_hash", userApiKeyHash[:8]+"..."))
+		} else if userBalance >= 0 && userBalance < m.x402MinBalance {
+			logger.Info("Legacy user: insufficient balance",
+				zap.Float64("balance", userBalance),
+				zap.Float64("required", m.x402MinBalance),
+				zap.String("api_key_hash", userApiKeyHash[:8]+"..."))
+			return m.challengeBuilder.Build402Response(w, userBalance, m.x402MinBalance)
+		}
+	}
+
 	inputTokens := m.countTokens(requestBody, contentType, modelName)
 
 	// Record token counting time
@@ -566,7 +564,7 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	}
 
 	wrappedWriter := m.createResponseWriter(w)
-	err := next.ServeHTTP(wrappedWriter, r)
+	err = next.ServeHTTP(wrappedWriter, r)
 	if err != nil {
 		return err
 	}
@@ -590,7 +588,7 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		hasher := sha256.New()
 		hasher.Write([]byte(apiKey))
 		apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
-		
+
 		m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens)
 	}
 
@@ -615,11 +613,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 //   - contract_address <address>   : Secret Network contract address for API key validation
 //
 // Example Caddyfile configuration:
-//   secret_reverse_proxy {
-//       API_MASTER_KEY "your-master-key-here"
-//       master_keys_file "/etc/caddy/master_keys.txt"
-//       contract_address "secret1abc..."
-//   }
+//
+//	secret_reverse_proxy {
+//	    API_MASTER_KEY "your-master-key-here"
+//	    master_keys_file "/etc/caddy/master_keys.txt"
+//	    contract_address "secret1abc..."
+//	}
 //
 // Parameters:
 //   - d: Caddyfile dispenser for parsing configuration tokens
@@ -634,7 +633,7 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		m.Config = proxyconfig.DefaultConfig()
 		logger.Debug("Using default configuration")
 	}
-	
+
 	// BLOCK 1.5: Environment Variable Processing
 	// Check for BLOCK_URLS environment variable and parse it
 	if blockURLsEnv := os.Getenv("BLOCK_URLS"); blockURLsEnv != "" {
@@ -651,11 +650,11 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 		}
 		m.Config.BlockedURLs = filteredURLs
-		logger.Info("🚫 Blocked URLs configured from environment", 
+		logger.Info("🚫 Blocked URLs configured from environment",
 			zap.Strings("blocked_urls", m.Config.BlockedURLs),
 			zap.Int("count", len(m.Config.BlockedURLs)))
 	}
-	
+
 	logger.Info("UnmarshalCaddyfile called - parsing secret_reverse_proxy configuration")
 	// BLOCK 2: Directive Parsing Loop
 	// Parse each configuration directive from the Caddyfile
@@ -665,271 +664,289 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		for d.NextBlock(0) {
 			// Parse individual configuration directives
 			switch d.Val() {
-				case "metering_interval":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					rawValue := d.Val()
-					expandedValue := expandEnvVars(rawValue)
-					interval, err := time.ParseDuration(expandedValue)
-					if err != nil {
-						return d.Errf("invalid metering_interval: %v", err)
-					}
-					m.Config.MeteringInterval = interval
-					logger.Info("⏰  Metering", zap.Int("Interval", int(m.Config.MeteringInterval)))
+			case "metering_interval":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				rawValue := d.Val()
+				expandedValue := expandEnvVars(rawValue)
+				interval, err := time.ParseDuration(expandedValue)
+				if err != nil {
+					return d.Errf("invalid metering_interval: %v", err)
+				}
+				m.Config.MeteringInterval = interval
+				logger.Info("⏰  Metering", zap.Int("Interval", int(m.Config.MeteringInterval)))
 
-				case "metering":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					expandedValue := expandEnvVars(d.Val())
-					m.Config.Metering = map[string]bool{
-						"on": true, "true": true, "1": true,
-					}[strings.ToLower(strings.TrimSpace(expandedValue))]
-					logger.Info("⚖️  Metering", zap.Bool("ON/OFF", m.Config.Metering))
+			case "metering":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				expandedValue := expandEnvVars(d.Val())
+				m.Config.Metering = map[string]bool{
+					"on": true, "true": true, "1": true,
+				}[strings.ToLower(strings.TrimSpace(expandedValue))]
+				logger.Info("⚖️  Metering", zap.Bool("ON/OFF", m.Config.Metering))
 
-				case "metering_url":
-					logger.Info("Processing metering_url directive")
-					
-					// Get the next token manually to handle environment variables
-					if !d.NextArg() {
-						logger.Error("🔴 metering_url directive missing argument")
-						return d.ArgErr()
-					}
-					
-					rawValue := d.Val()
-					logger.Info("Raw metering_url value:", zap.String("raw", rawValue))
-					
-					// Expand environment variables if present
-					expandedValue := expandEnvVars(rawValue)
-					m.Config.MeteringURL = expandedValue
-					
-					logger.Info("🔗 Metering URL configured successfully:", zap.String("metering_url", m.Config.MeteringURL))
+			case "metering_url":
+				logger.Info("Processing metering_url directive")
 
-				case "API_MASTER_KEY":
-					// Primary master key configuration
-					logger.Info("Processing API_MASTER_KEY directive")
-					
-					// Get the next token manually to handle environment variables
-					if !d.NextArg() {
-						logger.Error("🔴 API_MASTER_KEY directive missing argument")
-						return d.ArgErr()
-					}
-					
-					rawValue := d.Val()
-					logger.Info("Raw API_MASTER_KEY value:", zap.String("raw", rawValue))
-					
-					// Expand environment variables if present
-					expandedValue := expandEnvVars(rawValue)
-					m.Config.APIKey = expandedValue
-					
-					logger.Info("🔑 Primary master key configured successfully:", zap.String("API_MASTER_KEY", m.Config.APIKey))
+				// Get the next token manually to handle environment variables
+				if !d.NextArg() {
+					logger.Error("🔴 metering_url directive missing argument")
+					return d.ArgErr()
+				}
 
-				case "master_keys_file":
-					// Additional master keys file path
-					logger.Info("Processing master_keys_file directive")
-					
-					// Get the next token manually to handle environment variables
-					if !d.NextArg() {
-						logger.Error("🔴 master_keys_file directive missing argument")
-						return d.ArgErr()
-					}
-					
-					rawValue := d.Val()
-					logger.Info("Raw master_keys_file value:", zap.String("raw", rawValue))
-					
-					// Expand environment variables if present
-					expandedValue := expandEnvVars(rawValue)
-					m.Config.MasterKeysFile = expandedValue
-					
-					logger.Info("🔑 Master keys file path configured successfully:", zap.String("master_keys_file", m.Config.MasterKeysFile))
+				rawValue := d.Val()
+				logger.Info("Raw metering_url value:", zap.String("raw", rawValue))
 
-				case "permit_file":
-					// Secret Network permit file path
-					logger.Info("Processing permit_file directive")
-					
-					// Get the next token manually to handle environment variables
-					if !d.NextArg() {
-						logger.Error("🔴 permit_file directive missing argument")
-						return d.ArgErr()
-					}
-					
-					rawValue := d.Val()
-					logger.Info("Raw permit_file value:", zap.String("raw", rawValue))
-					
-					// Expand environment variables if present
-					expandedValue := expandEnvVars(rawValue)
-					m.Config.PermitFile = expandedValue
-					
-					logger.Info("🔑 Permit file configured successfully:", zap.String("permit_file", m.Config.PermitFile))
+				// Expand environment variables if present
+				expandedValue := expandEnvVars(rawValue)
+				m.Config.MeteringURL = expandedValue
 
-				case "contract_address":
-					// Smart contract address for API key validation
-					logger.Info("Processing contract_address directive")
-					
-					// Get the next token manually to handle environment variables
-					if !d.NextArg() {
-						logger.Error("🔴 contract_address directive missing argument")
-						return d.ArgErr()
-					}
-					
-					rawValue := d.Val()
-					logger.Info("Raw contract_address value:", zap.String("raw", rawValue))
-					
-					// Expand environment variables if present
-					expandedValue := expandEnvVars(rawValue)
-					m.Config.ContractAddress = expandedValue
-					
-					logger.Info("🔑 Contract address configured successfully:", zap.String("contract_address", m.Config.ContractAddress))
+				logger.Info("🔗 Metering URL configured successfully:", zap.String("metering_url", m.Config.MeteringURL))
 
-				case "secret_chain_id":
-					logger.Info("Processing secret_chain_id directive")
-					
-					// Get the next token manually to handle environment variables
-					if !d.NextArg() {
-						logger.Error("🔴 secret_chain_id directive missing argument")
-						return d.ArgErr()
-					}
-					
-					rawValue := d.Val()
-					logger.Info("Raw secret_chain_id value:", zap.String("raw", rawValue))
-					
-					// Expand environment variables if present
-					expandedValue := expandEnvVars(rawValue)
-					m.Config.SecretChainID = expandedValue
-					
-					logger.Info("🔗 Secret chain ID configured successfully:", zap.String("secret_chain_id", m.Config.SecretChainID))
+			case "API_MASTER_KEY":
+				// Primary master key configuration
+				logger.Info("Processing API_MASTER_KEY directive")
 
-				case "secret_node":
-					logger.Info("Processing secret_node directive")
-					
-					// Get the next token manually to handle environment variables
-					if !d.NextArg() {
-						logger.Error("🔴 secret_node directive missing argument")
-						return d.ArgErr()
-					}
-					
-					rawValue := d.Val()
-					logger.Info("Raw secret_node value:", zap.String("raw", rawValue))
-					
-					// Expand environment variables if present
-					expandedValue := expandEnvVars(rawValue)
-					m.Config.SecretNode = expandedValue
-					
-					logger.Info("💻 Secret node configured successfully:", zap.String("secret_node", m.Config.SecretNode))
+				// Get the next token manually to handle environment variables
+				if !d.NextArg() {
+					logger.Error("🔴 API_MASTER_KEY directive missing argument")
+					return d.ArgErr()
+				}
 
-				case "max_body_size":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					rawValue := expandEnvVars(d.Val())
-					if size, err := parseByteSize(rawValue); err == nil {
-						m.Config.MaxBodySize = size
-					} else {
-						return d.Errf("invalid max_body_size: %v", err)
-					}
-					logger.Info("📏 Max body size", zap.Int64("bytes", m.Config.MaxBodySize))
+				rawValue := d.Val()
+				logger.Info("Raw API_MASTER_KEY value:", zap.String("raw", rawValue))
 
-				case "token_counting_mode":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					expandedValue := expandEnvVars(d.Val())
-					validModes := map[string]bool{
-						"heuristic": true, "fast": true, "accurate": true,
-					}
-					if !validModes[expandedValue] {
-						return d.Errf("invalid token_counting_mode: %s (valid: heuristic, fast, accurate)", expandedValue)
-					}
-					m.Config.TokenCountingMode = expandedValue
-					logger.Info("🔢 Token counting mode", zap.String("mode", m.Config.TokenCountingMode))
+				// Expand environment variables if present
+				expandedValue := expandEnvVars(rawValue)
+				m.Config.APIKey = expandedValue
 
-				case "max_retries":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					rawValue := expandEnvVars(d.Val())
-					if retries, err := strconv.Atoi(rawValue); err == nil && retries >= 0 {
-						m.Config.MaxRetries = retries
-					} else {
-						return d.Errf("invalid max_retries: %v", err)
-					}
-					logger.Info("🔄 Max retries", zap.Int("retries", m.Config.MaxRetries))
+				logger.Info("🔑 Primary master key configured successfully:", zap.String("API_MASTER_KEY", m.Config.APIKey))
 
-				case "retry_backoff":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					rawValue := expandEnvVars(d.Val())
-					if backoff, err := time.ParseDuration(rawValue); err == nil {
-						m.Config.RetryBackoff = backoff
-					} else {
-						return d.Errf("invalid retry_backoff: %v", err)
-					}
-					logger.Info("⏱️  Retry backoff", zap.Duration("backoff", m.Config.RetryBackoff))
+			case "master_keys_file":
+				// Additional master keys file path
+				logger.Info("Processing master_keys_file directive")
 
-				case "enable_metrics":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					expandedValue := expandEnvVars(d.Val())
-					m.Config.EnableMetrics = map[string]bool{
-						"on": true, "true": true, "1": true, "yes": true,
-					}[strings.ToLower(strings.TrimSpace(expandedValue))]
-					logger.Info("📊 Enable metrics", zap.Bool("enabled", m.Config.EnableMetrics))
+				// Get the next token manually to handle environment variables
+				if !d.NextArg() {
+					logger.Error("🔴 master_keys_file directive missing argument")
+					return d.ArgErr()
+				}
 
-				case "metrics_path":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					expandedValue := expandEnvVars(d.Val())
-					m.Config.MetricsPath = expandedValue
-					logger.Info("📍 Metrics path", zap.String("path", m.Config.MetricsPath))
+				rawValue := d.Val()
+				logger.Info("Raw master_keys_file value:", zap.String("raw", rawValue))
 
-				// x402 Payment Protocol directives (portal-based)
-				case "x402_enabled":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					expandedValue := expandEnvVars(d.Val())
-					m.Config.X402Enabled = map[string]bool{
-						"on": true, "true": true, "1": true, "yes": true,
-					}[strings.ToLower(strings.TrimSpace(expandedValue))]
-					logger.Info("x402 enabled", zap.Bool("enabled", m.Config.X402Enabled))
+				// Expand environment variables if present
+				expandedValue := expandEnvVars(rawValue)
+				m.Config.MasterKeysFile = expandedValue
 
-				case "devportal_url":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					m.Config.DevPortalURL = expandEnvVars(d.Val())
-					logger.Info("DevPortal URL configured", zap.String("url", m.Config.DevPortalURL))
+				logger.Info("🔑 Master keys file path configured successfully:", zap.String("master_keys_file", m.Config.MasterKeysFile))
 
-				case "devportal_service_key":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					m.Config.DevPortalServiceKey = expandEnvVars(d.Val())
-					logger.Info("DevPortal service key configured")
+			case "permit_file":
+				// Secret Network permit file path
+				logger.Info("Processing permit_file directive")
 
-				case "x402_min_balance_usdc":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					m.Config.X402MinBalanceUSDC = expandEnvVars(d.Val())
-					logger.Info("x402 min balance configured", zap.String("min_balance_usdc", m.Config.X402MinBalanceUSDC))
+				// Get the next token manually to handle environment variables
+				if !d.NextArg() {
+					logger.Error("🔴 permit_file directive missing argument")
+					return d.ArgErr()
+				}
 
-				case "x402_topup_url":
-					if !d.NextArg() {
-						return d.ArgErr()
-					}
-					m.Config.X402TopupURL = expandEnvVars(d.Val())
-					logger.Info("x402 topup URL configured", zap.String("url", m.Config.X402TopupURL))
+				rawValue := d.Val()
+				logger.Info("Raw permit_file value:", zap.String("raw", rawValue))
 
-				default:
-					logger.Error("Unmarshal Caddyfile: unknown subdirective", zap.String("directive", d.Val()))
-					// Unknown directive - return error
-					return d.Errf("unknown subdirective: %s", d.Val())
+				// Expand environment variables if present
+				expandedValue := expandEnvVars(rawValue)
+				m.Config.PermitFile = expandedValue
+
+				logger.Info("🔑 Permit file configured successfully:", zap.String("permit_file", m.Config.PermitFile))
+
+			case "contract_address":
+				// Smart contract address for API key validation
+				logger.Info("Processing contract_address directive")
+
+				// Get the next token manually to handle environment variables
+				if !d.NextArg() {
+					logger.Error("🔴 contract_address directive missing argument")
+					return d.ArgErr()
+				}
+
+				rawValue := d.Val()
+				logger.Info("Raw contract_address value:", zap.String("raw", rawValue))
+
+				// Expand environment variables if present
+				expandedValue := expandEnvVars(rawValue)
+				m.Config.ContractAddress = expandedValue
+
+				logger.Info("🔑 Contract address configured successfully:", zap.String("contract_address", m.Config.ContractAddress))
+
+			case "secret_chain_id":
+				logger.Info("Processing secret_chain_id directive")
+
+				// Get the next token manually to handle environment variables
+				if !d.NextArg() {
+					logger.Error("🔴 secret_chain_id directive missing argument")
+					return d.ArgErr()
+				}
+
+				rawValue := d.Val()
+				logger.Info("Raw secret_chain_id value:", zap.String("raw", rawValue))
+
+				// Expand environment variables if present
+				expandedValue := expandEnvVars(rawValue)
+				m.Config.SecretChainID = expandedValue
+
+				logger.Info("🔗 Secret chain ID configured successfully:", zap.String("secret_chain_id", m.Config.SecretChainID))
+
+			case "secret_node":
+				logger.Info("Processing secret_node directive")
+
+				// Get the next token manually to handle environment variables
+				if !d.NextArg() {
+					logger.Error("🔴 secret_node directive missing argument")
+					return d.ArgErr()
+				}
+
+				rawValue := d.Val()
+				logger.Info("Raw secret_node value:", zap.String("raw", rawValue))
+
+				// Expand environment variables if present
+				expandedValue := expandEnvVars(rawValue)
+				m.Config.SecretNode = expandedValue
+
+				logger.Info("💻 Secret node configured successfully:", zap.String("secret_node", m.Config.SecretNode))
+
+			case "max_body_size":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				rawValue := expandEnvVars(d.Val())
+				if size, err := parseByteSize(rawValue); err == nil {
+					m.Config.MaxBodySize = size
+				} else {
+					return d.Errf("invalid max_body_size: %v", err)
+				}
+				logger.Info("📏 Max body size", zap.Int64("bytes", m.Config.MaxBodySize))
+
+			case "token_counting_mode":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				expandedValue := expandEnvVars(d.Val())
+				validModes := map[string]bool{
+					"heuristic": true, "fast": true, "accurate": true,
+				}
+				if !validModes[expandedValue] {
+					return d.Errf("invalid token_counting_mode: %s (valid: heuristic, fast, accurate)", expandedValue)
+				}
+				m.Config.TokenCountingMode = expandedValue
+				logger.Info("🔢 Token counting mode", zap.String("mode", m.Config.TokenCountingMode))
+
+			case "max_retries":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				rawValue := expandEnvVars(d.Val())
+				if retries, err := strconv.Atoi(rawValue); err == nil && retries >= 0 {
+					m.Config.MaxRetries = retries
+				} else {
+					return d.Errf("invalid max_retries: %v", err)
+				}
+				logger.Info("🔄 Max retries", zap.Int("retries", m.Config.MaxRetries))
+
+			case "retry_backoff":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				rawValue := expandEnvVars(d.Val())
+				if backoff, err := time.ParseDuration(rawValue); err == nil {
+					m.Config.RetryBackoff = backoff
+				} else {
+					return d.Errf("invalid retry_backoff: %v", err)
+				}
+				logger.Info("⏱️  Retry backoff", zap.Duration("backoff", m.Config.RetryBackoff))
+
+			case "enable_metrics":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				expandedValue := expandEnvVars(d.Val())
+				m.Config.EnableMetrics = map[string]bool{
+					"on": true, "true": true, "1": true, "yes": true,
+				}[strings.ToLower(strings.TrimSpace(expandedValue))]
+				logger.Info("📊 Enable metrics", zap.Bool("enabled", m.Config.EnableMetrics))
+
+			case "metrics_path":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				expandedValue := expandEnvVars(d.Val())
+				m.Config.MetricsPath = expandedValue
+				logger.Info("📍 Metrics path", zap.String("path", m.Config.MetricsPath))
+
+			// x402 Payment Protocol directives (portal-based)
+			case "x402_enabled":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				expandedValue := expandEnvVars(d.Val())
+				m.Config.X402Enabled = map[string]bool{
+					"on": true, "true": true, "1": true, "yes": true,
+				}[strings.ToLower(strings.TrimSpace(expandedValue))]
+				logger.Info("x402 enabled", zap.Bool("enabled", m.Config.X402Enabled))
+
+			case "devportal_url":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.Config.DevPortalURL = expandEnvVars(d.Val())
+				logger.Info("DevPortal URL configured", zap.String("url", m.Config.DevPortalURL))
+
+			case "devportal_service_key":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.Config.DevPortalServiceKey = expandEnvVars(d.Val())
+				logger.Info("DevPortal service key configured")
+
+			case "x402_min_balance_usd":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				parsedMinBalance, parseErr := strconv.ParseFloat(expandEnvVars(d.Val()), 64)
+				if parseErr != nil {
+					return d.Errf("invalid x402_min_balance_usd value: %v", parseErr)
+				}
+				m.Config.X402MinBalanceUSD = parsedMinBalance
+				logger.Info("x402 min balance configured", zap.Float64("min_balance_usd", m.Config.X402MinBalanceUSD))
+
+			case "x402_topup_url":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.Config.X402TopupURL = expandEnvVars(d.Val())
+				logger.Info("x402 topup URL configured", zap.String("url", m.Config.X402TopupURL))
+
+			default:
+				logger.Error("Unmarshal Caddyfile: unknown subdirective", zap.String("directive", d.Val()))
+				// Unknown directive - return error
+				return d.Errf("unknown subdirective: %s", d.Val())
 			}
+		}
+		// Handle directives in outer loop (no-brace / flat format)
+		switch d.Val() {
+		case "cache_ttl":
+			args := d.RemainingArgs()
+			if len(args) != 1 {
+				return d.Errf("cache_ttl requires exactly one argument")
+			}
+			dur, durErr := time.ParseDuration(args[0])
+			if durErr != nil {
+				return d.Errf("invalid cache TTL: %v", durErr)
+			}
+			m.Config.CacheTTL = dur
+			logger.Info("⏱️  Cache TTL configured", zap.Duration("cache_ttl", m.Config.CacheTTL))
 		}
 		logger.Info("🔄 Finished processing block for token:", zap.String("token", d.Val()))
 	}
@@ -947,13 +964,63 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// serveX402 handles requests via the portal-based x402 payment protocol.
-// It checks the agent's balance with DevPortal and returns 402 if insufficient.
-func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, apiKey string) error {
+// serveX402 handles requests from x402 agents identified by x-agent-address header.
+// Flow: verify EIP-191 signature → check portal balance → forward → report usage.
+func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, walletAddr string) error {
 	logger := caddy.Log()
 
-	// 1. Check balance with DevPortal
-	balance, err := m.portalClient.GetBalance(apiKey)
+	// 1. Read raw body before anything else (needed for EIP-191 signature verification)
+	var rawBody []byte
+	if r.Body != nil {
+		var err error
+		rawBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return nil
+		}
+		r.Body.Close()
+		// Restore body so readRequestBody and next.ServeHTTP can consume it
+		r.Body = io.NopCloser(bytes.NewReader(rawBody))
+	}
+
+	// 2. Verify EIP-191 agent signature (matches DevPortal verifySignature.ts)
+	timestamp := r.Header.Get("X-Agent-Timestamp")
+	if err := x402.ValidateTimestamp(timestamp, 30*time.Second); err != nil {
+		logger.Info("x402: invalid timestamp", zap.Error(err), zap.String("wallet", walletAddr))
+		http.Error(w, "Invalid or expired agent timestamp", http.StatusUnauthorized)
+		return nil
+	}
+
+	sig := r.Header.Get("X-Agent-Signature")
+	ok, err := x402.VerifyAgentSignature(walletAddr, sig, r.Method, r.URL.Path, string(rawBody), timestamp)
+	if err != nil || !ok {
+		logger.Info("x402: signature verification failed",
+			zap.Bool("ok", ok),
+			zap.Error(err),
+			zap.String("wallet", walletAddr))
+		http.Error(w, "Invalid agent signature", http.StatusUnauthorized)
+		return nil
+	}
+
+	// 3. Detect model from rawBody (already available from sig step above).
+	// This determines whether the request is an LLM call (has "model" field) or not.
+	// We do this BEFORE the balance check so that non-LLM paths (e.g. GET /v1/models,
+	// health checks, embedding queries without billing) are never blocked by balance.
+	contentType := r.Header.Get("Content-Type")
+	model := detectModelFromRequestBody(string(rawBody), contentType)
+
+	// 4. For non-LLM requests (no "model" field in body), skip balance check entirely
+	// and proxy directly — these paths consume no tokens and should never be gated.
+	if model == "unknown" {
+		logger.Debug("x402: non-LLM request, skipping balance check",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.String("wallet", walletAddr))
+		return next.ServeHTTP(w, r)
+	}
+
+	// 5. Check balance with DevPortal (LLM requests only)
+	balance, err := m.portalClient.GetBalance(walletAddr)
 	if err != nil {
 		if errors.Is(err, x402.ErrPortalUnreachable) {
 			logger.Error("Portal unreachable, failing closed", zap.Error(err))
@@ -965,27 +1032,27 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 		return nil
 	}
 
-	// 2. Check if balance meets minimum threshold
+	// 6. Enforce minimum balance
 	if balance < m.x402MinBalance {
 		logger.Info("x402: insufficient balance",
-			zap.Int64("balance", balance),
-			zap.Int64("required", m.x402MinBalance))
+			zap.Float64("balance", balance),
+			zap.Float64("required", m.x402MinBalance),
+			zap.String("wallet", walletAddr))
 		return m.challengeBuilder.Build402Response(w, balance, m.x402MinBalance)
 	}
 
-	// 3. Read request body for token counting
-	requestBody, contentType := m.readRequestBody(r)
-	model := detectModelFromRequestBody(requestBody, contentType)
+	// 7. Count input tokens.
+	// readRequestBody uses the enhanced body handler (may return "" in tests; model is still known).
+	requestBody, _ := m.readRequestBody(r)
 	inputTokens := m.countTokens(requestBody, contentType, model)
 
-	// 4. Forward to upstream with response capture
+	// 8. Forward to upstream with response capture
 	tw := NewTokenMeteringResponseWriter(w)
-	err = next.ServeHTTP(tw, r)
-	if err != nil {
+	if err := next.ServeHTTP(tw, r); err != nil {
 		return err
 	}
 
-	// 5. Count output tokens
+	// 9. Count output tokens
 	outputTokens := 0
 	if m.tokenCounter != nil {
 		respBody := tw.Body()
@@ -993,27 +1060,29 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 		outputTokens = m.tokenCounter.CountTokensWithModel(string(respBody), respContentType, model)
 	}
 
-	// 6. Report usage to DevPortal (async — don't block the response)
+	// 10. Report usage to DevPortal (we only reach here for LLM requests with model != "unknown")
+	reportTimestamp := time.Now().Unix()
 	go func() {
-		if reportErr := m.portalClient.ReportUsage(apiKey, model, inputTokens, outputTokens); reportErr != nil {
+		if reportErr := m.portalClient.ReportUsage(walletAddr, model, inputTokens, outputTokens, reportTimestamp); reportErr != nil {
 			logger.Error("Failed to report usage to portal",
 				zap.Error(reportErr),
+				zap.String("wallet", walletAddr),
 				zap.String("model", model),
 				zap.Int("input_tokens", inputTokens),
 				zap.Int("output_tokens", outputTokens))
 		}
 	}()
 
-	// 7. Record metrics
+	// 11. Record metrics
 	if m.metricsCollector != nil {
 		m.metricsCollector.RecordAuthorized()
 		m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
 	}
 
-	// 8. Record usage in accumulator for legacy metering pipeline
+	// 12. Record usage in accumulator for legacy metering pipeline
 	if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
-		apiKeyHash := hashString(apiKey)
-		m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, model, inputTokens, outputTokens)
+		walletHash := hashString(walletAddr)
+		m.tokenAccumulator.RecordUsageWithModel(walletHash, model, inputTokens, outputTokens)
 	}
 
 	return nil
@@ -1028,12 +1097,12 @@ func hashString(s string) string {
 // parseByteSize parses byte size strings like "1MB", "500KB", etc.
 func parseByteSize(value string) (int64, error) {
 	value = strings.TrimSpace(strings.ToUpper(value))
-	
+
 	// Handle pure numbers (bytes)
 	if size, err := strconv.ParseInt(value, 10, 64); err == nil {
 		return size, nil
 	}
-	
+
 	// Handle size with units
 	multipliers := map[string]int64{
 		"B":  1,
@@ -1041,7 +1110,7 @@ func parseByteSize(value string) (int64, error) {
 		"MB": 1024 * 1024,
 		"GB": 1024 * 1024 * 1024,
 	}
-	
+
 	for suffix, multiplier := range multipliers {
 		if strings.HasSuffix(value, suffix) {
 			numStr := strings.TrimSuffix(value, suffix)
@@ -1050,41 +1119,8 @@ func parseByteSize(value string) (int64, error) {
 			}
 		}
 	}
-	
+
 	return 0, fmt.Errorf("invalid byte size format: %s", value)
-}
-
-// parseUSDCToMinor converts a USDC string like "0.01" to minor units (6 decimals).
-// e.g. "0.01" -> 10000, "1.00" -> 1000000, "0.000001" -> 1
-func parseUSDCToMinor(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, fmt.Errorf("empty USDC value")
-	}
-
-	parts := strings.SplitN(s, ".", 2)
-	whole, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid whole part: %w", err)
-	}
-
-	var frac int64
-	if len(parts) == 2 {
-		fracStr := parts[1]
-		// Pad or truncate to 6 decimal places
-		if len(fracStr) > 6 {
-			fracStr = fracStr[:6]
-		}
-		for len(fracStr) < 6 {
-			fracStr += "0"
-		}
-		frac, err = strconv.ParseInt(fracStr, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("invalid fractional part: %w", err)
-		}
-	}
-
-	return whole*1_000_000 + frac, nil
 }
 
 // countTokens counts tokens using the enhanced token counting system with model awareness
@@ -1134,7 +1170,7 @@ func (m *Middleware) readRequestBody(r *http.Request) (content, contentType stri
 			}
 			return "", r.Header.Get("Content-Type")
 		}
-		
+
 		// Record metrics if available
 		if m.metricsCollector != nil {
 			if bodyInfo.Error != nil {
@@ -1143,10 +1179,10 @@ func (m *Middleware) readRequestBody(r *http.Request) (content, contentType stri
 				m.metricsCollector.RecordCacheHit() // Successful operation
 			}
 		}
-		
+
 		return bodyInfo.Content, bodyInfo.ContentType
 	}
-	
+
 	// If enhanced system is not available, log error
 	caddy.Log().Warn("Enhanced body handler not available, cannot read request body")
 	return "", r.Header.Get("Content-Type")
@@ -1164,7 +1200,7 @@ func (m *Middleware) extractResponseBody(wrappedWriter http.ResponseWriter) (con
 	if basicWriter, ok := wrappedWriter.(*TokenMeteringResponseWriter); ok {
 		return string(basicWriter.Body()), "application/json"
 	}
-	
+
 	// Should not reach here, but provide safe fallback
 	return "", "application/json"
 }
@@ -1180,21 +1216,21 @@ func (m *Middleware) extractResponseBody(wrappedWriter http.ResponseWriter) (con
 func expandEnvVars(value string) string {
 	// Pattern to match {env.VAR_NAME}
 	envPattern := regexp.MustCompile(`\{env\.([A-Za-z_][A-Za-z0-9_]*)\}`)
-	
+
 	return envPattern.ReplaceAllStringFunc(value, func(match string) string {
 		// Extract the variable name from {env.VAR_NAME}
 		varName := envPattern.FindStringSubmatch(match)[1]
-		
+
 		// Get the environment variable value
 		envValue := os.Getenv(varName)
-		
+
 		// Log for debugging
 		logger := caddy.Log()
 		logger.Debug("Expanding environment variable",
 			zap.String("var_name", varName),
 			zap.String("env_value", envValue),
 			zap.String("original", match))
-		
+
 		return envValue
 	})
 }
@@ -1228,20 +1264,21 @@ func min(a, b int) int {
 //   - string: The extracted API key, or original header if no known prefix found
 //
 // Example:
-//   extractAPIKey("Bearer abc123") returns "abc123"
-//   extractAPIKey("Basic xyz789") returns "xyz789"
-//   extractAPIKey("plainkey") returns "plainkey"
+//
+//	extractAPIKey("Bearer abc123") returns "abc123"
+//	extractAPIKey("Basic xyz789") returns "xyz789"
+//	extractAPIKey("plainkey") returns "plainkey"
 func extractAPIKey(authHeader string) string {
 	// Try to remove "Basic " prefix (HTTP Basic Auth format)
 	if apiKey, found := strings.CutPrefix(authHeader, "Basic "); found {
 		return apiKey
 	}
-	
+
 	// Try to remove "Bearer " prefix (OAuth/JWT token format)
 	if apiKey, found := strings.CutPrefix(authHeader, "Bearer "); found {
 		return apiKey
 	}
-	
+
 	// No recognized prefix - return the header as-is (custom format)
 	return authHeader
 }
@@ -1260,21 +1297,21 @@ func detectModelFromRequestBody(requestBody, contentType string) string {
 	if !strings.Contains(strings.ToLower(contentType), "application/json") {
 		return "unknown"
 	}
-	
+
 	// Parse JSON to extract model field
 	var jsonData map[string]any
 	if err := json.Unmarshal([]byte(requestBody), &jsonData); err != nil {
 		// Not valid JSON
 		return "unknown"
 	}
-	
+
 	// Look for model field
 	if model, exists := jsonData["model"]; exists {
 		if modelStr, ok := model.(string); ok && modelStr != "" {
 			return modelStr
 		}
 	}
-	
+
 	return "unknown"
 }
 
@@ -1290,21 +1327,22 @@ func detectModelFromRequestBody(requestBody, contentType string) string {
 //   - error: nil on success, error if parsing fails
 //
 // Note: This function creates a new Middleware instance and delegates
-//       the actual parsing to UnmarshalCaddyfile.
+//
+//	the actual parsing to UnmarshalCaddyfile.
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	logger := caddy.Log()
 	logger.Info("🔧 parseCaddyfile called - creating middleware instance")
-	
+
 	// Create new middleware instance
 	var m Middleware
-	
+
 	// Parse configuration using the Caddyfile dispenser
 	err := m.UnmarshalCaddyfile(h.Dispenser)
 	if err != nil {
 		logger.Error("Failed to parse Caddyfile configuration", zap.Error(err))
 		return nil, err
 	}
-	
+
 	logger.Info("✅ parseCaddyfile completed successfully")
 	// Return configured middleware
 	return m, nil
@@ -1327,7 +1365,7 @@ func (m *Middleware) Cleanup() error {
 		m.meteringRunning = false
 		logger.Debug("Legacy token reporting goroutine stopped")
 	}
-	
+
 	// Stop the resilient reporter
 	if m.resilientReporter != nil {
 		logger.Debug("Stopping resilient reporter")
@@ -1339,7 +1377,8 @@ func (m *Middleware) Cleanup() error {
 	if m.validator != nil {
 		logger.Debug("Cleaning up validator cache")
 		m.validator.CleanupCache()
-		logger.Debug("Validator cache cleaned up")}
+		logger.Debug("Validator cache cleaned up")
+	}
 
 	// Enhanced metering components handle their own cleanup
 

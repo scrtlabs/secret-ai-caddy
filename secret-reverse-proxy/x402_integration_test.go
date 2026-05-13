@@ -1,34 +1,71 @@
 package secret_reverse_proxy
 
 import (
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/crypto"
 	"go.uber.org/zap"
 
 	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
-	"github.com/scrtlabs/secret-reverse-proxy/x402"
 	validators "github.com/scrtlabs/secret-reverse-proxy/validators"
+	"github.com/scrtlabs/secret-reverse-proxy/x402"
 )
+
+// --- Test wallet helpers ---
+
+func generateTestWallet(t *testing.T) (*ecdsa.PrivateKey, string) {
+	t.Helper()
+	privKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("failed to generate test wallet: %v", err)
+	}
+	addr := crypto.PubkeyToAddress(privKey.PublicKey).Hex()
+	return privKey, addr
+}
+
+// signRequest builds an EIP-191 signature matching DevPortal's verifySignature.ts.
+// payload = method + path + body + timestamp (no separators)
+// hash    = sha256(payload)
+// sig     = personal_sign(hashBytes, privateKey)
+func signRequest(t *testing.T, privKey *ecdsa.PrivateKey, method, path, body, timestamp string) string {
+	t.Helper()
+	payload := method + path + body + timestamp
+	hashBytes := sha256.Sum256([]byte(payload))
+	personalHash := accounts.TextHash(hashBytes[:])
+	sig, err := crypto.Sign(personalHash, privKey)
+	if err != nil {
+		t.Fatalf("failed to sign request: %v", err)
+	}
+	sig[64] += 27 // normalize v: 0/1 → 27/28 (Ethereum convention)
+	return "0x" + hex.EncodeToString(sig)
+}
 
 // --- Mock Portal Server ---
 
 type testPortalServer struct {
-	balances     map[string]int64
-	usageReports []x402.UsageReport
+	balances     map[string]float64 // wallet → USD balance
+	usageReports []x402.UsageReportRequest
+	serviceKey   string
 	mu           sync.Mutex
 	server       *httptest.Server
 }
 
-func newTestPortalServer() *testPortalServer {
+func newTestPortalServer(serviceKey string) *testPortalServer {
 	p := &testPortalServer{
-		balances: make(map[string]int64),
+		balances:   make(map[string]float64),
+		serviceKey: serviceKey,
 	}
 
 	mux := http.NewServeMux()
@@ -39,24 +76,32 @@ func newTestPortalServer() *testPortalServer {
 }
 
 func (p *testPortalServer) handleBalance(w http.ResponseWriter, r *http.Request) {
-	apiKey := r.Header.Get("X-Api-Key")
-	if apiKey == "" {
-		http.Error(w, "missing api key", http.StatusBadRequest)
+	svcKey := r.Header.Get("X-Agent-Service-Key")
+	if svcKey == "" {
+		http.Error(w, "missing service key", http.StatusUnauthorized)
+		return
+	}
+	walletAddr := r.Header.Get("X-Agent-Wallet-Address")
+	if walletAddr == "" {
+		walletAddr = r.URL.Query().Get("wallet_address")
+	}
+	if walletAddr == "" {
+		http.Error(w, "missing wallet address", http.StatusBadRequest)
 		return
 	}
 
 	p.mu.Lock()
-	balance := p.balances[apiKey]
+	balance := p.balances[strings.ToLower(walletAddr)]
 	p.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"balance": fmt.Sprintf("%d", balance),
+		"balance": strconv.FormatFloat(balance, 'f', 6, 64),
 	})
 }
 
 func (p *testPortalServer) handleReportUsage(w http.ResponseWriter, r *http.Request) {
-	var report x402.UsageReport
+	var report x402.UsageReportRequest
 	json.NewDecoder(r.Body).Decode(&report)
 
 	p.mu.Lock()
@@ -67,10 +112,16 @@ func (p *testPortalServer) handleReportUsage(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-func (p *testPortalServer) getUsageReports() []x402.UsageReport {
+func (p *testPortalServer) setBalance(walletAddr string, usd float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make([]x402.UsageReport, len(p.usageReports))
+	p.balances[strings.ToLower(walletAddr)] = usd
+}
+
+func (p *testPortalServer) getUsageReports() []x402.UsageReportRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]x402.UsageReportRequest, len(p.usageReports))
 	copy(out, p.usageReports)
 	return out
 }
@@ -97,15 +148,15 @@ func (h *mockLLMHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error
 
 // --- Helper to build middleware ---
 
-func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSDC string) *Middleware {
+func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, serviceKey string) *Middleware {
 	t.Helper()
 	config := &proxyconfig.Config{
 		APIKey:              "master-key-123",
 		CacheTTL:            time.Hour,
 		X402Enabled:         true,
 		DevPortalURL:        portalURL,
-		DevPortalServiceKey: "test-service-key",
-		X402MinBalanceUSDC:  minBalanceUSDC,
+		DevPortalServiceKey: serviceKey,
+		X402MinBalanceUSD:   minBalanceUSD,
 		MaxBodySize:         10 * 1024 * 1024,
 	}
 
@@ -118,30 +169,38 @@ func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSDC string) 
 
 	m.portalClient = x402.NewPortalClient(portalURL, config.DevPortalServiceKey, logger)
 	m.challengeBuilder = x402.NewChallengeBuilder(portalURL + "/api/agent/add-funds")
-
-	minBalance, err := parseUSDCToMinor(config.X402MinBalanceUSDC)
-	if err != nil {
-		t.Fatalf("failed to parse min balance: %v", err)
-	}
-	m.x402MinBalance = minBalance
+	m.x402MinBalance = minBalanceUSD
 
 	return m
+}
+
+// agentReq builds a signed agent request for tests.
+func agentReq(t *testing.T, privKey *ecdsa.PrivateKey, walletAddr, method, path, body string) *http.Request {
+	t.Helper()
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+	sig := signRequest(t, privKey, method, path, body, timestamp)
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Address", walletAddr)
+	req.Header.Set("X-Agent-Signature", sig)
+	req.Header.Set("X-Agent-Timestamp", timestamp)
+	return req
 }
 
 // --- Tests ---
 
 func TestX402_InsufficientBalance_Returns402(t *testing.T) {
-	portal := newTestPortalServer()
+	portal := newTestPortalServer("test-service-key")
 	defer portal.close()
 
-	portal.balances["agent-key-1"] = 0 // no funds
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds
 
-	m := buildX402Middleware(t, portal.server.URL, "0.01")
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
 	next := &mockLLMHandler{}
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`))
-	req.Header.Set("Authorization", "Bearer agent-key-1")
-	req.Header.Set("Content-Type", "application/json")
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
 	w := httptest.NewRecorder()
 
 	err := m.ServeHTTP(w, req, next)
@@ -152,42 +211,37 @@ func TestX402_InsufficientBalance_Returns402(t *testing.T) {
 	if w.Code != http.StatusPaymentRequired {
 		t.Errorf("expected status 402, got %d", w.Code)
 	}
-
 	if next.called {
 		t.Error("expected next handler NOT to be called")
 	}
 
-	// Check response body
 	var challenge x402.Challenge
 	if err := json.NewDecoder(w.Body).Decode(&challenge); err != nil {
 		t.Fatalf("failed to decode challenge: %v", err)
 	}
-
 	if challenge.Error != "Insufficient balance" {
 		t.Errorf("unexpected error: %q", challenge.Error)
 	}
 	if challenge.TopupURL == "" {
 		t.Error("expected topup_url in response")
 	}
-
-	// Check header
 	if w.Header().Get("Payment-Required") != "x402" {
 		t.Errorf("expected Payment-Required header 'x402', got %q", w.Header().Get("Payment-Required"))
 	}
 }
 
 func TestX402_SufficientBalance_ProxiesRequest(t *testing.T) {
-	portal := newTestPortalServer()
+	portal := newTestPortalServer("test-service-key")
 	defer portal.close()
 
-	portal.balances["agent-key-2"] = 20000 // $0.02
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.02) // $0.02
 
-	m := buildX402Middleware(t, portal.server.URL, "0.01")
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
 	next := &mockLLMHandler{}
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`))
-	req.Header.Set("Authorization", "Bearer agent-key-2")
-	req.Header.Set("Content-Type", "application/json")
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
 	w := httptest.NewRecorder()
 
 	err := m.ServeHTTP(w, req, next)
@@ -198,7 +252,6 @@ func TestX402_SufficientBalance_ProxiesRequest(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
-
 	if !next.called {
 		t.Error("expected next handler to be called")
 	}
@@ -210,23 +263,20 @@ func TestX402_SufficientBalance_ProxiesRequest(t *testing.T) {
 	if len(reports) != 1 {
 		t.Fatalf("expected 1 usage report, got %d", len(reports))
 	}
-	if reports[0].APIKey != "agent-key-2" {
-		t.Errorf("expected api_key 'agent-key-2', got %q", reports[0].APIKey)
+	if !strings.EqualFold(reports[0].WalletAddress, walletAddr) {
+		t.Errorf("expected wallet_address %q in usage report, got %q", walletAddr, reports[0].WalletAddress)
 	}
-	// Model detection requires bodyHandler to be initialized (metering concern).
-	// In this minimal test setup it falls back to "unknown", which is fine —
-	// the important thing is the report was sent with the right API key.
-	if reports[0].Model == "" {
-		t.Error("expected non-empty model in usage report")
+	if len(reports[0].UsageData) != 1 {
+		t.Fatalf("expected 1 usage_data entry, got %d", len(reports[0].UsageData))
 	}
 }
 
 func TestX402_MasterKey_BypassesPortal(t *testing.T) {
-	portal := newTestPortalServer()
+	portal := newTestPortalServer("test-service-key")
 	defer portal.close()
 
-	// Portal has NO balance for master key — but it shouldn't matter
-	m := buildX402Middleware(t, portal.server.URL, "0.01")
+	// Portal has NO balance — but master key bypasses x402 path entirely (no x-agent-address)
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
 	next := &mockLLMHandler{}
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`))
@@ -242,12 +292,11 @@ func TestX402_MasterKey_BypassesPortal(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
-
 	if !next.called {
 		t.Error("expected next handler to be called (master key bypasses portal)")
 	}
 
-	// Portal should have received NO usage reports (master key path doesn't report)
+	// Portal should have received NO balance checks or usage reports
 	reports := portal.getUsageReports()
 	if len(reports) != 0 {
 		t.Errorf("expected 0 usage reports for master key, got %d", len(reports))
@@ -255,13 +304,13 @@ func TestX402_MasterKey_BypassesPortal(t *testing.T) {
 }
 
 func TestX402_PortalUnreachable_Returns503(t *testing.T) {
-	// Point to a dead URL
-	m := buildX402Middleware(t, "http://127.0.0.1:1", "0.01")
+	privKey, walletAddr := generateTestWallet(t)
+
+	m := buildX402Middleware(t, "http://127.0.0.1:1", 0.01, "test-service-key")
 	next := &mockLLMHandler{}
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer agent-key-3")
-	req.Header.Set("Content-Type", "application/json")
+	body := `{"model":"llama-3","messages":[]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
 	w := httptest.NewRecorder()
 
 	err := m.ServeHTTP(w, req, next)
@@ -272,24 +321,22 @@ func TestX402_PortalUnreachable_Returns503(t *testing.T) {
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected status 503, got %d", w.Code)
 	}
-
 	if next.called {
 		t.Error("expected next handler NOT to be called when portal is unreachable")
 	}
 }
 
 func TestX402_PartialBalance_Returns402WithCorrectDeficit(t *testing.T) {
-	portal := newTestPortalServer()
+	portal := newTestPortalServer("test-service-key")
 	defer portal.close()
 
-	portal.balances["agent-key-4"] = 5000 // $0.005 — less than $0.01 threshold
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.005) // $0.005 — less than $0.01 threshold
 
-	m := buildX402Middleware(t, portal.server.URL, "0.01")
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
 	next := &mockLLMHandler{}
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer agent-key-4")
-	req.Header.Set("Content-Type", "application/json")
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", `{"model":"llama-3","messages":[]}`)
 	w := httptest.NewRecorder()
 
 	m.ServeHTTP(w, req, next)
@@ -301,43 +348,36 @@ func TestX402_PartialBalance_Returns402WithCorrectDeficit(t *testing.T) {
 	var challenge x402.Challenge
 	json.NewDecoder(w.Body).Decode(&challenge)
 
-	if challenge.BalanceUSDC != "0.005000" {
-		t.Errorf("expected balance_usdc '0.005000', got %q", challenge.BalanceUSDC)
+	if challenge.BalanceUSD != "0.005000" {
+		t.Errorf("expected balance_usd '0.005000', got %q", challenge.BalanceUSD)
 	}
-	if challenge.TopupAmountUSDC != "0.005000" {
-		t.Errorf("expected topup_amount_usdc '0.005000', got %q", challenge.TopupAmountUSDC)
+	if challenge.TopupAmountUSD != "0.005000" {
+		t.Errorf("expected topup_amount_usd '0.005000', got %q", challenge.TopupAmountUSD)
 	}
 }
 
-func TestParseUSDCToMinor(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected int64
-		wantErr  bool
-	}{
-		{"0.01", 10000, false},
-		{"0.02", 20000, false},
-		{"1.00", 1000000, false},
-		{"0.000001", 1, false},
-		{"10", 10000000, false},
-		{"", 0, true},
-		{"abc", 0, true},
-	}
+func TestX402_InvalidSignature_Returns401(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
 
-	for _, tc := range tests {
-		got, err := parseUSDCToMinor(tc.input)
-		if tc.wantErr {
-			if err == nil {
-				t.Errorf("parseUSDCToMinor(%q): expected error", tc.input)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("parseUSDCToMinor(%q): unexpected error: %v", tc.input, err)
-			continue
-		}
-		if got != tc.expected {
-			t.Errorf("parseUSDCToMinor(%q) = %d, want %d", tc.input, got, tc.expected)
-		}
+	_, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0)
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	// Use a DIFFERENT private key to produce a bad signature
+	wrongKey, _ := generateTestWallet(t)
+	body := `{"model":"llama-3","messages":[]}`
+	req := agentReq(t, wrongKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	m.ServeHTTP(w, req, next)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called with invalid signature")
 	}
 }

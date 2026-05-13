@@ -1,11 +1,12 @@
 version: '3.8'
 
 services:
-  echo-server:
-    image: ealen/echo-server
-    container_name: echo-server
-    # ports:
-    #   - "3000:80" # Optional for debug access
+  # Mock LLM backend — simulates SecretAI/Ollama API with realistic OpenAI-format responses
+  # Returns proper usage (25 input + 28 output tokens) for billing pipeline testing
+  mock-llm:
+    build:
+      context: ./test/mock-llm
+    container_name: mock-llm
     networks:
       - testnet
 
@@ -13,33 +14,31 @@ services:
     image: secret-reverse-proxy:latest
     container_name: caddy-reverse-proxy
     ports:
-      - "8085:80" # External access point
+      - "8085:80"
+    env_file:
+      - ./local/.env
     environment:
       - SKIP_SSL_VALIDATION=true
-      - SECRET_NODE=lcd.secret.tactus.starshell.net
+      - SECRET_NODE=rpc12.scrtlabs.com
       - SECRET_CHAIN_ID=secret-4
       - SECRET_CONTRACT=secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm
-      - SECRET_API_MASTER_KEY=bWFzdGVyQHNjcnRsYWJzLmNvbTpTZWNyZXROZXR3b3JrTWFzdGVyS2V5X18yMDI1
       - METERING=1
       - METERING_INTERVAL=1m
       - METERING_URL=https://preview-aidev.scrtlabs.com
       - BLOCK_URLS=8085/api/pull
-      # x402 Payment Protocol (disabled by default)
-      - X402_ENABLED=${X402_ENABLED:-false}
-      - X402_AGENT_KEY=${X402_AGENT_KEY:-}
-      - X402_AGENT_ADDRESS=${X402_AGENT_ADDRESS:-}
-      - X402_SECRETVM_URL=${X402_SECRETVM_URL:-}
-      - X402_PAYMENT_URL=${X402_PAYMENT_URL:-}
+      # x402 Payment Protocol — values required in env_file (local/.env)
+      - X402_ENABLED=${X402_ENABLED:-true}
+      - DEVPORTAL_URL=${DEVPORTAL_URL}
+      - DEVPORTAL_SERVICE_KEY=${DEVPORTAL_SERVICE_KEY}
+      - X402_MIN_BALANCE_USD=${X402_MIN_BALANCE_USD:-0.001}
     volumes:
       - ./Caddyfile-test:/etc/caddy/Caddyfile
-      - ./permit.json:/etc/caddy/permit.json
-      - ./master_keys.txt:/etc/caddy/master_keys.txt
       - ./config:/config/caddy
       - ./data:/data/caddy
     networks:
       - testnet
     depends_on:
-      - echo-server
+      - mock-llm
 
 networks:
   testnet:

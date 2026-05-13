@@ -26,7 +26,7 @@ func getSecretNode() string {
 	if node := os.Getenv("SECRET_NODE"); node != "" {
 		return node
 	}
-	return "pulsar.lcd.secretnodes.com"
+	return "rpc12.scrtlabs.com"
 }
 
 func Trace() string {

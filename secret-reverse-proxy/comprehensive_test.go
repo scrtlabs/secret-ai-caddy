@@ -161,14 +161,20 @@ func TestMiddleware_ServeHTTP_WithTestableValidator(t *testing.T) {
 
 	// For this test, just use the regular validator and set up a mock for the contract call
 	middleware.validator = apikeyval.NewAPIKeyValidator(config)
-	
+
 	// Replace the contract query function temporarily
 	originalQuery := queryContractFunc
-	defer func() { queryContractFunc = originalQuery }()
-	
-	queryContractFunc = func(contractAddress string, query map[string]any) (map[string]any, error) {
+	originalValidatorsQuery := validators.QueryContractFunc
+	defer func() {
+		queryContractFunc = originalQuery
+		validators.QueryContractFunc = originalValidatorsQuery
+	}()
+
+	mockFn := func(contractAddress string, query map[string]any) (map[string]any, error) {
 		return mockQuerier.QueryContract(contractAddress, query)
 	}
+	queryContractFunc = mockFn
+	validators.QueryContractFunc = mockFn
 
 	mockNext := &ComprehensiveMockHandler{}
 
@@ -186,7 +192,7 @@ func TestMiddleware_ServeHTTP_WithTestableValidator(t *testing.T) {
 		},
 		{
 			name:           "contract valid key success",
-			authHeader:     "Bearer contract-valid-key", 
+			authHeader:     "Bearer contract-valid-key",
 			expectedStatus: http.StatusOK,
 			expectNextCall: true,
 		},
@@ -277,21 +283,21 @@ func TestMiddleware_CaddyModuleInfo(t *testing.T) {
 func TestParseCaddyfileFunctionExists(t *testing.T) {
 	// The parseCaddyfile function is primarily tested through UnmarshalCaddyfile
 	// This test verifies the function exists and has the right signature
-	
+
 	middleware := &Middleware{}
-	
+
 	// Test that the middleware can be provisioned (uses defaults)
 	ctx := caddy.Context{}
 	err := middleware.Provision(ctx)
 	if err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
-	
+
 	// Verify that the configuration has defaults
 	if middleware.Config == nil {
 		t.Error("Expected config to be initialized during provision")
 	}
-	
+
 	t.Log("parseCaddyfile function exists and integrates with Caddy")
 }
 
@@ -302,7 +308,7 @@ func TestDefaultConfigurationValues(t *testing.T) {
 	// Test all default values
 	expectedDefaults := map[string]interface{}{
 		"MasterKeysFile":  "master_keys.txt",
-		"ContractAddress": "secret1ttm9axv8hqwjv3qxvxseecppsrw4cd68getrvr",
+		"ContractAddress": "secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm",
 		"CacheTTL":        30 * time.Minute,
 	}
 
@@ -351,14 +357,14 @@ func TestAPIKeyValidatorCreation(t *testing.T) {
 // TestFullProvisionAndValidateFlow tests complete middleware setup
 func TestFullProvisionAndValidateFlow(t *testing.T) {
 	tests := []struct {
-		name           string
-		config         *Config
+		name            string
+		config          *Config
 		expectProvError bool
 		expectValError  bool
 	}{
 		{
-			name:           "nil config gets defaults",
-			config:         nil,
+			name:            "nil config gets defaults",
+			config:          nil,
 			expectProvError: false,
 			expectValError:  false, // Should get valid defaults
 		},
@@ -611,7 +617,7 @@ func TestReadPermitFromFile_ComprehensiveErrorHandling(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create temp file with content - use simplified approach
 			tmpFile := fmt.Sprintf("/tmp/test_permit_%d.json", time.Now().UnixNano())
-			
+
 			// Write content to file using simple method
 			if err := func() error {
 				f, err := os.Create(tmpFile)
@@ -624,7 +630,7 @@ func TestReadPermitFromFile_ComprehensiveErrorHandling(t *testing.T) {
 			}(); err != nil {
 				t.Fatalf("Failed to create temp file: %v", err)
 			}
-			
+
 			// Clean up
 			defer func() {
 				os.Remove(tmpFile)

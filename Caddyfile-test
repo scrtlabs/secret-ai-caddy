@@ -58,8 +58,7 @@
 			secret_node {env.SECRET_NODE}
     		contract_address {env.SECRET_CONTRACT}
 			secret_chain_id {env.SECRET_CHAIN_ID}
-    		permit_file /etc/caddy/permit.json
-			metering {env.METERING}
+    		metering {env.METERING}
 			metering_interval {env.METERING_INTERVAL}
     		metering_url {env.METERING_URL}
 			
@@ -71,18 +70,14 @@
 			enable_metrics true
 			metrics_path /metrics
 
-			# x402 Payment Protocol (disabled by default, enable via env vars)
+			# x402 Payment Protocol (portal-based)
 			x402_enabled {env.X402_ENABLED}
-			x402_agent_key {env.X402_AGENT_KEY}
-			x402_agent_address {env.X402_AGENT_ADDRESS}
-			x402_secretvm_url {env.X402_SECRETVM_URL}
-			x402_payment_url {env.X402_PAYMENT_URL}
+			devportal_url {env.DEVPORTAL_URL}
+			devportal_service_key {env.DEVPORTAL_SERVICE_KEY}
+			x402_min_balance_usd {env.X402_MIN_BALANCE_USD}
 		}
 		
-		reverse_proxy echo-server:80 {
-			health_uri /health
-			health_interval 30s
-			health_timeout 10s
+		reverse_proxy mock-llm:80 {
 			header_up Host {host}
 			header_up X-Real-IP {remote_host}
 			header_up X-Forwarded-Port {server_port}
