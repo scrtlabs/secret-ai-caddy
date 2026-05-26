@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/scrtlabs/secret-reverse-proxy/utils"
 )
 
 // PortalClient is the HTTP client for DevPortal balance and usage APIs.
@@ -24,14 +26,15 @@ type PortalClient struct {
 }
 
 // NewPortalClient creates a new DevPortal API client.
+// Respects SKIP_SSL_VALIDATION env var (via utils.GetHTTPClient) for dev/test environments.
 func NewPortalClient(baseURL, serviceKey string, logger *zap.Logger) *PortalClient {
+	httpClient := utils.GetHTTPClient()
+	httpClient.Timeout = 10 * time.Second
 	return &PortalClient{
 		baseURL:    baseURL,
 		serviceKey: serviceKey,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		logger: logger,
+		httpClient: httpClient,
+		logger:     logger,
 	}
 }
 
