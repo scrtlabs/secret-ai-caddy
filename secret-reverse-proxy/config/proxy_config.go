@@ -59,6 +59,12 @@ type Config struct {
 	DevPortalServiceKey string  `json:"devportal_service_key,omitempty"`
 	X402MinBalanceUSD   float64 `json:"x402_min_balance_usd,omitempty"` // Minimum balance threshold in USD (e.g. 0.01)
 	X402TopupURL        string  `json:"x402_topup_url,omitempty"`       // Override topup URL (defaults to DevPortalURL + /api/agent/add-funds)
+
+	// LLM request defaults — injected when the client does not set these fields.
+	// Allows operator-level control over model behaviour without requiring client changes.
+	// Both are no-ops when empty/zero (client values always win).
+	DefaultThink      string `json:"default_think,omitempty"`       // e.g. "low", "medium", "high"
+	DefaultNumPredict int    `json:"default_num_predict,omitempty"` // e.g. 512; -1 = unlimited
 }
 
 // Config interface implementation for enhanced metering

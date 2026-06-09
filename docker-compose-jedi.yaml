@@ -1,0 +1,300 @@
+# =============================================================================
+# SecretAI Docker Compose — JEDI (gpt-oss:120b)
+# Ollama 0.20.7 | Caddy v0.1.17
+# =============================================================================
+# Changes vs original:
+#   - ollama-init: added patching step (num_predict=512, think=low) — fixed
+#     /api/create format from old "modelfile" to new "from"+"parameters"
+#   - ollama: added OLLAMA_VERBOSE=1 for more detailed logs
+# =============================================================================
+version: '3.8'
+
+services:
+
+  init:
+    image: alpine:3.23.4
+    container_name: sys-init
+    volumes:
+      - /mnt/secure:/workdir
+    command: >
+      sh -c "
+        mkdir -p /workdir/stt-models &&
+        mkdir -p /workdir/stt-logs &&
+        mkdir -p /workdir/tts-data/hf &&
+        mkdir -p /workdir/tts-data/cache &&
+        mkdir -p /workdir/tts-models &&
+        mkdir -p /workdir/tts-logs &&
+        chmod -R 777 /workdir/tts-logs /workdir/tts-models /workdir/tts-data /workdir/stt-logs /workdir/stt-models
+      "
+    restart: "no"
+    networks:
+      - secretai_network
+
+  caddy:
+    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.17
+    container_name: caddy-proxy
+    ports:
+      - "21434:21434"
+      - "25436:25436"
+      - "25435:25435"
+      - "18800:18800"
+    volumes:
+      - /mnt/secure/app_cert:/etc/ssl/certs:ro
+      - /mnt/secure/app_cert:/etc/ssl/private:ro
+      - /mnt/secure/caddy-data:/data
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    env_file:
+      - usr/.env
+    environment:
+      - SKIP_SSL_VALIDATION=true
+      - SECRET_CHAIN_ID=secret-4
+      - SECRET_CONTRACT=secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm
+      - METERING=1
+      - METERING_INTERVAL=1m
+      - METERING_URL=https://secretai.scrtlabs.com
+      - BLOCK_URLS=21434/api/pull
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    user: root
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - secretai_network
+
+  ollama-init:
+    image: alpine:3.23.4
+    container_name: ollama-llm-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - /mnt/secure/.ollama:/root/.ollama
+    command: >
+      sh -c "
+        set -e
+        apk add --no-cache curl jq 2>/dev/null || true
+
+        MODELS='gpt-oss:120b'
+
+        echo '============================================'
+        echo 'Starting Ollama Model Management (JEDI)'
+        echo 'Ollama version: 0.20.7'
+        echo '============================================'
+
+        # -----------------------------------------------------------
+        # PHASE 1: Pull missing models
+        # -----------------------------------------------------------
+        echo 'Fetching currently available models...'
+        EXISTING_MODELS=$$(curl -s http://ollama:11434/api/tags | jq -r '.models[].name' 2>/dev/null || echo '')
+        echo \"Current models: $$EXISTING_MODELS\"
+
+        for MODEL in $$MODELS; do
+          if echo \"$$EXISTING_MODELS\" | grep -q \"$$MODEL\"; then
+            echo \"  ✓ $$MODEL already exists, skipping pull\"
+          else
+            echo \"  → Pulling $$MODEL...\"
+            curl -X POST http://ollama:11434/api/pull \
+              -H 'Content-Type: application/json' \
+              -d '{\"name\": \"'\"$$MODEL\"'\"}' --progress-bar
+            echo \"  ✓ Pull complete for $$MODEL\"
+          fi
+        done
+
+        # -----------------------------------------------------------
+        # PHASE 2: Patch model defaults (num_predict, think)
+        # NOTE: No num_ctx patching on JEDI — model uses its own default.
+        # Uses new /api/create format (from + parameters) required by 0.20.7+
+        # -----------------------------------------------------------
+        echo ''
+        echo '=== Setting model defaults: num_predict=512, think=low ==='
+        for MODEL in $$MODELS; do
+          echo \"  → Patching $$MODEL\"
+          curl -s -X POST http://ollama:11434/api/create \
+            -H 'Content-Type: application/json' \
+            -d \"{\\\"name\\\": \\\"$$MODEL\\\", \\\"from\\\": \\\"$$MODEL\\\", \\\"parameters\\\": {\\\"num_predict\\\": 512, \\\"think\\\": \\\"low\\\"}}\" \
+            | grep -o '\"status\":\"[^\"]*\"' | tail -1
+          echo \"  ✓ $$MODEL patched\"
+        done
+
+        # -----------------------------------------------------------
+        # PHASE 3: Pre-load and pin models in VRAM
+        # -----------------------------------------------------------
+        echo ''
+        echo '============================================'
+        echo 'Phase 3: Loading and pinning models in VRAM'
+        echo '============================================'
+        for MODEL in $$MODELS; do
+          echo \"Loading: $$MODEL\"
+          RESPONSE=$$(curl -s -w '\n%{http_code}' -X POST http://ollama:11434/api/generate \
+            -H 'Content-Type: application/json' \
+            -d '{\"model\": \"'\"$$MODEL\"'\", \"prompt\": \"\", \"keep_alive\": -1, \"stream\": false}')
+          HTTP_CODE=$$(echo \"$$RESPONSE\" | tail -1)
+          if [ \"$$HTTP_CODE\" = \"200\" ]; then
+            echo \"  ✓ $$MODEL loaded and pinned\"
+          else
+            echo \"  ✗ Failed to load $$MODEL (HTTP $$HTTP_CODE)\"
+          fi
+          sleep 10
+        done
+
+        # -----------------------------------------------------------
+        # PHASE 4: Verify GPU residency via /api/ps
+        # -----------------------------------------------------------
+        echo ''
+        echo '============================================'
+        echo 'Phase 4: Verifying GPU residency'
+        echo '============================================'
+        PS_RESPONSE=$$(curl -s http://ollama:11434/api/ps)
+        echo \"$$PS_RESPONSE\" | jq -r '.models[] | \"  • \" + .name + \" | VRAM: \" + (.size_vram/1073741824|tostring) + \"GB\"' 2>/dev/null || echo \"$$PS_RESPONSE\"
+
+        LOADED_COUNT=$$(echo \"$$PS_RESPONSE\" | jq '.models | length' 2>/dev/null || echo '0')
+        EXPECTED_COUNT=$$(echo $$MODELS | wc -w | tr -d ' ')
+        echo \"Models GPU-resident: $$LOADED_COUNT / $$EXPECTED_COUNT expected\"
+
+        echo ''
+        echo '============================================'
+        echo 'Model management completed!'
+        echo '============================================'
+      "
+    restart: "no"
+    networks:
+      - secretai_network
+
+  ollama:
+    image: ollama/ollama:0.20.7
+    container_name: ollama-llm
+    privileged: true
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 160G
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_MAX_LOADED_MODELS=5
+      - OLLAMA_NUM_PARALLEL=2
+      - OLLAMA_LOAD_TIMEOUT=600
+      - OLLAMA_NO_CLOUD=1
+      - OLLAMA_DEBUG=1
+      - OLLAMA_VERBOSE=1   # request verbose llama.cpp logs
+    volumes:
+      - /mnt/secure/.ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 60s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    networks:
+      - secretai_network
+
+  stt_service:
+    image: ghcr.io/scrtlabs/secret-ai-stt-tts:v0.0.8
+    container_name: secretai-stt-service
+    privileged: true
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WHISPER_MODEL=large-v3
+      - WHISPER_COMPUTE_TYPE=float16
+      - WHISPER_DEVICE=cuda
+      - CHUNK_DURATION=2.0
+      - SAMPLE_RATE=16000
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+        limits:
+          memory: 4G
+    volumes:
+      - /mnt/secure/stt-models:/app/models
+      - /mnt/secure/stt-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - secretai_network
+    labels:
+      - "com.secretai.service=stt"
+      - "com.secretai.version=1.1.0"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  tts_service:
+    image: remsky/kokoro-fastapi-gpu:latest
+    container_name: secretai-kokoro-tts
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      HF_HOME: /data/hf
+      TRANSFORMERS_CACHE: /data/hf/transformers
+      XDG_CACHE_HOME: /data/.cache
+      PORT: "8880"
+      PYTHONUNBUFFERED: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+        limits:
+          memory: 4G
+    volumes:
+      - /mnt/secure/tts-data/hf:/data/hf
+      - /mnt/secure/tts-data/cache:/data/.cache
+      - /mnt/secure/tts-models:/models
+      - /mnt/secure/tts-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8880/v1/test"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - secretai_network
+    labels:
+      - "com.secretai.service=tts"
+      - "com.secretai.provider=kokoro"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+networks:
+  secretai_network:
+    driver: bridge
+
+volumes:
+  tgi-models:
+    driver: local
