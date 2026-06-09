@@ -563,6 +563,22 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		m.metricsCollector.RecordTokenCountTime(time.Since(tokenCountStart))
 	}
 
+	// Inject operator-level LLM defaults (think, num_predict) when not set by client.
+	// This runs AFTER token counting so billing uses the original prompt length,
+	// and BEFORE forwarding so Ollama receives the enriched body.
+	if m.Config != nil && (m.Config.DefaultThink != "" || m.Config.DefaultNumPredict != 0) {
+		injected := injectRequestDefaults(requestBody, contentType,
+			m.Config.DefaultThink, m.Config.DefaultNumPredict)
+		if injected != requestBody {
+			bodyBytes := []byte(injected)
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
+			logger.Debug("Injected LLM request defaults",
+				zap.String("default_think", m.Config.DefaultThink),
+				zap.Int("default_num_predict", m.Config.DefaultNumPredict))
+		}
+	}
+
 	wrappedWriter := m.createResponseWriter(w)
 	err = next.ServeHTTP(wrappedWriter, r)
 	if err != nil {
@@ -891,6 +907,29 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				expandedValue := expandEnvVars(d.Val())
 				m.Config.MetricsPath = expandedValue
 				logger.Info("📍 Metrics path", zap.String("path", m.Config.MetricsPath))
+
+			case "default_think":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				val := strings.ToLower(strings.TrimSpace(expandEnvVars(d.Val())))
+				valid := map[string]bool{"low": true, "medium": true, "high": true, "off": true}
+				if !valid[val] {
+					return d.Errf("invalid default_think %q (must be low, medium, high, or off)", val)
+				}
+				m.Config.DefaultThink = val
+				logger.Info("🧠 Default think level", zap.String("think", val))
+
+			case "default_num_predict":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				n, err := strconv.Atoi(strings.TrimSpace(expandEnvVars(d.Val())))
+				if err != nil {
+					return d.Errf("invalid default_num_predict: %v", err)
+				}
+				m.Config.DefaultNumPredict = n
+				logger.Info("📏 Default num_predict", zap.Int("num_predict", n))
 
 			// x402 Payment Protocol directives (portal-based)
 			case "x402_enabled":
@@ -1325,6 +1364,68 @@ func detectModelFromRequestBody(requestBody, contentType string) string {
 	}
 
 	return "unknown"
+}
+
+// injectRequestDefaults adds operator-defined default values to an LLM request body.
+// It only sets fields that the client has not already provided, so client values
+// always take precedence.  Returns the (possibly modified) body as a string.
+//
+// Supported defaults (controlled via Caddyfile directives):
+//   - default_think      → sets top-level "think" field  (e.g. "low")
+//   - default_num_predict → sets "options.num_predict"   (e.g. 512)
+func injectRequestDefaults(body, contentType, defaultThink string, defaultNumPredict int) string {
+	if body == "" {
+		return body
+	}
+	if !strings.Contains(strings.ToLower(contentType), "application/json") {
+		return body
+	}
+	if defaultThink == "" && defaultNumPredict == 0 {
+		return body
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		return body // not valid JSON — leave untouched
+	}
+
+	modified := false
+
+	// Inject "think" only when absent.
+	// "off" injects boolean false (disables thinking); any other value is injected as-is.
+	if defaultThink != "" {
+		if _, exists := parsed["think"]; !exists {
+			if defaultThink == "off" {
+				parsed["think"] = false
+			} else {
+				parsed["think"] = defaultThink
+			}
+			modified = true
+		}
+	}
+
+	// Inject "options.num_predict" only when absent
+	if defaultNumPredict != 0 {
+		opts, _ := parsed["options"].(map[string]interface{})
+		if opts == nil {
+			opts = make(map[string]interface{})
+		}
+		if _, exists := opts["num_predict"]; !exists {
+			opts["num_predict"] = defaultNumPredict
+			parsed["options"] = opts
+			modified = true
+		}
+	}
+
+	if !modified {
+		return body
+	}
+
+	result, err := json.Marshal(parsed)
+	if err != nil {
+		return body
+	}
+	return string(result)
 }
 
 // parseCaddyfile is the entry point for Caddyfile parsing of this middleware.
