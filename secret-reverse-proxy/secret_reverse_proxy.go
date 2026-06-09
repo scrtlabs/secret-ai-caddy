@@ -913,9 +913,9 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				val := strings.ToLower(strings.TrimSpace(expandEnvVars(d.Val())))
-				valid := map[string]bool{"low": true, "medium": true, "high": true}
+				valid := map[string]bool{"low": true, "medium": true, "high": true, "off": true}
 				if !valid[val] {
-					return d.Errf("invalid default_think %q (must be low, medium, or high)", val)
+					return d.Errf("invalid default_think %q (must be low, medium, high, or off)", val)
 				}
 				m.Config.DefaultThink = val
 				logger.Info("🧠 Default think level", zap.String("think", val))
@@ -1391,10 +1391,15 @@ func injectRequestDefaults(body, contentType, defaultThink string, defaultNumPre
 
 	modified := false
 
-	// Inject "think" only when absent
+	// Inject "think" only when absent.
+	// "off" injects boolean false (disables thinking); any other value is injected as-is.
 	if defaultThink != "" {
 		if _, exists := parsed["think"]; !exists {
-			parsed["think"] = defaultThink
+			if defaultThink == "off" {
+				parsed["think"] = false
+			} else {
+				parsed["think"] = defaultThink
+			}
 			modified = true
 		}
 	}

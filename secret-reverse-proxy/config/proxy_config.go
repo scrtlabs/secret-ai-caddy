@@ -63,7 +63,13 @@ type Config struct {
 	// LLM request defaults — injected when the client does not set these fields.
 	// Allows operator-level control over model behaviour without requiring client changes.
 	// Both are no-ops when empty/zero (client values always win).
-	DefaultThink      string `json:"default_think,omitempty"`       // e.g. "low", "medium", "high"
+	//
+	// DefaultThink values:
+	//   "low" | "medium" | "high"  → inject think as a string (enables thinking mode)
+	//   "off"                      → inject think as boolean false (disables thinking mode)
+	//                                Use "off" for models like gemma4 that route all output
+	//                                to the thinking field when think is enabled.
+	DefaultThink      string `json:"default_think,omitempty"`       // "low"/"medium"/"high"/"off"
 	DefaultNumPredict int    `json:"default_num_predict,omitempty"` // e.g. 512; -1 = unlimited
 }
 
