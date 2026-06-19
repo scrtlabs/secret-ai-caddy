@@ -77,7 +77,6 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
     volumes:
       - /mnt/secure/.vllm:/root/.cache/huggingface
     command: >
@@ -137,12 +136,6 @@ configs:
             Access-Control-Max-Age "86400"
             Vary "Origin"
           }
-          header !@has_origin {
-            Access-Control-Allow-Origin "*"
-            Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-            Access-Control-Allow-Headers "*"
-            Access-Control-Max-Age "86400"
-          }
           respond "" 204
         }
 
@@ -155,12 +148,6 @@ configs:
             Access-Control-Allow-Headers "*"
             Access-Control-Expose-Headers "*"
             Vary "Origin"
-          }
-          header !@has_origin {
-            Access-Control-Allow-Origin "*"
-            Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-            Access-Control-Allow-Headers "*"
-            Access-Control-Expose-Headers "*"
           }
 
           secret_reverse_proxy {
