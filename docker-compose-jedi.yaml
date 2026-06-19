@@ -67,7 +67,7 @@ services:
       - secretai_network
 
   vllm:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.23.0
     container_name: vllm-llm
     privileged: true
     runtime: nvidia
