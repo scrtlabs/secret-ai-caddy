@@ -556,26 +556,32 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		}
 	}
 
-	inputTokens := m.countTokens(requestBody, contentType, modelName)
+	// Count input tokens from message text only (not full JSON with metadata).
+	inputContent := extractRequestMessageContent(requestBody)
+	if inputContent == "" {
+		inputContent = requestBody
+	}
+	inputTokens := m.countTokens(inputContent, "text/plain", modelName)
 
 	// Record token counting time
 	if m.metricsCollector != nil {
 		m.metricsCollector.RecordTokenCountTime(time.Since(tokenCountStart))
 	}
 
-	// Inject operator-level LLM defaults (think, num_predict) when not set by client.
-	// This runs AFTER token counting so billing uses the original prompt length,
-	// and BEFORE forwarding so Ollama receives the enriched body.
-	if m.Config != nil && (m.Config.DefaultThink != "" || m.Config.DefaultNumPredict != 0) {
-		injected := injectRequestDefaults(requestBody, contentType,
-			m.Config.DefaultThink, m.Config.DefaultNumPredict)
-		if injected != requestBody {
-			bodyBytes := []byte(injected)
+	// Prepare forwarded body: inject operator defaults + stream_options.include_usage=true.
+	// stream_options injection ensures vLLM returns authoritative usage in the final SSE chunk.
+	// This runs AFTER token counting so input billing uses the original prompt length.
+	{
+		forwarded := requestBody
+		if m.Config != nil && (m.Config.DefaultThink != "" || m.Config.DefaultNumPredict != 0) {
+			forwarded = injectRequestDefaults(forwarded, contentType,
+				m.Config.DefaultThink, m.Config.DefaultNumPredict)
+		}
+		forwarded = injectStreamUsageOption(forwarded, contentType)
+		if forwarded != requestBody {
+			bodyBytes := []byte(forwarded)
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			r.ContentLength = int64(len(bodyBytes))
-			logger.Debug("Injected LLM request defaults",
-				zap.String("default_think", m.Config.DefaultThink),
-				zap.Int("default_num_predict", m.Config.DefaultNumPredict))
 		}
 	}
 
@@ -587,8 +593,26 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 	// Count response tokens
 	responseTokenCountStart := time.Now()
-	responseBody, responseContentType := m.extractResponseBody(wrappedWriter)
-	outputTokens := m.countTokens(responseBody, responseContentType, modelName)
+	responseBody, _ := m.extractResponseBody(wrappedWriter)
+	if modelName == "unknown" {
+		modelName = detectModelFromResponseBody(responseBody)
+	}
+	// Priority 1: authoritative usage from backend (vLLM always provides this for
+	// non-streaming; for streaming it requires stream_options.include_usage=true which
+	// we inject above).
+	var outputTokens int
+	if promptTok, completionTok, ok := extractUsageFromResponse(responseBody); ok {
+		inputTokens = promptTok
+		outputTokens = completionTok
+	} else {
+		// Priority 2: extract only the generated text, then tokenize.
+		// This avoids counting SSE JSON wrappers or response metadata.
+		content := extractResponseContent(responseBody)
+		if content == "" {
+			content = responseBody
+		}
+		outputTokens = m.countTokens(content, "text/plain", modelName)
+	}
 
 	// Record response token counting time
 	if m.metricsCollector != nil {
@@ -1087,10 +1111,21 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 		return m.challengeBuilder.Build402Response(w, balance, m.x402MinBalance)
 	}
 
-	// 7. Count input tokens.
-	// readRequestBody uses the enhanced body handler (may return "" in tests; model is still known).
+	// 7. Count input tokens from message text only (not the full JSON envelope).
 	requestBody, _ := m.readRequestBody(r)
-	inputTokens := m.countTokens(requestBody, contentType, model)
+	inputContent := extractRequestMessageContent(requestBody)
+	if inputContent == "" {
+		inputContent = requestBody
+	}
+	inputTokens := m.countTokens(inputContent, "text/plain", model)
+
+	// Inject stream_options.include_usage=true so vLLM returns authoritative usage counts.
+	forwarded := injectStreamUsageOption(requestBody, contentType)
+	if forwarded != requestBody {
+		bodyBytes := []byte(forwarded)
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		r.ContentLength = int64(len(bodyBytes))
+	}
 
 	// 8. Forward to upstream with response capture
 	tw := NewTokenMeteringResponseWriter(w)
@@ -1098,12 +1133,22 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 		return err
 	}
 
-	// 9. Count output tokens
-	outputTokens := 0
-	if m.tokenCounter != nil {
-		respBody := tw.Body()
-		respContentType := tw.Header().Get("Content-Type")
-		outputTokens = m.tokenCounter.CountTokensWithModel(string(respBody), respContentType, model)
+	// 9. Count output tokens — prefer authoritative usage from backend response,
+	// fall back to extracting generated text and running the tokenizer.
+	respBody := string(tw.Body())
+	if model == "unknown" {
+		model = detectModelFromResponseBody(respBody)
+	}
+	var outputTokens int
+	if promptTok, completionTok, ok := extractUsageFromResponse(respBody); ok {
+		inputTokens = promptTok
+		outputTokens = completionTok
+	} else if m.tokenCounter != nil {
+		content := extractResponseContent(respBody)
+		if content == "" {
+			content = respBody
+		}
+		outputTokens = m.tokenCounter.CountTokensWithModel(content, "text/plain", model)
 	}
 
 	// 10. Report usage to DevPortal (we only reach here for LLM requests with model != "unknown")
@@ -1332,6 +1377,198 @@ func extractAPIKey(authHeader string) string {
 
 	// No recognized prefix - return the header as-is (custom format)
 	return authHeader
+}
+
+// extractUsageFromResponse parses authoritative token counts from the backend response.
+// Works for both non-streaming JSON (usage field at top level) and SSE streaming
+// (usage field in the final chunk, requires stream_options.include_usage=true).
+// Returns (promptTokens, completionTokens, true) when found.
+func extractUsageFromResponse(body string) (promptTokens, completionTokens int, ok bool) {
+	parseUsageObj := func(raw string) (int, int, bool) {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			return 0, 0, false
+		}
+		usage, _ := obj["usage"].(map[string]any)
+		if usage == nil {
+			return 0, 0, false
+		}
+		toInt := func(v any) int {
+			if f, ok := v.(float64); ok {
+				return int(f)
+			}
+			return 0
+		}
+		pt := toInt(usage["prompt_tokens"])
+		ct := toInt(usage["completion_tokens"])
+		if ct == 0 && pt == 0 {
+			return 0, 0, false
+		}
+		return pt, ct, true
+	}
+
+	// Non-streaming: direct JSON
+	if !strings.Contains(body, "\ndata:") && !strings.HasPrefix(body, "data:") {
+		pt, ct, found := parseUsageObj(strings.TrimSpace(body))
+		return pt, ct, found
+	}
+
+	// Streaming SSE: scan every chunk (usage is usually in the last non-[DONE] chunk)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(line[5:])
+		if data == "[DONE]" {
+			continue
+		}
+		if pt, ct, found := parseUsageObj(data); found {
+			return pt, ct, true
+		}
+	}
+	return 0, 0, false
+}
+
+// extractResponseContent extracts the actual generated text from a response body.
+// For SSE streaming: concatenates delta.content from all chunks.
+// For non-streaming JSON: extracts choices[].message.content.
+// Falls back to empty string if neither format is recognized.
+func extractResponseContent(body string) string {
+	var sb strings.Builder
+
+	// SSE streaming
+	if strings.Contains(body, "\ndata:") || strings.HasPrefix(body, "data:") {
+		for _, line := range strings.Split(body, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(line[5:])
+			if data == "[DONE]" {
+				continue
+			}
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(data), &obj); err != nil {
+				continue
+			}
+			choices, _ := obj["choices"].([]any)
+			for _, c := range choices {
+				cm, _ := c.(map[string]any)
+				delta, _ := cm["delta"].(map[string]any)
+				if content, ok := delta["content"].(string); ok {
+					sb.WriteString(content)
+				}
+			}
+		}
+		return sb.String()
+	}
+
+	// Non-streaming JSON
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &obj); err != nil {
+		return ""
+	}
+	choices, _ := obj["choices"].([]any)
+	for _, c := range choices {
+		cm, _ := c.(map[string]any)
+		msg, _ := cm["message"].(map[string]any)
+		if content, ok := msg["content"].(string); ok {
+			sb.WriteString(content)
+		}
+	}
+	return sb.String()
+}
+
+// extractRequestMessageContent extracts plain text from the messages array in a chat
+// completion request. Only text is counted — not JSON structure, tool definitions, etc.
+func extractRequestMessageContent(body string) string {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(body), &obj); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	messages, _ := obj["messages"].([]any)
+	for _, m := range messages {
+		msg, _ := m.(map[string]any)
+		switch content := msg["content"].(type) {
+		case string:
+			sb.WriteString(content)
+			sb.WriteByte('\n')
+		case []any:
+			for _, block := range content {
+				b, _ := block.(map[string]any)
+				if b["type"] == "text" {
+					if text, ok := b["text"].(string); ok {
+						sb.WriteString(text)
+						sb.WriteByte('\n')
+					}
+				}
+			}
+		}
+	}
+	// Include top-level system prompt if present
+	if system, ok := obj["system"].(string); ok {
+		sb.WriteString(system)
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// injectStreamUsageOption adds stream_options.include_usage=true to streaming requests.
+// This ensures vLLM returns authoritative token counts in the final SSE chunk.
+// Only modifies the body when stream=true and include_usage is not already set.
+func injectStreamUsageOption(body, contentType string) string {
+	if body == "" || !strings.Contains(strings.ToLower(contentType), "application/json") {
+		return body
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		return body
+	}
+	isStream, _ := parsed["stream"].(bool)
+	if !isStream {
+		return body
+	}
+	opts, _ := parsed["stream_options"].(map[string]any)
+	if opts == nil {
+		opts = make(map[string]any)
+	}
+	if _, exists := opts["include_usage"]; exists {
+		return body
+	}
+	opts["include_usage"] = true
+	parsed["stream_options"] = opts
+	result, err := json.Marshal(parsed)
+	if err != nil {
+		return body
+	}
+	return string(result)
+}
+
+// detectModelFromResponseBody extracts the model name from a response body.
+// Handles both streaming (SSE) and regular JSON responses.
+func detectModelFromResponseBody(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		var raw string
+		if strings.HasPrefix(line, "data:") {
+			raw = strings.TrimSpace(line[5:])
+			if raw == "[DONE]" {
+				continue
+			}
+		} else if strings.HasPrefix(line, "{") {
+			raw = line
+		} else {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(raw), &obj); err == nil {
+			if m, ok := obj["model"].(string); ok && m != "" {
+				return m
+			}
+		}
+	}
+	return "unknown"
 }
 
 // detectModelFromRequestBody extracts the model name from JSON request body.
