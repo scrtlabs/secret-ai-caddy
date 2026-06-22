@@ -20,7 +20,7 @@ services:
       - secretai_network
 
   caddy:
-    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.17
+    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.18
     container_name: caddy-proxy
     ports:
       - "21434:21434"
