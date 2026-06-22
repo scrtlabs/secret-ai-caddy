@@ -1,6 +1,6 @@
 # =============================================================================
 # SecretAI Docker Compose — JEDI (gpt-oss:120b)
-# vLLM | Caddy v0.1.17
+# vLLM | Caddy v0.1.18
 # =============================================================================
 
 services:
@@ -123,7 +123,7 @@ configs:
       }
 
       :21434 {
-        tls /etc/ssl/certs/secret_vm_fullchain.pem /etc/ssl/private/secret_vm_private.pem
+        tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
 
         @cors_preflight method OPTIONS
         handle @cors_preflight {
