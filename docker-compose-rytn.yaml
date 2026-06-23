@@ -152,7 +152,7 @@ services:
       --port 8000
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.36
-      --max-model-len 12288
+      --max-model-len 8000
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
     healthcheck:
