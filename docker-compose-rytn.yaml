@@ -153,7 +153,7 @@ services:
       --quantization bitsandbytes
       --load-format bitsandbytes
       --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.28
+      --gpu-memory-utilization 0.33
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
     healthcheck:
