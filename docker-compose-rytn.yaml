@@ -201,8 +201,7 @@ services:
       --served-model-name qwq:32b
       --host 0.0.0.0
       --port 8001
-      --quantization awq
-      --kv-cache-dtype fp8
+      --quantization awq_marlin
       --gpu-memory-utilization 0.28
       --max-model-len 32768
       --max-num-batched-tokens 8192
@@ -256,8 +255,7 @@ services:
       --served-model-name qwen3-vl:32b
       --host 0.0.0.0
       --port 8002
-      --quantization awq
-      --kv-cache-dtype fp8
+      --quantization awq_marlin
       --gpu-memory-utilization 0.28
       --max-model-len 16384
       --max-num-batched-tokens 8192
