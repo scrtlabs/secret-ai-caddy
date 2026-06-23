@@ -153,7 +153,8 @@ services:
       --quantization bitsandbytes
       --load-format bitsandbytes
       --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.33
+      --gpu-memory-utilization 0.36
+      --max-model-len 32768
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
     healthcheck:
@@ -206,6 +207,7 @@ services:
       --load-format bitsandbytes
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
+      --max-model-len 32768
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
     healthcheck:
@@ -261,6 +263,7 @@ services:
       --load-format bitsandbytes
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
+      --max-model-len 16384
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
       --limit-mm-per-prompt '{"image": 1}'
