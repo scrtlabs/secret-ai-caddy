@@ -121,7 +121,7 @@ services:
         condition: service_healthy
 
   # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
-  # HF model: cyankiwi/gemma-4-31B-it-AWQ-4bit
+  # HF model: QuantTrio/gemma-4-31B-it-AWQ
   vllm-gemma:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-gemma
@@ -146,7 +146,7 @@ services:
     volumes:
       - /mnt/secure/.vllm-gemma:/root/.cache/huggingface
     command: >
-      --model cyankiwi/gemma-4-31B-it-AWQ-4bit
+      --model QuantTrio/gemma-4-31B-it-AWQ
       --served-model-name gemma4:31b
       --host 0.0.0.0
       --port 8000
