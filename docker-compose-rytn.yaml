@@ -201,9 +201,9 @@ services:
       --served-model-name qwq:32b
       --host 0.0.0.0
       --port 8001
-      --quantization awq_marlin
+      --quantization awq
       --gpu-memory-utilization 0.28
-      --max-model-len 32768
+      --max-model-len 8192
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
     healthcheck:
@@ -255,9 +255,9 @@ services:
       --served-model-name qwen3-vl:32b
       --host 0.0.0.0
       --port 8002
-      --quantization awq_marlin
+      --quantization awq
       --gpu-memory-utilization 0.28
-      --max-model-len 16384
+      --max-model-len 8192
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
       --limit-mm-per-prompt '{"image": 1}'
