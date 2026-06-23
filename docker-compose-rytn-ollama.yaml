@@ -1,0 +1,594 @@
+# =============================================================================
+# SecretAI Docker Compose — RYTN (Ollama archive)
+# Ollama 0.24.0 | Caddy v0.1.16 | gemma4:31b + qwq:32b + qwen3-vl:32b
+# Fetched verbatim from https://secretai-rytn.scrtlabs.com:29343/docker-compose
+# =============================================================================
+
+x-gpu: &gpu
+  gpus: all   # or: "device=0" to pin a specific GPU
+
+services:
+
+  init:
+    image: alpine:latest
+    container_name: sys-init
+    volumes:
+      - /mnt/secure:/workdir
+    command: >
+      sh -c "
+        mkdir -p /workdir/stt-models &&
+        mkdir -p /workdir/stt-logs &&
+        mkdir -p /workdir/tts-data/hf &&
+        mkdir -p /workdir/tts-data/cache &&
+        mkdir -p /workdir/tts-models &&
+        mkdir -p /workdir/tts-logs &&
+        chmod -R 777 /workdir/tts-logs /workdir/tts-models /workdir/tts-data /workdir/stt-logs /workdir/stt-models
+      "
+    restart: "no"
+    networks:
+      - secretai_network
+
+  caddy:
+    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.16
+    container_name: caddy-proxy
+
+    ports:
+      - "21434:21434"  # HTTPS entry point into Ollama
+      - "25436:25436"  # HTTPS entry point into STT
+      - "25435:25435"  # HTTPS entry point into TTS
+      - "18800:18800"  # HTTPS entry point into Solidity LLM
+
+    volumes:
+      - /mnt/secure/app_cert:/etc/ssl/certs:ro
+      - /mnt/secure/app_cert:/etc/ssl/private:ro
+      - /mnt/secure/caddy-data:/data
+
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+
+    env_file:
+      - usr/.env
+
+    environment:
+      - SKIP_SSL_VALIDATION=true
+      - SECRET_CHAIN_ID=secret-4
+      - SECRET_CONTRACT=secret18xpp2kmkk7g8xzx24wm5zstw9tjv6g3xle2vjm
+      - METERING=1
+      - METERING_INTERVAL=1m
+      - METERING_URL=https://secretai.scrtlabs.com
+      - BLOCK_URLS=21434/api/pull
+
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+
+    user: root
+
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+    networks:
+      - secretai_network
+
+  ollama-init:
+    image: alpine:latest
+    container_name: ollama-llm-init
+
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+    volumes:
+      - /mnt/secure/.ollama:/root/.ollama
+
+    command: >
+      sh -c "
+        set -e
+
+        # Install curl if not present
+        apk add --no-cache curl jq 2>/dev/null || true
+
+        # Define models to pull and load
+        MODELS='gemma4:31b qwq:32b qwen3-vl:32b'
+
+        echo '============================================'
+        echo 'Starting Ollama Model Management'
+        echo '============================================'
+
+        # Get list of existing models
+        echo 'Fetching currently available models...'
+        EXISTING_MODELS=$$(curl -s http://ollama:11434/api/tags | grep -o '\"name\":\"[^\"]*\"' | cut -d'\"' -f4 || echo '')
+        echo \"Current models: $$EXISTING_MODELS\"
+        echo ''
+
+        # Pull missing models
+        echo '============================================'
+        echo 'Checking and pulling missing models'
+        echo '============================================'
+        for MODEL in $$MODELS; do
+          echo \"Checking model: $$MODEL\"
+          if echo \"$$EXISTING_MODELS\" | grep -q \"$$MODEL\"; then
+            echo \"  ✓ Model $$MODEL already exists, skipping pull\"
+          else
+            echo \"  → Pulling model: $$MODEL\"
+            curl -X POST http://ollama:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\": \"'\"$$MODEL\"'\"}' --progress-bar
+            echo \"  ✓ Pull request sent for $$MODEL\"
+          fi
+          echo ''
+        done
+
+        # Wait for all pulls to complete
+        echo '============================================'
+        echo 'Waiting for all pulls to complete...'
+        echo '============================================'
+        sleep 5
+
+        echo '=== Patching num_ctx=16384 via Modelfile ==='
+        for MODEL in $$MODELS; do
+          echo \"  → Patching $$MODEL\"
+          curl -s -X POST http://ollama:11434/api/create \
+            -H 'Content-Type: application/json' \
+            -d '{\"name\": \"'\"$$MODEL\"'\", \"modelfile\": \"FROM '\"$$MODEL\"'\nPARAMETER num_ctx 16384\", \"stream\": false}' \
+            | grep -o '\"status\":\"[^\"]*\"' | tail -1
+          echo \"  ✓ $$MODEL patched\"
+        done
+
+        # Load/warm up each model
+        echo '============================================'
+        echo 'Loading and warming up models'
+        echo '============================================'
+        for MODEL in $$MODELS; do
+          echo \"Loading model: $$MODEL\"
+          RESPONSE=$$(curl -s -X POST http://ollama:11434/api/generate -H 'Content-Type: application/json' -d '{\"model\": \"'\"$$MODEL\"'\", \"prompt\": \"Hello\", \"stream\": false}' || echo 'error')
+
+          if echo \"$$RESPONSE\" | grep -q 'error'; then
+            echo \"  ✗ Failed to load $$MODEL\"
+          else
+            echo \"  ✓ Model $$MODEL loaded successfully\"
+          fi
+          echo ''
+        done
+
+        # Display final status
+        echo '============================================'
+        echo 'Final Model Status'
+        echo '============================================'
+        curl -s http://ollama:11434/api/tags | grep -o '\"name\":\"[^\"]*\"' | cut -d'\"' -f4 | while read -r model; do
+          echo \"  • $$model\"
+        done
+
+        echo ''
+        echo '============================================'
+        echo 'Model management completed successfully!'
+        echo '============================================'
+      "
+    restart: "no"
+    networks:
+      - secretai_network
+
+  ollama:
+    image: ollama/ollama:0.24.0
+    container_name: ollama-llm
+    privileged: true
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 160G
+
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_MAX_LOADED_MODELS=5
+      - OLLAMA_DEBUG=1
+      - OLLAMA_LOAD_TIMEOUT=600
+
+    volumes:
+      - /mnt/secure/.ollama:/root/.ollama
+
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    networks:
+      - secretai_network
+
+  stt_service:
+    image: ghcr.io/scrtlabs/secret-ai-stt-tts:v0.0.8
+    container_name: secretai-stt-service
+    privileged: true
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WHISPER_MODEL=large-v3
+      - WHISPER_COMPUTE_TYPE=float16
+      - WHISPER_DEVICE=cuda
+      - CHUNK_DURATION=2.0
+      - SAMPLE_RATE=16000
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+        limits:
+          memory: 4G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    volumes:
+      - /mnt/secure/stt-models:/app/models
+      - /mnt/secure/stt-logs:/app/logs
+    networks:
+      - secretai_network
+    labels:
+      - "com.secretai.service=stt"
+      - "com.secretai.version=1.1.0"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  tts_service:
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+    container_name: secretai-kokoro-tts
+    restart: unless-stopped
+
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      HF_HOME: /data/hf
+      TRANSFORMERS_CACHE: /data/hf/transformers
+      XDG_CACHE_HOME: /data/.cache
+      PORT: "8880"
+      PYTHONUNBUFFERED: "1"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+        limits:
+          memory: 4G
+
+    volumes:
+      - /mnt/secure/tts-data/hf:/data/hf
+      - /mnt/secure/tts-data/cache:/data/.cache
+      - /mnt/secure/tts-models:/models
+      - /mnt/secure/tts-logs:/app/logs
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8880/v1/test"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - secretai_network
+
+    labels:
+      - "com.secretai.service=tts"
+      - "com.secretai.provider=kokoro"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+networks:
+  secretai_network:
+    driver: bridge
+    name: secretai_network
+
+volumes:
+  tgi-models:
+    driver: local
+
+configs:
+  caddyfile:
+    content: |
+      {
+              debug
+              order secret_reverse_proxy first
+              log {
+                      output stdout
+                      format console
+                      level DEBUG
+              }
+      }
+
+      :25436 {
+              tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
+
+              @cors_preflight method OPTIONS
+              handle @cors_preflight {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Max-Age "86400"
+                              Vary "Origin"
+                      }
+                      respond "" 204
+              }
+
+              handle {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Expose-Headers "*"
+                              Vary "Origin"
+                      }
+
+                      secret_reverse_proxy {
+                              API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+                              secret_node {env.SECRET_NODE}
+                              contract_address {env.SECRET_CONTRACT}
+                              secret_chain_id {env.SECRET_CHAIN_ID}
+                              metering {env.METERING}
+                              metering_interval {env.METERING_INTERVAL}
+                              metering_url {env.METERING_URL}
+                              max_body_size 2097152
+                              token_counting_mode accurate
+                              max_retries 5
+                              retry_backoff 300s
+                              enable_metrics true
+                              metrics_path /metrics
+                      }
+
+                      reverse_proxy secretai-stt-service:8001 {
+                              health_uri /healthz
+                              health_interval 30s
+                              health_timeout 10s
+                              header_up Host {host}
+                              header_up X-Real-IP {remote_host}
+                              header_up X-Forwarded-Port {server_port}
+                      }
+              }
+
+              handle_errors {
+                      @502 expression {http.error.status_code} == 502
+                      @503 expression {http.error.status_code} == 503
+                      @504 expression {http.error.status_code} == 504
+                      respond @502 "Service temporarily unavailable - secretai-stt-service not ready" 502
+                      respond @503 "Service temporarily unavailable - please try again" 503
+                      respond @504 "Service timeout - request took too long" 504
+              }
+      }
+
+      :25435 {
+              tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
+
+              @cors_preflight method OPTIONS
+              handle @cors_preflight {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Max-Age "86400"
+                              Vary "Origin"
+                      }
+                      respond "" 204
+              }
+
+              handle {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Expose-Headers "*"
+                              Vary "Origin"
+                      }
+
+                      secret_reverse_proxy {
+                              API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+                              secret_node {env.SECRET_NODE}
+                              contract_address {env.SECRET_CONTRACT}
+                              secret_chain_id {env.SECRET_CHAIN_ID}
+                              metering {env.METERING}
+                              metering_interval {env.METERING_INTERVAL}
+                              metering_url {env.METERING_URL}
+                              max_body_size 2097152
+                              token_counting_mode accurate
+                              max_retries 5
+                              retry_backoff 300s
+                              enable_metrics true
+                              metrics_path /metrics
+                      }
+
+                      reverse_proxy secretai-kokoro-tts:8880 {
+                              health_uri /v1/test
+                              health_interval 30s
+                              health_timeout 10s
+                              header_up Host {host}
+                              header_up X-Real-IP {remote_host}
+                              header_up X-Forwarded-Port {server_port}
+                      }
+              }
+
+              handle_errors {
+                      @502 expression {http.error.status_code} == 502
+                      @503 expression {http.error.status_code} == 503
+                      @504 expression {http.error.status_code} == 504
+                      respond @502 "Service temporarily unavailable - secretai-kokoro-tts not ready" 502
+                      respond @503 "Service temporarily unavailable - please try again" 503
+                      respond @504 "Service timeout - request took too long" 504
+              }
+      }
+
+      :21434 {
+              tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
+
+              @cors_preflight method OPTIONS
+              handle @cors_preflight {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Max-Age "86400"
+                              Vary "Origin"
+                      }
+                      respond "" 204
+              }
+
+              handle {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Expose-Headers "*"
+                              Vary "Origin"
+                      }
+
+                      secret_reverse_proxy {
+                              API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+                              secret_node {env.SECRET_NODE}
+                              contract_address {env.SECRET_CONTRACT}
+                              secret_chain_id {env.SECRET_CHAIN_ID}
+                              metering {env.METERING}
+                              metering_interval {env.METERING_INTERVAL}
+                              metering_url {env.METERING_URL}
+                              max_body_size 2097152
+                              token_counting_mode accurate
+                              max_retries 5
+                              retry_backoff 300s
+                              enable_metrics true
+                              metrics_path /metrics
+                      }
+
+                      reverse_proxy ollama-llm:11434 {
+                              health_uri /
+                              health_interval 30s
+                              health_timeout 10s
+                              header_up Host {host}
+                              header_up X-Real-IP {remote_host}
+                              header_up X-Forwarded-Port {server_port}
+                      }
+              }
+
+              handle_errors {
+                      @502 expression {http.error.status_code} == 502
+                      @503 expression {http.error.status_code} == 503
+                      @504 expression {http.error.status_code} == 504
+                      respond @502 "Service temporarily unavailable - ollama-llm not ready" 502
+                      respond @503 "Service temporarily unavailable - please try again" 503
+                      respond @504 "Service timeout - request took too long" 504
+              }
+      }
+
+      https://:18800 {
+              tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
+
+              @cors_preflight method OPTIONS
+              handle @cors_preflight {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Max-Age "86400"
+                              Vary "Origin"
+                      }
+                      respond "" 204
+              }
+
+              handle {
+                      @has_origin header Origin *
+                      header @has_origin {
+                              Access-Control-Allow-Origin {header.origin}
+                              Access-Control-Allow-Credentials "true"
+                              Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With"
+                              Access-Control-Expose-Headers "*"
+                              Vary "Origin"
+                      }
+
+                      secret_reverse_proxy {
+                              API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
+                              secret_node {env.SECRET_NODE}
+                              contract_address {env.SECRET_CONTRACT}
+                              secret_chain_id {env.SECRET_CHAIN_ID}
+                              metering {env.METERING}
+                              metering_interval {env.METERING_INTERVAL}
+                              metering_url {env.METERING_URL}
+                              max_body_size 2097152
+                              token_counting_mode accurate
+                              max_retries 5
+                              retry_backoff 300s
+                              enable_metrics true
+                              metrics_path /metrics
+                      }
+
+                      route {
+                              handle_path /generate* {
+                                      reverse_proxy tgi:80
+                              }
+                              handle_path /generate_stream* {
+                                      reverse_proxy tgi:80
+                              }
+                              handle_path /tokenize* {
+                                      reverse_proxy tgi:80
+                              }
+                              handle_path /v1/* {
+                                      reverse_proxy tgi:80
+                              }
+                              handle_path /metrics {
+                                      reverse_proxy tgi:80
+                              }
+                      }
+              }
+
+              handle_errors {
+                      @502 expression {http.error.status_code} == 502
+                      @503 expression {http.error.status_code} == 503
+                      @504 expression {http.error.status_code} == 504
+                      respond @502 "Service temporarily unavailable - tgi not ready" 502
+                      respond @503 "Service temporarily unavailable - please try again" 503
+                      respond @504 "Service timeout - request took too long" 504
+              }
+      }

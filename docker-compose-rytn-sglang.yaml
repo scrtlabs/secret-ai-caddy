@@ -1,26 +1,32 @@
 # =============================================================================
-# SecretAI Docker Compose — RYTN (vLLM)
-# vLLM v0.23.0 | Caddy v0.1.18 | LiteLLM router
-# Models: gemma4:31b + qwq:32b + qwen3-vl:32b (AWQ int4)
+# SecretAI Docker Compose — RYTN (SGLang)
+# SGLang latest | Caddy v0.1.18 | LiteLLM router
+# Models: gemma4:31b + qwq:32b + qwen3-vl:32b (bitsandbytes int4)
 #
 # Architecture:
-#   Caddy :21434 -> LiteLLM :4000 --> vllm-gemma   :8000  (gemma4:31b)
-#                                 --> vllm-qwq      :8001  (qwq:32b)
-#                                 --> vllm-qwen3vl  :8002  (qwen3-vl:32b)
+#   Caddy :21434 -> LiteLLM :4000 --> sglang-gemma   :8000  (gemma4:31b)
+#                                 --> sglang-qwq      :8001  (qwq:32b)
+#                                 --> sglang-qwen3vl  :8002  (qwen3-vl:32b)
+#
+# SGLang vs vLLM:
+#   + RadixAttention: KV cache reuse across requests with shared prefixes
+#   + Better throughput for multi-turn chat (common prefix cached)
+#   + Faster TTFT on repeated system prompts
+#   - bitsandbytes support less tested than in vLLM
+#
+# Per-model notes (from docs/model cards):
+#   gemma4:31b   Multimodal arch → requires triton attention backend + no cuda-graph
+#   qwq:32b      Standard text model, no special flags needed
+#   qwen3-vl:32b VLM, max_pixels=1048576 (1024×1024) limits image memory
 #
 # VRAM budget H100 80GB:
-#   gemma4:31b   AWQ int4 ~16GB + KV -> 22.4GB (28% alloc)
-#   qwq:32b      AWQ int4 ~16GB + KV -> 22.4GB (28% alloc)
-#   qwen3-vl:32b AWQ int4 ~16GB + KV -> 22.4GB (28% alloc)
-#   STT (Whisper large-v3)           ~  3GB
-#   TTS (Kokoro)                     ~  2GB
+#   gemma4:31b   bitsandbytes int4 ~16GB + KV -> 22.4GB (28% alloc)
+#   qwq:32b      bitsandbytes int4 ~16GB + KV -> 22.4GB (28% alloc)
+#   qwen3-vl:32b bitsandbytes int4 ~16GB + KV -> 22.4GB (28% alloc)
+#   STT (Whisper large-v3)                    ~  3GB
+#   TTS (Kokoro)                              ~  2GB
 #   -----------------------------------------
-#   Total                            ~72GB < 80GB
-#
-# AWQ checkpoints:
-#   gemma4:31b:  google/gemma-4-31B-it       (official, bitsandbytes int4)
-#   qwq:32b:     Qwen/QwQ-32B               (official, bitsandbytes int4)
-#   qwen3-vl:32b Qwen/Qwen3-VL-32B-Instruct (official, bitsandbytes int4)
+#   Total                                     ~72GB < 80GB
 #
 # Port 18800 (TGI Solidity LLM) is a separate deployment; Caddy routes only.
 # =============================================================================
@@ -40,9 +46,9 @@ services:
         mkdir -p /workdir/tts-data/cache &&
         mkdir -p /workdir/tts-models &&
         mkdir -p /workdir/tts-logs &&
-        mkdir -p /workdir/.vllm-gemma &&
-        mkdir -p /workdir/.vllm-qwq &&
-        mkdir -p /workdir/.vllm-qwen3vl &&
+        mkdir -p /workdir/.sglang-gemma &&
+        mkdir -p /workdir/.sglang-qwq &&
+        mkdir -p /workdir/.sglang-qwen3vl &&
         mkdir -p /workdir/caddy-data &&
         chmod -R 777 /workdir/tts-logs /workdir/tts-models /workdir/tts-data /workdir/stt-logs /workdir/stt-models
       "
@@ -113,15 +119,15 @@ services:
     networks:
       - secretai_network
     depends_on:
-      - vllm-gemma
-      - vllm-qwq
-      - vllm-qwen3vl
+      - sglang-gemma
+      - sglang-qwq
+      - sglang-qwen3vl
 
-  # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
+  # ── SGLang: gemma4:31b ────────────────────────────────────────────────────
   # HF model: google/gemma-4-31B-it
-  vllm-gemma:
-    image: vllm/vllm-openai:v0.23.0
-    container_name: vllm-gemma
+  sglang-gemma:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-gemma
     privileged: true
     runtime: nvidia
     ipc: host
@@ -141,20 +147,23 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
     volumes:
-      - /mnt/secure/.vllm-gemma:/root/.cache/huggingface
+      - /mnt/secure/.sglang-gemma:/root/.cache/huggingface
     command: >
-      --model google/gemma-4-31B-it
+      python -m sglang.launch_server
+      --model-path google/gemma-4-31B-it
       --served-model-name gemma4:31b
       --host 0.0.0.0
       --port 8000
+      --tp 1
+      --mem-fraction-static 0.28
       --quantization bitsandbytes
-      --load-format bitsandbytes
-      --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.28
-      --max-num-batched-tokens 8192
-      --tensor-parallel-size 1
+      --kv-cache-dtype fp8_e4m3
+      --attention-backend triton
+      --disable-cuda-graph
+      --chunked-prefill-size -1
+      --enable-metrics
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 120s
       start_period: 600s
@@ -168,11 +177,11 @@ services:
     networks:
       - secretai_network
 
-  # ── vLLM: qwq:32b ─────────────────────────────────────────────────────────
+  # ── SGLang: qwq:32b ───────────────────────────────────────────────────────
   # HF model: Qwen/QwQ-32B
-  vllm-qwq:
-    image: vllm/vllm-openai:v0.23.0
-    container_name: vllm-qwq
+  sglang-qwq:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-qwq
     privileged: true
     runtime: nvidia
     ipc: host
@@ -192,20 +201,21 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
     volumes:
-      - /mnt/secure/.vllm-qwq:/root/.cache/huggingface
+      - /mnt/secure/.sglang-qwq:/root/.cache/huggingface
     command: >
-      --model Qwen/QwQ-32B
+      python -m sglang.launch_server
+      --model-path Qwen/QwQ-32B
       --served-model-name qwq:32b
       --host 0.0.0.0
       --port 8001
+      --tp 1
+      --mem-fraction-static 0.28
       --quantization bitsandbytes
-      --load-format bitsandbytes
-      --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.28
-      --max-num-batched-tokens 8192
-      --tensor-parallel-size 1
+      --kv-cache-dtype fp8_e4m3
+      --chunked-prefill-size 4096
+      --enable-metrics
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/v1/models"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
       timeout: 120s
       start_period: 600s
@@ -219,12 +229,11 @@ services:
     networks:
       - secretai_network
 
-  # ── vLLM: qwen3-vl:32b (Vision Language Model) ───────────────────────────
+  # ── SGLang: qwen3-vl:32b (Vision Language Model) ─────────────────────────
   # HF model: Qwen/Qwen3-VL-32B-Instruct
-  # VLM: --limit-mm-per-prompt image=1 (1 image per request)
-  vllm-qwen3vl:
-    image: vllm/vllm-openai:v0.23.0
-    container_name: vllm-qwen3vl
+  sglang-qwen3vl:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-qwen3vl
     privileged: true
     runtime: nvidia
     ipc: host
@@ -244,21 +253,22 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
     volumes:
-      - /mnt/secure/.vllm-qwen3vl:/root/.cache/huggingface
+      - /mnt/secure/.sglang-qwen3vl:/root/.cache/huggingface
     command: >
-      --model Qwen/Qwen3-VL-32B-Instruct
+      python -m sglang.launch_server
+      --model-path Qwen/Qwen3-VL-32B-Instruct
       --served-model-name qwen3-vl:32b
       --host 0.0.0.0
       --port 8002
+      --tp 1
+      --mem-fraction-static 0.28
       --quantization bitsandbytes
-      --load-format bitsandbytes
-      --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.28
-      --max-num-batched-tokens 8192
-      --tensor-parallel-size 1
-      --limit-mm-per-prompt image=1
+      --kv-cache-dtype fp8_e4m3
+      --chunked-prefill-size 4096
+      --mm-process-config '{"image":{"max_pixels":1048576}}'
+      --enable-metrics
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/v1/models"]
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 30s
       timeout: 120s
       start_period: 600s
@@ -362,17 +372,17 @@ configs:
         - model_name: gemma4:31b
           litellm_params:
             model: openai/gemma4:31b
-            api_base: http://vllm-gemma:8000/v1
+            api_base: http://sglang-gemma:8000/v1
             api_key: "dummy"
         - model_name: qwq:32b
           litellm_params:
             model: openai/qwq:32b
-            api_base: http://vllm-qwq:8001/v1
+            api_base: http://sglang-qwq:8001/v1
             api_key: "dummy"
         - model_name: qwen3-vl:32b
           litellm_params:
             model: openai/qwen3-vl:32b
-            api_base: http://vllm-qwen3vl:8002/v1
+            api_base: http://sglang-qwen3vl:8002/v1
             api_key: "dummy"
 
       litellm_settings:
