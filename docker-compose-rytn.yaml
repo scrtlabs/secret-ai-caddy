@@ -172,7 +172,7 @@ services:
 
   # ── vLLM: qwq:32b ─────────────────────────────────────────────────────────
   # Starts after gemma is healthy to avoid GPU memory profiling conflicts
-  # HF model: Qwen/QwQ-32B (bitsandbytes int4; AWQ locks to fp16 which breaks FA3+fp8kv)
+  # HF model: Qwen/QwQ-32B-AWQ (AWQ fp16 + fp8 KV; force TRITON_ATTN to bypass FA3 BF16 requirement)
   vllm-qwq:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-qwq
@@ -194,16 +194,15 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
+      - VLLM_ATTENTION_BACKEND=TRITON_ATTN
     volumes:
       - /mnt/secure/.vllm-qwq:/root/.cache/huggingface
     command: >
-      --model Qwen/QwQ-32B
+      --model Qwen/QwQ-32B-AWQ
       --served-model-name qwq:32b
       --host 0.0.0.0
       --port 8001
-      --quantization bitsandbytes
-      --load-format bitsandbytes
-      --dtype bfloat16
+      --quantization awq
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
       --max-model-len 8192
@@ -251,6 +250,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
+      - VLLM_ATTENTION_BACKEND=TRITON_ATTN
     volumes:
       - /mnt/secure/.vllm-qwen3vl:/root/.cache/huggingface
     command: >
@@ -259,7 +259,6 @@ services:
       --host 0.0.0.0
       --port 8002
       --quantization awq
-      --dtype bfloat16
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
       --max-model-len 8192
