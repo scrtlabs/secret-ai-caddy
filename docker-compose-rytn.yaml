@@ -172,7 +172,7 @@ services:
 
   # ── vLLM: qwq:32b ─────────────────────────────────────────────────────────
   # Starts after gemma is healthy to avoid GPU memory profiling conflicts
-  # HF model: Qwen/QwQ-32B-AWQ (official)
+  # HF model: Qwen/QwQ-32B (bitsandbytes int4; AWQ locks to fp16 which breaks FA3+fp8kv)
   vllm-qwq:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-qwq
@@ -197,11 +197,12 @@ services:
     volumes:
       - /mnt/secure/.vllm-qwq:/root/.cache/huggingface
     command: >
-      --model Qwen/QwQ-32B-AWQ
+      --model Qwen/QwQ-32B
       --served-model-name qwq:32b
       --host 0.0.0.0
       --port 8001
-      --quantization awq
+      --quantization bitsandbytes
+      --load-format bitsandbytes
       --dtype bfloat16
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
