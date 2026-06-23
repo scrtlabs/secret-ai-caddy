@@ -113,9 +113,12 @@ services:
     networks:
       - secretai_network
     depends_on:
-      - vllm-gemma
-      - vllm-qwq
-      - vllm-qwen3vl
+      vllm-gemma:
+        condition: service_healthy
+      vllm-qwq:
+        condition: service_healthy
+      vllm-qwen3vl:
+        condition: service_healthy
 
   # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
   # HF model: google/gemma-4-31B-it
@@ -169,6 +172,7 @@ services:
       - secretai_network
 
   # ── vLLM: qwq:32b ─────────────────────────────────────────────────────────
+  # Starts after gemma is healthy to avoid GPU memory profiling conflicts
   # HF model: Qwen/QwQ-32B
   vllm-qwq:
     image: vllm/vllm-openai:v0.23.0
@@ -218,6 +222,9 @@ services:
         max-file: "3"
     networks:
       - secretai_network
+    depends_on:
+      vllm-gemma:
+        condition: service_healthy
 
   # ── vLLM: qwen3-vl:32b (Vision Language Model) ───────────────────────────
   # HF model: Qwen/Qwen3-VL-32B-Instruct
@@ -256,7 +263,7 @@ services:
       --gpu-memory-utilization 0.28
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
-      --limit-mm-per-prompt image=1
+      --limit-mm-per-prompt '{"image": 1}'
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/v1/models"]
       interval: 30s
@@ -271,6 +278,9 @@ services:
         max-file: "3"
     networks:
       - secretai_network
+    depends_on:
+      vllm-qwq:
+        condition: service_healthy
 
   stt_service:
     image: ghcr.io/scrtlabs/secret-ai-stt-tts:v0.0.8
