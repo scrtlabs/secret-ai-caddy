@@ -121,7 +121,7 @@ services:
         condition: service_healthy
 
   # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
-  # HF model: QuantTrio/gemma-4-31B-it-AWQ
+  # HF model: cyankiwi/gemma-4-31B-it-AWQ-4bit (compressed-tensors format)
   vllm-gemma:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-gemma
@@ -146,11 +146,11 @@ services:
     volumes:
       - /mnt/secure/.vllm-gemma:/root/.cache/huggingface
     command: >
-      --model QuantTrio/gemma-4-31B-it-AWQ
+      --model cyankiwi/gemma-4-31B-it-AWQ-4bit
       --served-model-name gemma4:31b
       --host 0.0.0.0
       --port 8000
-      --quantization awq
+      --quantization compressed_tensors
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.36
       --max-model-len 12288
