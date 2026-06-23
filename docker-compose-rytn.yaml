@@ -150,7 +150,6 @@ services:
       --served-model-name gemma4:31b
       --host 0.0.0.0
       --port 8000
-      --quantization compressed_tensors
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.36
       --max-model-len 12288
