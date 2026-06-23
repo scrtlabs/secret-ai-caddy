@@ -202,6 +202,8 @@ services:
       --host 0.0.0.0
       --port 8001
       --quantization awq
+      --dtype bfloat16
+      --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
       --max-model-len 8192
       --max-num-batched-tokens 8192
@@ -256,6 +258,8 @@ services:
       --host 0.0.0.0
       --port 8002
       --quantization awq
+      --dtype bfloat16
+      --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
       --max-model-len 8192
       --max-num-batched-tokens 8192
