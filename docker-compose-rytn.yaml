@@ -121,7 +121,7 @@ services:
         condition: service_healthy
 
   # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
-  # HF model: google/gemma-4-31B-it
+  # HF model: cyankiwi/gemma-4-31B-it-AWQ-4bit
   vllm-gemma:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-gemma
@@ -146,15 +146,14 @@ services:
     volumes:
       - /mnt/secure/.vllm-gemma:/root/.cache/huggingface
     command: >
-      --model google/gemma-4-31B-it
+      --model cyankiwi/gemma-4-31B-it-AWQ-4bit
       --served-model-name gemma4:31b
       --host 0.0.0.0
       --port 8000
-      --quantization bitsandbytes
-      --load-format bitsandbytes
+      --quantization awq
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.36
-      --max-model-len 32768
+      --max-model-len 12288
       --max-num-batched-tokens 8192
       --tensor-parallel-size 1
     healthcheck:
@@ -174,7 +173,7 @@ services:
 
   # ── vLLM: qwq:32b ─────────────────────────────────────────────────────────
   # Starts after gemma is healthy to avoid GPU memory profiling conflicts
-  # HF model: Qwen/QwQ-32B
+  # HF model: Qwen/QwQ-32B-AWQ (official)
   vllm-qwq:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-qwq
@@ -199,12 +198,11 @@ services:
     volumes:
       - /mnt/secure/.vllm-qwq:/root/.cache/huggingface
     command: >
-      --model Qwen/QwQ-32B
+      --model Qwen/QwQ-32B-AWQ
       --served-model-name qwq:32b
       --host 0.0.0.0
       --port 8001
-      --quantization bitsandbytes
-      --load-format bitsandbytes
+      --quantization awq
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
       --max-model-len 32768
@@ -229,7 +227,7 @@ services:
         condition: service_healthy
 
   # ── vLLM: qwen3-vl:32b (Vision Language Model) ───────────────────────────
-  # HF model: Qwen/Qwen3-VL-32B-Instruct
+  # HF model: QuantTrio/Qwen3-VL-32B-Instruct-AWQ
   # VLM: --limit-mm-per-prompt image=1 (1 image per request)
   vllm-qwen3vl:
     image: vllm/vllm-openai:v0.23.0
@@ -255,12 +253,11 @@ services:
     volumes:
       - /mnt/secure/.vllm-qwen3vl:/root/.cache/huggingface
     command: >
-      --model Qwen/Qwen3-VL-32B-Instruct
+      --model QuantTrio/Qwen3-VL-32B-Instruct-AWQ
       --served-model-name qwen3-vl:32b
       --host 0.0.0.0
       --port 8002
-      --quantization bitsandbytes
-      --load-format bitsandbytes
+      --quantization awq
       --kv-cache-dtype fp8
       --gpu-memory-utilization 0.28
       --max-model-len 16384
