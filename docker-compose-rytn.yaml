@@ -134,7 +134,7 @@ services:
       --port 8000
       --kv-cache-dtype fp8
       --enable-prefix-caching
-      --gpu-memory-utilization 0.47
+      --gpu-memory-utilization 0.42
       --max-model-len 16384
       --max-num-batched-tokens 16384
       --tensor-parallel-size 1
@@ -190,8 +190,8 @@ services:
       --kv-cache-dtype fp8
       --enable-prefix-caching
       --gpu-memory-utilization 0.47
-      --max-model-len 16384
-      --max-num-batched-tokens 16384
+      --max-model-len 8192
+      --max-num-batched-tokens 8192
       --tensor-parallel-size 1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/v1/models"]
