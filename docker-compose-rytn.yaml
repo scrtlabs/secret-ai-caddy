@@ -74,14 +74,13 @@ services:
     networks:
       - secretai_network
 
-  # ── LiteLLM router: single OpenAI-compatible endpoint for all models ────
+  # ── llm-router: transparent FastAPI proxy, routes by model name ─────────
+  # Pass-through: response fields (prompt_tokens_details, cached_tokens, etc.)
+  # are forwarded unchanged from vLLM without normalization.
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    build: ./llm-router
+    image: secret-ai-llm-router:latest
     container_name: litellm-router
-    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "4"]
-    configs:
-      - source: litellm_config
-        target: /etc/litellm/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
       interval: 30s
@@ -218,25 +217,6 @@ networks:
     name: secretai_network
 
 configs:
-  litellm_config:
-    content: |
-      model_list:
-        - model_name: gemma4:31b
-          litellm_params:
-            model: openai/gemma4:31b
-            api_base: http://vllm-gemma:8000/v1
-            api_key: "dummy"
-        - model_name: qwen3.6:27b
-          litellm_params:
-            model: openai/qwen3.6:27b
-            api_base: http://vllm-qwen36:8001/v1
-            api_key: "dummy"
-
-      litellm_settings:
-        drop_params: true
-        set_verbose: false
-        request_timeout: 600
-
   caddyfile:
     content: |
       {
