@@ -1,26 +1,20 @@
 # =============================================================================
 # SecretAI Docker Compose — RYTN (vLLM)
 # vLLM v0.23.0 | Caddy v0.1.18 | LiteLLM router
-# Models: gemma4:31b + qwq:32b + qwen3-vl:32b (AWQ int4)
+# Models: gemma4:31b + qwen3.6:27b (AWQ / bitsandbytes int4)
 #
 # Architecture:
-#   Caddy :21434 -> LiteLLM :4000 --> vllm-gemma   :8000  (gemma4:31b)
-#                                 --> vllm-qwq      :8001  (qwq:32b)
-#                                 --> vllm-qwen3vl  :8002  (qwen3-vl:32b)
+#   Caddy :21434 -> LiteLLM :4000 --> vllm-gemma  :8000  (gemma4:31b)
+#                                 --> vllm-qwen36  :8001  (qwen3.6:27b)
 #
 # VRAM budget H100 80GB:
-#   gemma4:31b   AWQ int4 ~16GB + KV -> 22.4GB (28% alloc)
-#   qwq:32b      AWQ int4 ~16GB + KV -> 22.4GB (28% alloc)
-#   qwen3-vl:32b AWQ int4 ~16GB + KV -> 22.4GB (28% alloc)
-#   STT (Whisper large-v3)           ~  3GB
-#   TTS (Kokoro)                     ~  2GB
+#   gemma4:31b   AWQ compressed-tensors ~14GB + KV fp8 -> 37.6GB (47% alloc)
+#   qwen3.6:27b  bitsandbytes int4      ~15GB + KV fp8 -> 37.6GB (47% alloc)
 #   -----------------------------------------
-#   Total                            ~72GB < 80GB
+#   Total                                              ~75.2GB < 80GB
 #
-# AWQ checkpoints:
-#   gemma4:31b:  google/gemma-4-31B-it       (official, bitsandbytes int4)
-#   qwq:32b:     Qwen/QwQ-32B               (official, bitsandbytes int4)
-#   qwen3-vl:32b Qwen/Qwen3-VL-32B-Instruct (official, bitsandbytes int4)
+# Prefix caching enabled on both models (--enable-prefix-caching).
+# Models start sequentially to avoid GPU memory profiling conflicts.
 #
 # Port 18800 (TGI Solidity LLM) is a separate deployment; Caddy routes only.
 # =============================================================================
@@ -34,17 +28,9 @@ services:
       - /mnt/secure:/workdir
     command: >
       sh -c "
-        mkdir -p /workdir/stt-models &&
-        mkdir -p /workdir/stt-logs &&
-        mkdir -p /workdir/tts-data/hf &&
-        mkdir -p /workdir/tts-data/cache &&
-        mkdir -p /workdir/tts-models &&
-        mkdir -p /workdir/tts-logs &&
         mkdir -p /workdir/.vllm-gemma &&
-        mkdir -p /workdir/.vllm-qwq &&
-        mkdir -p /workdir/.vllm-qwen3vl &&
-        mkdir -p /workdir/caddy-data &&
-        chmod -R 777 /workdir/tts-logs /workdir/tts-models /workdir/tts-data /workdir/stt-logs /workdir/stt-models
+        mkdir -p /workdir/.vllm-qwen36 &&
+        mkdir -p /workdir/caddy-data
       "
     restart: "no"
     networks:
@@ -55,8 +41,6 @@ services:
     container_name: caddy-proxy
     ports:
       - "21434:21434"
-      - "25436:25436"
-      - "25435:25435"
       - "18800:18800"
     volumes:
       - /mnt/secure/app_cert:/etc/ssl/certs:ro
@@ -115,9 +99,7 @@ services:
     depends_on:
       vllm-gemma:
         condition: service_healthy
-      vllm-qwq:
-        condition: service_healthy
-      vllm-qwen3vl:
+      vllm-qwen36:
         condition: service_healthy
 
   # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
@@ -151,9 +133,10 @@ services:
       --host 0.0.0.0
       --port 8000
       --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.36
-      --max-model-len 8000
-      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.47
+      --max-model-len 16384
+      --max-num-batched-tokens 16384
       --tensor-parallel-size 1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
@@ -170,12 +153,12 @@ services:
     networks:
       - secretai_network
 
-  # ── vLLM: qwq:32b ─────────────────────────────────────────────────────────
+  # ── vLLM: qwen3.6:27b ────────────────────────────────────────────────────
+  # HF model: Qwen/Qwen3.6-27B (bitsandbytes int4; BF16+fp8 KV compatible with FA3)
   # Starts after gemma is healthy to avoid GPU memory profiling conflicts
-  # HF model: Qwen/QwQ-32B-AWQ (AWQ fp16 + fp8 KV; force TRITON_ATTN to bypass FA3 BF16 requirement)
-  vllm-qwq:
+  vllm-qwen36:
     image: vllm/vllm-openai:v0.23.0
-    container_name: vllm-qwq
+    container_name: vllm-qwen36
     privileged: true
     runtime: nvidia
     ipc: host
@@ -194,19 +177,21 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
-      - VLLM_ATTENTION_BACKEND=TRITON_ATTN
     volumes:
-      - /mnt/secure/.vllm-qwq:/root/.cache/huggingface
+      - /mnt/secure/.vllm-qwen36:/root/.cache/huggingface
     command: >
-      --model Qwen/QwQ-32B-AWQ
-      --served-model-name qwq:32b
+      --model Qwen/Qwen3.6-27B
+      --served-model-name qwen3.6:27b
       --host 0.0.0.0
       --port 8001
-      --quantization awq
+      --quantization bitsandbytes
+      --load-format bitsandbytes
+      --dtype bfloat16
       --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.28
-      --max-model-len 8192
-      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --gpu-memory-utilization 0.47
+      --max-model-len 16384
+      --max-num-batched-tokens 16384
       --tensor-parallel-size 1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/v1/models"]
@@ -226,141 +211,6 @@ services:
       vllm-gemma:
         condition: service_healthy
 
-  # ── vLLM: qwen3-vl:32b (Vision Language Model) ───────────────────────────
-  # HF model: QuantTrio/Qwen3-VL-32B-Instruct-AWQ
-  # VLM: --limit-mm-per-prompt image=1 (1 image per request)
-  vllm-qwen3vl:
-    image: vllm/vllm-openai:v0.23.0
-    container_name: vllm-qwen3vl
-    privileged: true
-    runtime: nvidia
-    ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-        limits:
-          memory: 60G
-    env_file:
-      - usr/.env
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - HF_HOME=/root/.cache/huggingface
-      - VLLM_ATTENTION_BACKEND=TRITON_ATTN
-    volumes:
-      - /mnt/secure/.vllm-qwen3vl:/root/.cache/huggingface
-    command: >
-      --model QuantTrio/Qwen3-VL-32B-Instruct-AWQ
-      --served-model-name qwen3-vl:32b
-      --host 0.0.0.0
-      --port 8002
-      --quantization awq
-      --kv-cache-dtype fp8
-      --gpu-memory-utilization 0.28
-      --max-model-len 8192
-      --max-num-batched-tokens 8192
-      --tensor-parallel-size 1
-      --limit-mm-per-prompt '{"image": 1}'
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/v1/models"]
-      interval: 30s
-      timeout: 120s
-      start_period: 600s
-      retries: 20
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
-    networks:
-      - secretai_network
-    depends_on:
-      vllm-qwq:
-        condition: service_healthy
-
-  stt_service:
-    image: ghcr.io/scrtlabs/secret-ai-stt-tts:v0.0.8
-    container_name: secretai-stt-service
-    privileged: true
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - WHISPER_MODEL=large-v3
-      - WHISPER_COMPUTE_TYPE=float16
-      - WHISPER_DEVICE=cuda
-      - CHUNK_DURATION=2.0
-      - SAMPLE_RATE=16000
-      - PYTHONUNBUFFERED=1
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-        limits:
-          memory: 4G
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    volumes:
-      - /mnt/secure/stt-models:/app/models
-      - /mnt/secure/stt-logs:/app/logs
-    networks:
-      - secretai_network
-    labels:
-      - "com.secretai.service=stt"
-      - "com.secretai.version=1.1.0"
-    depends_on:
-      init:
-        condition: service_completed_successfully
-
-  tts_service:
-    image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
-    container_name: secretai-kokoro-tts
-    restart: unless-stopped
-    runtime: nvidia
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      HF_HOME: /data/hf
-      TRANSFORMERS_CACHE: /data/hf/transformers
-      XDG_CACHE_HOME: /data/.cache
-      PORT: "8880"
-      PYTHONUNBUFFERED: "1"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-        limits:
-          memory: 4G
-    volumes:
-      - /mnt/secure/tts-data/hf:/data/hf
-      - /mnt/secure/tts-data/cache:/data/.cache
-      - /mnt/secure/tts-models:/models
-      - /mnt/secure/tts-logs:/app/logs
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8880/v1/test"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 10s
-    networks:
-      - secretai_network
-    labels:
-      - "com.secretai.service=tts"
-      - "com.secretai.provider=kokoro"
-    depends_on:
-      init:
-        condition: service_completed_successfully
-
 networks:
   secretai_network:
     driver: bridge
@@ -375,15 +225,10 @@ configs:
             model: openai/gemma4:31b
             api_base: http://vllm-gemma:8000/v1
             api_key: "dummy"
-        - model_name: qwq:32b
+        - model_name: qwen3.6:27b
           litellm_params:
-            model: openai/qwq:32b
-            api_base: http://vllm-qwq:8001/v1
-            api_key: "dummy"
-        - model_name: qwen3-vl:32b
-          litellm_params:
-            model: openai/qwen3-vl:32b
-            api_base: http://vllm-qwen3vl:8002/v1
+            model: openai/qwen3.6:27b
+            api_base: http://vllm-qwen36:8001/v1
             api_key: "dummy"
 
       litellm_settings:
@@ -475,138 +320,6 @@ configs:
           @503 expression {http.error.status_code} == 503
           @504 expression {http.error.status_code} == 504
           respond @502 "LLM service temporarily unavailable" 502
-          respond @503 "Service temporarily unavailable" 503
-          respond @504 "Request timeout" 504
-        }
-      }
-
-      :25436 {
-        tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
-
-        @cors_preflight method OPTIONS
-        handle @cors_preflight {
-          @has_origin header Origin *
-          header @has_origin {
-            Access-Control-Allow-Origin {header.origin}
-            Access-Control-Allow-Credentials "true"
-            Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-            Access-Control-Allow-Headers "*"
-            Access-Control-Max-Age "86400"
-            Vary "Origin"
-          }
-          respond "" 204
-        }
-
-        handle {
-          @has_origin header Origin *
-          header @has_origin {
-            Access-Control-Allow-Origin {header.origin}
-            Access-Control-Allow-Credentials "true"
-            Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-            Access-Control-Allow-Headers "*"
-            Access-Control-Expose-Headers "*"
-            Vary "Origin"
-          }
-
-          secret_reverse_proxy {
-            API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
-            secret_node {env.SECRET_NODE}
-            contract_address {env.SECRET_CONTRACT}
-            secret_chain_id {env.SECRET_CHAIN_ID}
-            metering {env.METERING}
-            metering_interval {env.METERING_INTERVAL}
-            metering_url {env.METERING_URL}
-            max_body_size 104857600
-            token_counting_mode heuristic
-            max_retries 5
-            retry_backoff 300s
-            x402_enabled {env.X402_ENABLED}
-            devportal_url {env.DEVPORTAL_URL}
-            devportal_service_key {env.DEVPORTAL_SERVICE_KEY}
-            x402_min_balance_usd {env.X402_MIN_BALANCE_USD}
-          }
-
-          reverse_proxy secretai-stt-service:8001 {
-            health_uri /healthz
-            health_interval 30s
-            health_timeout 10s
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-Port {server_port}
-          }
-        }
-
-        handle_errors {
-          @502 expression {http.error.status_code} == 502
-          @503 expression {http.error.status_code} == 503
-          @504 expression {http.error.status_code} == 504
-          respond @502 "STT service temporarily unavailable" 502
-          respond @503 "Service temporarily unavailable" 503
-          respond @504 "Request timeout" 504
-        }
-      }
-
-      :25435 {
-        tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
-
-        @cors_preflight method OPTIONS
-        handle @cors_preflight {
-          @has_origin header Origin *
-          header @has_origin {
-            Access-Control-Allow-Origin {header.origin}
-            Access-Control-Allow-Credentials "true"
-            Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-            Access-Control-Allow-Headers "*"
-            Access-Control-Max-Age "86400"
-            Vary "Origin"
-          }
-          respond "" 204
-        }
-
-        handle {
-          @has_origin header Origin *
-          header @has_origin {
-            Access-Control-Allow-Origin {header.origin}
-            Access-Control-Allow-Credentials "true"
-            Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-            Access-Control-Allow-Headers "*"
-            Access-Control-Expose-Headers "*"
-            Vary "Origin"
-          }
-
-          secret_reverse_proxy {
-            API_MASTER_KEY {env.SECRET_API_MASTER_KEY}
-            secret_node {env.SECRET_NODE}
-            contract_address {env.SECRET_CONTRACT}
-            secret_chain_id {env.SECRET_CHAIN_ID}
-            metering {env.METERING}
-            metering_interval {env.METERING_INTERVAL}
-            metering_url {env.METERING_URL}
-            max_body_size 2097152
-            token_counting_mode heuristic
-            max_retries 5
-            retry_backoff 300s
-            x402_enabled {env.X402_ENABLED}
-            devportal_url {env.DEVPORTAL_URL}
-            devportal_service_key {env.DEVPORTAL_SERVICE_KEY}
-            x402_min_balance_usd {env.X402_MIN_BALANCE_USD}
-          }
-
-          reverse_proxy secretai-kokoro-tts:8880 {
-            health_uri /v1/test
-            health_interval 30s
-            health_timeout 10s
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-Port {server_port}
-          }
-        }
-
-        handle_errors {
-          @502 expression {http.error.status_code} == 502
-          @503 expression {http.error.status_code} == 503
-          @504 expression {http.error.status_code} == 504
-          respond @502 "TTS service temporarily unavailable" 502
           respond @503 "Service temporarily unavailable" 503
           respond @504 "Request timeout" 504
         }
