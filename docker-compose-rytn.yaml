@@ -7,11 +7,13 @@
 #   Caddy :21434 -> LiteLLM :4000 --> vllm-gemma  :8000  (gemma4:31b)
 #                                 --> vllm-qwen36  :8001  (qwen3.6:27b)
 #
-# VRAM budget H100 80GB:
-#   gemma4:31b   AWQ compressed-tensors ~14GB + KV fp8 -> 37.6GB (47% alloc)
-#   qwen3.6:27b  bitsandbytes int4      ~15GB + KV fp8 -> 37.6GB (47% alloc)
+# VRAM budget H100 80GB (79.18 GiB usable):
+#   gemma4:31b   AWQ compressed-tensors 20.2GB weights + 7.9GB KV fp8  = ~29GB physical (42% alloc)
+#   qwen3.6:27b  bitsandbytes int4      18.2GB weights + ~22GB KV fp8  = ~42GB physical (55% alloc)
 #   -----------------------------------------
-#   Total                                              ~75.2GB < 80GB
+#   Total                                                               ~71GB < 79.18GB ✓
+#
+# qwen3.6:27b max_model_len=32768 (Mamba block=1568 tok; prefix cache needs >1568 tok shared prefix)
 #
 # Prefix caching enabled on both models (--enable-prefix-caching).
 # Models start sequentially to avoid GPU memory profiling conflicts.
@@ -74,13 +76,14 @@ services:
     networks:
       - secretai_network
 
-  # ── llm-router: transparent FastAPI proxy, routes by model name ─────────
-  # Pass-through: response fields (prompt_tokens_details, cached_tokens, etc.)
-  # are forwarded unchanged from vLLM without normalization.
+  # ── LiteLLM router: single OpenAI-compatible endpoint for all models ────
   litellm:
-    build: ./llm-router
-    image: secret-ai-llm-router:latest
+    image: ghcr.io/berriai/litellm:main-latest
     container_name: litellm-router
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "4"]
+    configs:
+      - source: litellm_config
+        target: /etc/litellm/config.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
       interval: 30s
@@ -133,6 +136,7 @@ services:
       --port 8000
       --kv-cache-dtype fp8
       --enable-prefix-caching
+      --enable-prompt-tokens-details
       --gpu-memory-utilization 0.42
       --max-model-len 16384
       --max-num-batched-tokens 16384
@@ -188,8 +192,9 @@ services:
       --dtype bfloat16
       --kv-cache-dtype fp8
       --enable-prefix-caching
-      --gpu-memory-utilization 0.47
-      --max-model-len 8192
+      --enable-prompt-tokens-details
+      --gpu-memory-utilization 0.55
+      --max-model-len 32768
       --max-num-batched-tokens 8192
       --max-num-seqs 256
       --tensor-parallel-size 1
@@ -217,6 +222,25 @@ networks:
     name: secretai_network
 
 configs:
+  litellm_config:
+    content: |
+      model_list:
+        - model_name: gemma4:31b
+          litellm_params:
+            model: openai/gemma4:31b
+            api_base: http://vllm-gemma:8000/v1
+            api_key: "dummy"
+        - model_name: qwen3.6:27b
+          litellm_params:
+            model: openai/qwen3.6:27b
+            api_base: http://vllm-qwen36:8001/v1
+            api_key: "dummy"
+
+      litellm_settings:
+        drop_params: true
+        set_verbose: false
+        request_timeout: 600
+
   caddyfile:
     content: |
       {

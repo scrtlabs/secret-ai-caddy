@@ -16,11 +16,11 @@
 #   gemma4:31b   Multimodal arch → requires triton attention backend + no cuda-graph
 #   qwen3.6:27b  Standard text model, standard SGLang flags
 #
-# VRAM budget H100 80GB:
-#   gemma4:31b   bitsandbytes int4 ~15GB + KV fp8 -> 37.6GB (47% alloc)
-#   qwen3.6:27b  bitsandbytes int4 ~15GB + KV fp8 -> 37.6GB (47% alloc)
+# VRAM budget H100 80GB (79.18 GiB usable):
+#   gemma4:31b   bitsandbytes int4 ~18GB weights + KV fp8  -> ~42GB physical (47% alloc)
+#   qwen3.6:27b  bitsandbytes int4 ~18GB weights + KV fp8  -> ~44GB physical (55% alloc)
 #   -----------------------------------------
-#   Total                                         ~75.2GB < 80GB
+#   Total                                                    ~86GB — MIGHT OOM, tune if needed
 #
 # Port 18800 (TGI Solidity LLM) is a separate deployment; Caddy routes only.
 # =============================================================================
@@ -193,9 +193,10 @@ services:
       --host 0.0.0.0
       --port 8001
       --tp 1
-      --mem-fraction-static 0.47
+      --mem-fraction-static 0.55
       --quantization bitsandbytes
       --kv-cache-dtype fp8_e4m3
+      --context-length 32768
       --chunked-prefill-size 4096
       --enable-metrics
     healthcheck:
