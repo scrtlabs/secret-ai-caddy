@@ -600,9 +600,10 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Priority 1: authoritative usage from backend (vLLM always provides this for
 	// non-streaming; for streaming it requires stream_options.include_usage=true which
 	// we inject above).
-	var outputTokens int
-	if promptTok, completionTok, ok := extractUsageFromResponse(responseBody); ok {
-		inputTokens = promptTok
+	var outputTokens, cachedTokens int
+	if promptTok, completionTok, cachedTok, ok := extractUsageFromResponse(responseBody); ok {
+		cachedTokens = cachedTok
+		inputTokens = promptTok - cachedTok // non-cached input only; cached billed separately
 		outputTokens = completionTok
 	} else {
 		// Priority 2: extract only the generated text, then tokenize.
@@ -632,13 +633,14 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			hasher.Write([]byte(apiKey))
 			apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
 
-			m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens)
+			m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens, cachedTokens)
 		}
 
 		// Log token usage for monitoring (enhanced system handles reporting internally)
 		caddy.Log().Info("Token usage recorded",
 			zap.Int("input_tokens", inputTokens),
 			zap.Int("output_tokens", outputTokens),
+			zap.Int("cached_tokens", cachedTokens),
 			zap.String("model", modelName),
 			zap.String("endpoint", r.URL.Path))
 	}
@@ -1139,10 +1141,12 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	if model == "unknown" {
 		model = detectModelFromResponseBody(respBody)
 	}
-	var outputTokens int
-	if promptTok, completionTok, ok := extractUsageFromResponse(respBody); ok {
-		inputTokens = promptTok
+	var outputTokens, cachedTokens int
+	if promptTok, completionTok, cachedTok, ok := extractUsageFromResponse(respBody); ok {
+		cachedTokens = cachedTok
+		inputTokens = promptTok - cachedTok // non-cached input only; cached billed separately
 		outputTokens = completionTok
+		_ = cachedTokens // x402 path: portal ReportUsage API doesn't support cached yet
 	} else if m.tokenCounter != nil {
 		content := extractResponseContent(respBody)
 		if content == "" {
@@ -1382,16 +1386,17 @@ func extractAPIKey(authHeader string) string {
 // extractUsageFromResponse parses authoritative token counts from the backend response.
 // Works for both non-streaming JSON (usage field at top level) and SSE streaming
 // (usage field in the final chunk, requires stream_options.include_usage=true).
-// Returns (promptTokens, completionTokens, true) when found.
-func extractUsageFromResponse(body string) (promptTokens, completionTokens int, ok bool) {
-	parseUsageObj := func(raw string) (int, int, bool) {
+// Returns (promptTokens, completionTokens, cachedTokens, true) when found.
+// cachedTokens comes from usage.prompt_tokens_details.cached_tokens (vLLM --enable-prompt-tokens-details).
+func extractUsageFromResponse(body string) (promptTokens, completionTokens, cachedTokens int, ok bool) {
+	parseUsageObj := func(raw string) (int, int, int, bool) {
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-			return 0, 0, false
+			return 0, 0, 0, false
 		}
 		usage, _ := obj["usage"].(map[string]any)
 		if usage == nil {
-			return 0, 0, false
+			return 0, 0, 0, false
 		}
 		toInt := func(v any) int {
 			if f, ok := v.(float64); ok {
@@ -1402,15 +1407,19 @@ func extractUsageFromResponse(body string) (promptTokens, completionTokens int, 
 		pt := toInt(usage["prompt_tokens"])
 		ct := toInt(usage["completion_tokens"])
 		if ct == 0 && pt == 0 {
-			return 0, 0, false
+			return 0, 0, 0, false
 		}
-		return pt, ct, true
+		var cached int
+		if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+			cached = toInt(details["cached_tokens"])
+		}
+		return pt, ct, cached, true
 	}
 
 	// Non-streaming: direct JSON
 	if !strings.Contains(body, "\ndata:") && !strings.HasPrefix(body, "data:") {
-		pt, ct, found := parseUsageObj(strings.TrimSpace(body))
-		return pt, ct, found
+		pt, ct, cached, found := parseUsageObj(strings.TrimSpace(body))
+		return pt, ct, cached, found
 	}
 
 	// Streaming SSE: scan every chunk (usage is usually in the last non-[DONE] chunk)
@@ -1423,11 +1432,11 @@ func extractUsageFromResponse(body string) (promptTokens, completionTokens int, 
 		if data == "[DONE]" {
 			continue
 		}
-		if pt, ct, found := parseUsageObj(data); found {
-			return pt, ct, true
+		if pt, ct, cached, found := parseUsageObj(data); found {
+			return pt, ct, cached, true
 		}
 	}
-	return 0, 0, false
+	return 0, 0, 0, false
 }
 
 // extractResponseContent extracts the actual generated text from a response body.

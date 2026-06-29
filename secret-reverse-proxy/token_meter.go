@@ -9,12 +9,14 @@ import (
 type ModelUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // TokenUsage stores cumulative token stats for a single API key.
 type TokenUsage struct {
 	InputTokens   int
 	OutputTokens  int
+	CachedTokens  int
 	LastUpdatedAt time.Time
 	// ModelUsage tracks token usage per model
 	ModelUsage    map[string]ModelUsage `json:"model_usage,omitempty"`
@@ -35,11 +37,11 @@ func NewTokenAccumulator() *TokenAccumulator {
 
 // RecordUsage adds tokens to the given API key's tally.
 func (ta *TokenAccumulator) RecordUsage(apiKeyHash string, inputTokens, outputTokens int) {
-	ta.RecordUsageWithModel(apiKeyHash, "unknown", inputTokens, outputTokens)
+	ta.RecordUsageWithModel(apiKeyHash, "unknown", inputTokens, outputTokens, 0)
 }
 
 // RecordUsageWithModel adds tokens to the given API key's tally, tracking per model.
-func (ta *TokenAccumulator) RecordUsageWithModel(apiKeyHash, modelName string, inputTokens, outputTokens int) {
+func (ta *TokenAccumulator) RecordUsageWithModel(apiKeyHash, modelName string, inputTokens, outputTokens, cachedTokens int) {
 	ta.mu.Lock()
 	defer ta.mu.Unlock()
 
@@ -50,20 +52,22 @@ func (ta *TokenAccumulator) RecordUsageWithModel(apiKeyHash, modelName string, i
 		}
 		ta.usage[apiKeyHash] = entry
 	}
-	
+
 	// Update overall totals
 	entry.InputTokens += inputTokens
 	entry.OutputTokens += outputTokens
+	entry.CachedTokens += cachedTokens
 	entry.LastUpdatedAt = time.Now()
-	
+
 	// Update per-model tracking
 	if entry.ModelUsage == nil {
 		entry.ModelUsage = make(map[string]ModelUsage)
 	}
-	
+
 	modelUsage := entry.ModelUsage[modelName]
 	modelUsage.InputTokens += inputTokens
 	modelUsage.OutputTokens += outputTokens
+	modelUsage.CachedTokens += cachedTokens
 	entry.ModelUsage[modelName] = modelUsage
 }
 

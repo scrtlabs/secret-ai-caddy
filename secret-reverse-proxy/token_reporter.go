@@ -124,9 +124,10 @@ func (rr *ResilientReporter) buildRecords(usage map[string]TokenUsage) []map[str
 			"api_key_hash":  apiKeyHash,
 			"input_tokens":  usageStats.InputTokens,
 			"output_tokens": usageStats.OutputTokens,
+			"cached_tokens": usageStats.CachedTokens,
 			"timestamp":     usageStats.LastUpdatedAt.Unix(),
 		}
-		
+
 		// Add per-model usage data if available
 		if len(usageStats.ModelUsage) > 0 {
 			modelUsageData := make(map[string]map[string]any)
@@ -134,6 +135,7 @@ func (rr *ResilientReporter) buildRecords(usage map[string]TokenUsage) []map[str
 				modelUsageData[modelName] = map[string]any{
 					"input_tokens":  modelUsage.InputTokens,
 					"output_tokens": modelUsage.OutputTokens,
+					"cached_tokens": modelUsage.CachedTokens,
 				}
 			}
 			record["model_usage"] = modelUsageData
@@ -156,6 +158,7 @@ func (rr *ResilientReporter) submitWithRetry(records []map[string]any, attempt i
 			apiKeyData := map[string]any{
 				"input_tokens":  record["input_tokens"],
 				"output_tokens": record["output_tokens"],
+				"cached_tokens": record["cached_tokens"],
 				"timestamp":     record["timestamp"],
 			}
 			
