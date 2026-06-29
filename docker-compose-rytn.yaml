@@ -180,6 +180,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     volumes:
       - /mnt/secure/.vllm-qwen36:/root/.cache/huggingface
     command: >
@@ -189,7 +190,6 @@ services:
       --port 8001
       --quantization compressed-tensors
       --dtype bfloat16
-      --enforce-eager
       --kv-cache-dtype fp8
       --enable-prefix-caching
       --enable-prompt-tokens-details
