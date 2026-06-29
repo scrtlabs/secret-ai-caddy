@@ -188,10 +188,11 @@ services:
       --host 0.0.0.0
       --port 8001
       --quantization compressed-tensors
+      --enforce-eager
       --kv-cache-dtype fp8
       --enable-prefix-caching
       --enable-prompt-tokens-details
-      --gpu-memory-utilization 0.47
+      --gpu-memory-utilization 0.55
       --max-model-len 32768
       --max-num-batched-tokens 8192
       --max-num-seqs 256
