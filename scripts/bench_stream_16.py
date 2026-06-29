@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 16 parallel streaming requests to SecretAI endpoint.
-Usage: python3 bench_stream_16.py <API_KEY> [URL]
+Usage: python3 bench_stream_16.py <API_KEY> [URL] [MODEL]
 """
 import threading, time, json, ssl, sys
 from urllib.request import Request, urlopen
 
-URL = sys.argv[2] if len(sys.argv) > 2 else "https://secretai-lambda.scrtlabs.com:21434/v1/chat/completions"
-KEY = sys.argv[1] if len(sys.argv) > 1 else ""
+URL   = sys.argv[2] if len(sys.argv) > 2 else "https://secretai-lambda4.scrtlabs.com:21434/v1/chat/completions"
+KEY   = sys.argv[1] if len(sys.argv) > 1 else ""
+MODEL = sys.argv[3] if len(sys.argv) > 3 else "gemma4:31b"
 N = 16
 
 PROMPTS = [
@@ -43,7 +44,7 @@ def send(idx):
     tokens = 0
 
     payload = json.dumps({
-        "model": "gpt-oss:120b",
+        "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
     }).encode()
@@ -88,7 +89,7 @@ def send(idx):
             print(f"\033[31m[{idx+1:02d}] ERROR: {e}\033[0m", flush=True)
 
 
-print(f"\033[1mLaunching {N} parallel streaming requests → {URL}\033[0m\n")
+print(f"\033[1mLaunching {N} parallel streaming requests → {URL}  model={MODEL}\033[0m\n")
 t_wall = time.time()
 
 threads = [threading.Thread(target=send, args=(i,)) for i in range(N)]

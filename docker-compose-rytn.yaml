@@ -9,7 +9,7 @@
 #
 # VRAM budget H100 80GB (79.18 GiB usable):
 #   gemma4:31b   AWQ compressed-tensors 20.2GB weights + 7.9GB KV fp8  = ~29GB physical (42% alloc)
-#   qwen3.6:27b  bitsandbytes int4      18.2GB weights + ~22GB KV fp8  = ~42GB physical (55% alloc)
+#   qwen3.6:27b  AWQ int4 (cyankiwi)    14.0GB weights + ~22GB KV fp8  = ~38GB physical (55% alloc)
 #   -----------------------------------------
 #   Total                                                               ~71GB < 79.18GB ✓
 #
@@ -158,7 +158,7 @@ services:
       - secretai_network
 
   # ── vLLM: qwen3.6:27b ────────────────────────────────────────────────────
-  # HF model: Qwen/Qwen3.6-27B (bitsandbytes int4; BF16+fp8 KV compatible with FA3)
+  # HF model: cyankiwi/Qwen3.6-27B-AWQ-INT4 (AWQ 4-bit; same author as gemma4 AWQ)
   # Starts after gemma is healthy to avoid GPU memory profiling conflicts
   vllm-qwen36:
     image: vllm/vllm-openai:v0.23.0
@@ -184,13 +184,11 @@ services:
     volumes:
       - /mnt/secure/.vllm-qwen36:/root/.cache/huggingface
     command: >
-      --model Qwen/Qwen3.6-27B
+      --model cyankiwi/Qwen3.6-27B-AWQ-INT4
       --served-model-name qwen3.6:27b
       --host 0.0.0.0
       --port 8001
-      --quantization bitsandbytes
-      --load-format bitsandbytes
-      --dtype bfloat16
+      --quantization awq
       --kv-cache-dtype fp8
       --enable-prefix-caching
       --enable-prompt-tokens-details
