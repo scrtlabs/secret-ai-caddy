@@ -1,21 +1,19 @@
 # =============================================================================
 # SecretAI Docker Compose — RYTN (SGLang)
 # SGLang latest | Caddy v0.1.19 | LiteLLM router
-# Models: gemma4-31b (QAT w4a16) + qwen3.6-27b (AWQ compressed-tensors int4)
+# Model: qwen3.6:27b (SGLang, Mamba-hybrid benchmark vs vLLM)
 #
-# Architecture:  (identical to docker-compose-rytn.yaml)
-#   Caddy :21434 -> LiteLLM :4000 --> sglang-gemma  :8000  (gemma4-31b)
-#                                 --> sglang-qwen36  :8001  (qwen3.6-27b)
+# Architecture:
+#   Caddy :21434 -> LiteLLM :4000 --> sglang-qwen36 :8001  (qwen3.6:27b)
 #
-# gemma4 model: google/gemma-4-31B-it-qat-w4a16-ct (official Google QAT)
-#   - QAT (Quantization Aware Training) > post-training AWQ in quality
-#   - ~17 GiB weights vs ~20 GiB for cyankiwi AWQ → +3 GiB more KV cache
-#   - Stored in /mnt/secure/.vllm-gemma alongside vLLM's cyankiwi model
-#     (HF cache handles multiple models in the same dir by model ID)
+# Purpose: benchmark qwen3.6-27b throughput in SGLang vs vLLM.
+#   Qwen3.6-27B (Qwen3_next) is a Mamba-hybrid — SSM layers reduce
+#   KV cache pressure; SGLang's RadixAttention (tree prefix cache) and
+#   chunked prefill may outperform vLLM on long-context workloads.
 #
-# IMPORTANT: SGLang forbids colon in --served-model-name (reserved for LoRA
-#   base:adapter syntax). Use dashes instead: gemma4-31b, qwen3.6-27b.
-#   Clients still send "model": "gemma4:31b" — LiteLLM maps it to gemma4-31b.
+# IMPORTANT: SGLang forbids colon in --served-model-name (LoRA base:adapter
+#   syntax). Clients send "qwen3.6:27b"; LiteLLM maps it to "qwen3.6-27b"
+#   which matches the SGLang --served-model-name.
 #
 # SGLang flag mapping from vLLM:
 #   --model                  → --model-path
@@ -27,20 +25,14 @@
 #   --kv-cache-dtype fp8     → --kv-cache-dtype fp8_e4m3
 #   --enable-prefix-caching  → RadixAttention ON by default in SGLang
 #
-# SGLang-specific flags used:
-#   --attention-backend triton      — Gemma4 heterogeneous head dims (256/512);
-#                                     SGLang auto-selects triton, explicit for clarity
+# SGLang-specific flags:
 #   --mamba-scheduler-strategy no_buffer — Qwen3.6 Mamba-hybrid V1 strategy,
-#                                     lower memory than extra_buffer (V2)
-#   --cuda-graph-max-bs-decode 256  — caps decode CUDA graph batch size, saves VRAM
+#                                          lower memory than extra_buffer (V2)
+#   --cuda-graph-max-bs-decode 256       — cap decode CUDA graph batch size
 #
 # VRAM budget H100 80GB:
-#   gemma4-31b   QAT w4a16  mem-fraction 0.41  (~17 GiB weights + ~15 GiB KV)
-#   qwen3.6-27b  AWQ int4   mem-fraction 0.55  (~19 GiB weights + ~24 GiB KV)
-#
-# WARNING: Qwen3.6-27B is a Mamba-hybrid architecture (Qwen3_next).
-#   SGLang support is experimental — may fail to load.
-#   If sglang-qwen36 fails, try context-length 32768 or fall back to vLLM.
+#   qwen3.6-27b AWQ int4  mem-fraction 0.95  (~14 GiB weights + ~62 GiB KV fp8)
+#   Full GPU available since only one model runs.
 # =============================================================================
 
 services:
@@ -52,7 +44,6 @@ services:
       - /mnt/secure:/workdir
     command: >
       sh -c "
-        mkdir -p /workdir/.vllm-gemma &&
         mkdir -p /workdir/.vllm-qwen36 &&
         mkdir -p /workdir/caddy-data
       "
@@ -98,7 +89,7 @@ services:
     networks:
       - secretai_network
 
-  # ── LiteLLM router: single OpenAI-compatible endpoint for all models ────
+  # ── LiteLLM router ──────────────────────────────────────────────────────
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
     container_name: litellm-router
@@ -121,78 +112,12 @@ services:
     networks:
       - secretai_network
     depends_on:
-      sglang-gemma:
-        condition: service_healthy
       sglang-qwen36:
         condition: service_healthy
 
-  # ── SGLang: gemma4-31b ───────────────────────────────────────────────────
-  # HF model: google/gemma-4-31B-it-qat-w4a16-ct (official Google QAT, ~17 GiB)
-  # Downloaded to /mnt/secure/.vllm-gemma (same HF cache dir as vLLM's cyankiwi).
-  # Served as "gemma4-31b" (dash, not colon — SGLang LoRA syntax restriction).
-  # Clients send "gemma4:31b" → LiteLLM maps → SGLang receives "gemma4-31b".
-  sglang-gemma:
-    image: lmsysorg/sglang:latest
-    container_name: sglang-gemma
-    privileged: true
-    runtime: nvidia
-    ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-        limits:
-          memory: 60G
-    env_file:
-      - usr/.env
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - HF_HOME=/root/.cache/huggingface
-    volumes:
-      - /mnt/secure/.vllm-gemma:/root/.cache/huggingface
-    command: >
-      python -m sglang.launch_server
-      --model-path google/gemma-4-31B-it-qat-w4a16-ct
-      --served-model-name gemma4-31b
-      --host 0.0.0.0
-      --port 8000
-      --tp 1
-      --dtype bfloat16
-      --quantization compressed-tensors
-      --attention-backend triton
-      --enable-multimodal false
-      --kv-cache-dtype fp8_e4m3
-      --mem-fraction-static 0.41
-      --context-length 16384
-      --chunked-prefill-size 16384
-      --max-running-requests 256
-      --cuda-graph-max-bs-decode 256
-      --enable-metrics
-      --trust-remote-code
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 120s
-      start_period: 600s
-      retries: 20
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
-    networks:
-      - secretai_network
-
   # ── SGLang: qwen3.6-27b ──────────────────────────────────────────────────
-  # HF model: cyankiwi/Qwen3.6-27B-AWQ-INT4 (Mamba-hybrid, experimental in SGLang)
-  # Reuses /mnt/secure/.vllm-qwen36 — no re-download if vLLM was run before.
-  # Starts after gemma to avoid GPU memory profiling conflicts.
-  # Mamba-hybrid: uses --mamba-scheduler-strategy no_buffer (V1, lower memory).
+  # Full GPU budget available — mem-fraction-static 0.95 leaves 5% (~4 GiB)
+  # for CUDA graphs, PyTorch caching allocator, and driver overhead.
   sglang-qwen36:
     image: lmsysorg/sglang:latest
     container_name: sglang-qwen36
@@ -227,7 +152,7 @@ services:
       --dtype bfloat16
       --quantization compressed-tensors
       --kv-cache-dtype fp8_e4m3
-      --mem-fraction-static 0.55
+      --mem-fraction-static 0.95
       --context-length 131072
       --chunked-prefill-size 8192
       --max-running-requests 256
@@ -249,9 +174,6 @@ services:
         max-file: "3"
     networks:
       - secretai_network
-    depends_on:
-      sglang-gemma:
-        condition: service_healthy
 
 networks:
   secretai_network:
@@ -262,13 +184,7 @@ configs:
   litellm_config:
     content: |
       model_list:
-        # model_name = what clients send ("gemma4:31b")
-        # model = what LiteLLM sends to SGLang backend (must match --served-model-name, no colon)
-        - model_name: gemma4:31b
-          litellm_params:
-            model: openai/gemma4-31b
-            api_base: http://sglang-gemma:8000/v1
-            api_key: "dummy"
+        # clients send "qwen3.6:27b" — LiteLLM maps to "qwen3.6-27b" (SGLang LoRA restriction)
         - model_name: qwen3.6:27b
           litellm_params:
             model: openai/qwen3.6-27b
