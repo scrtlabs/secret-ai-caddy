@@ -156,7 +156,8 @@ services:
       --context-length 131072
       --chunked-prefill-size 8192
       --max-running-requests 256
-      --mamba-scheduler-strategy no_buffer
+      --mamba-radix-cache-strategy no_buffer
+      --disable-overlap-schedule
       --cuda-graph-max-bs-decode 256
       --enable-metrics
       --trust-remote-code
