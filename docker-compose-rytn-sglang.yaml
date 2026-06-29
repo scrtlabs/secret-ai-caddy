@@ -1,28 +1,32 @@
 # =============================================================================
 # SecretAI Docker Compose — RYTN (SGLang)
-# SGLang latest | Caddy v0.1.18 | LiteLLM router
-# Models: gemma4:31b + qwen3.6:27b (bitsandbytes int4)
+# SGLang latest | Caddy v0.1.19 | LiteLLM router
+# Models: gemma4:31b + qwen3.6:27b (AWQ compressed-tensors int4)
 #
-# Architecture:
+# Architecture:  (identical to docker-compose-rytn.yaml)
 #   Caddy :21434 -> LiteLLM :4000 --> sglang-gemma  :8000  (gemma4:31b)
 #                                 --> sglang-qwen36  :8001  (qwen3.6:27b)
 #
-# SGLang vs vLLM:
-#   + RadixAttention: KV cache reuse across requests with shared prefixes (prefix caching built-in)
-#   + Better throughput for multi-turn chat (common prefix cached)
-#   + Faster TTFT on repeated system prompts
+# KEY: volumes reuse /mnt/secure/.vllm-gemma and .vllm-qwen36 —
+#      no re-download needed, SGLang reads the same HF cache as vLLM.
 #
-# Per-model notes:
-#   gemma4:31b   Multimodal arch → requires triton attention backend + no cuda-graph
-#   qwen3.6:27b  Standard text model, standard SGLang flags
+# SGLang flag mapping from vLLM:
+#   --model                  → --model-path
+#   --gpu-memory-utilization → --mem-fraction-static
+#   --max-model-len          → --context-length
+#   --max-num-batched-tokens → --chunked-prefill-size
+#   --max-num-seqs           → --max-running-requests
+#   --tensor-parallel-size   → --tp
+#   --kv-cache-dtype fp8     → --kv-cache-dtype fp8_e4m3
+#   --enable-prefix-caching  → RadixAttention ON by default in SGLang
 #
-# VRAM budget H100 80GB (79.18 GiB usable):
-#   gemma4:31b   bitsandbytes int4 ~18GB weights + KV fp8  -> ~42GB physical (47% alloc)
-#   qwen3.6:27b  bitsandbytes int4 ~18GB weights + KV fp8  -> ~44GB physical (55% alloc)
-#   -----------------------------------------
-#   Total                                                    ~86GB — MIGHT OOM, tune if needed
+# VRAM budget H100 80GB — identical split to vLLM rytn:
+#   gemma4:31b   AWQ  mem-fraction 0.41
+#   qwen3.6:27b  AWQ  mem-fraction 0.55
 #
-# Port 18800 (TGI Solidity LLM) is a separate deployment; Caddy routes only.
+# WARNING: Qwen3.6-27B is a Mamba-hybrid architecture (Qwen3_next).
+#   SGLang support is experimental — may fail to load.
+#   If sglang-qwen36 fails, try context-length 32768 or fall back to vLLM.
 # =============================================================================
 
 services:
@@ -34,8 +38,8 @@ services:
       - /mnt/secure:/workdir
     command: >
       sh -c "
-        mkdir -p /workdir/.sglang-gemma &&
-        mkdir -p /workdir/.sglang-qwen36 &&
+        mkdir -p /workdir/.vllm-gemma &&
+        mkdir -p /workdir/.vllm-qwen36 &&
         mkdir -p /workdir/caddy-data
       "
     restart: "no"
@@ -43,7 +47,7 @@ services:
       - secretai_network
 
   caddy:
-    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.18
+    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.19
     container_name: caddy-proxy
     ports:
       - "21434:21434"
@@ -103,12 +107,14 @@ services:
     networks:
       - secretai_network
     depends_on:
-      - sglang-gemma
-      - sglang-qwen36
+      sglang-gemma:
+        condition: service_healthy
+      sglang-qwen36:
+        condition: service_healthy
 
   # ── SGLang: gemma4:31b ────────────────────────────────────────────────────
-  # HF model: google/gemma-4-31B-it
-  # Multimodal arch requires triton attention + no cuda-graph
+  # HF model: cyankiwi/gemma-4-31B-it-AWQ-4bit (compressed-tensors AWQ int4)
+  # Reuses /mnt/secure/.vllm-gemma — no re-download if vLLM was run before.
   sglang-gemma:
     image: lmsysorg/sglang:latest
     container_name: sglang-gemma
@@ -131,21 +137,23 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
     volumes:
-      - /mnt/secure/.sglang-gemma:/root/.cache/huggingface
+      - /mnt/secure/.vllm-gemma:/root/.cache/huggingface
     command: >
       python -m sglang.launch_server
-      --model-path google/gemma-4-31B-it
+      --model-path cyankiwi/gemma-4-31B-it-AWQ-4bit
       --served-model-name gemma4:31b
       --host 0.0.0.0
       --port 8000
       --tp 1
-      --mem-fraction-static 0.47
-      --quantization bitsandbytes
+      --dtype bfloat16
+      --quantization compressed-tensors
       --kv-cache-dtype fp8_e4m3
-      --attention-backend triton
-      --disable-cuda-graph
-      --chunked-prefill-size -1
+      --mem-fraction-static 0.41
+      --context-length 16384
+      --chunked-prefill-size 16384
+      --max-running-requests 256
       --enable-metrics
+      --trust-remote-code
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -161,8 +169,10 @@ services:
     networks:
       - secretai_network
 
-  # ── SGLang: qwen3.6:27b ───────────────────────────────────────────────────
-  # HF model: Qwen/Qwen3.6-27B
+  # ── SGLang: qwen3.6:27b ──────────────────────────────────────────────────
+  # HF model: cyankiwi/Qwen3.6-27B-AWQ-INT4 (Mamba-hybrid, experimental in SGLang)
+  # Reuses /mnt/secure/.vllm-qwen36 — no re-download if vLLM was run before.
+  # Starts after gemma to avoid GPU memory profiling conflicts.
   sglang-qwen36:
     image: lmsysorg/sglang:latest
     container_name: sglang-qwen36
@@ -184,21 +194,25 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/root/.cache/huggingface
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     volumes:
-      - /mnt/secure/.sglang-qwen36:/root/.cache/huggingface
+      - /mnt/secure/.vllm-qwen36:/root/.cache/huggingface
     command: >
       python -m sglang.launch_server
-      --model-path Qwen/Qwen3.6-27B
+      --model-path cyankiwi/Qwen3.6-27B-AWQ-INT4
       --served-model-name qwen3.6:27b
       --host 0.0.0.0
       --port 8001
       --tp 1
-      --mem-fraction-static 0.55
-      --quantization bitsandbytes
+      --dtype bfloat16
+      --quantization compressed-tensors
       --kv-cache-dtype fp8_e4m3
-      --context-length 32768
-      --chunked-prefill-size 4096
+      --mem-fraction-static 0.55
+      --context-length 131072
+      --chunked-prefill-size 8192
+      --max-running-requests 256
       --enable-metrics
+      --trust-remote-code
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
@@ -213,6 +227,9 @@ services:
         max-file: "3"
     networks:
       - secretai_network
+    depends_on:
+      sglang-gemma:
+        condition: service_healthy
 
 networks:
   secretai_network:
