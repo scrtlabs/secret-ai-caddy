@@ -9,7 +9,7 @@
 #
 # VRAM budget H100 80GB (79.18 GiB usable):
 #   gemma4:31b   AWQ compressed-tensors 20.2GB weights + 7.9GB KV fp8  = ~29GB physical (42% alloc)
-#   qwen3.6:27b  AWQ int4 (cyankiwi)    14.0GB weights + ~22GB KV fp8  = ~38GB physical (55% alloc)
+#   qwen3.6:27b  AWQ int4 (cyankiwi)    19.2GB weights + ~14GB KV fp8  = ~37GB physical (47% alloc)
 #   -----------------------------------------
 #   Total                                                               ~71GB < 79.18GB ✓
 #
@@ -191,7 +191,7 @@ services:
       --kv-cache-dtype fp8
       --enable-prefix-caching
       --enable-prompt-tokens-details
-      --gpu-memory-utilization 0.55
+      --gpu-memory-utilization 0.47
       --max-model-len 32768
       --max-num-batched-tokens 8192
       --max-num-seqs 256
