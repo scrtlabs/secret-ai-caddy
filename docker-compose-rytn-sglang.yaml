@@ -164,6 +164,7 @@ services:
       --dtype bfloat16
       --quantization compressed-tensors
       --attention-backend triton
+      --enable-multimodal false
       --kv-cache-dtype fp8_e4m3
       --mem-fraction-static 0.41
       --context-length 16384
