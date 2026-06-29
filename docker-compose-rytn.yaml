@@ -1,6 +1,6 @@
 # =============================================================================
 # SecretAI Docker Compose — RYTN (vLLM)
-# vLLM v0.23.0 | Caddy v0.1.18 | LiteLLM router
+# vLLM v0.23.0 | Caddy v0.1.19 | LiteLLM router
 # Models: gemma4:31b + qwen3.6:27b (AWQ / bitsandbytes int4)
 #
 # Architecture:
@@ -13,8 +13,7 @@
 #   -----------------------------------------
 #   Total                                                               ~71GB < 79.18GB ✓
 #
-# qwen3.6:27b max_model_len=131072 (128K native Qwen3; KV=549K tok → 4.2x concurrent at 128K)
-# Mamba block=1568 tok — prefix cache requires >1568 tok shared prefix to show cache hit
+# qwen3.6:27b max_model_len=32768 (Mamba block=1568 tok; prefix cache requires >1568 tok shared prefix)
 #
 # Prefix caching enabled on both models (--enable-prefix-caching).
 # Models start sequentially to avoid GPU memory profiling conflicts.
@@ -40,7 +39,7 @@ services:
       - secretai_network
 
   caddy:
-    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.18
+    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.19
     container_name: caddy-proxy
     ports:
       - "21434:21434"
@@ -193,7 +192,7 @@ services:
       --enable-prefix-caching
       --enable-prompt-tokens-details
       --gpu-memory-utilization 0.55
-      --max-model-len 131072
+      --max-model-len 32768
       --max-num-batched-tokens 8192
       --max-num-seqs 256
       --tensor-parallel-size 1
