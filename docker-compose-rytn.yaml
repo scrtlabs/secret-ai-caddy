@@ -194,7 +194,7 @@ services:
       --enable-prefix-caching
       --enable-prompt-tokens-details
       --gpu-memory-utilization 0.55
-      --max-model-len 32768
+      --max-model-len 131072
       --max-num-batched-tokens 8192
       --max-num-seqs 256
       --tensor-parallel-size 1
