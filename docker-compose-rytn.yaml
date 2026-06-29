@@ -137,7 +137,7 @@ services:
       --kv-cache-dtype fp8
       --enable-prefix-caching
       --enable-prompt-tokens-details
-      --gpu-memory-utilization 0.42
+      --gpu-memory-utilization 0.41
       --max-model-len 16384
       --max-num-batched-tokens 16384
       --tensor-parallel-size 1
