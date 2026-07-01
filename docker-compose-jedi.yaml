@@ -224,7 +224,7 @@ services:
       --kv-cache-dtype fp8
       --no-enable-prefix-caching
       --max-num-batched-tokens 16384
-      --max-model-len 32768
+      --max-model-len 131072
       --max-num-seqs 50
       --tool-call-parser openai
       --enable-auto-tool-choice
