@@ -119,9 +119,16 @@ services:
     image: python@sha256:506f2951c04925a2a98fc0604e0e0a3ffd2788cc4aed0eb77c3517c98ac651c0
     container_name: gpu-watchdog
     runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=utility
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -163,7 +170,7 @@ services:
                         capture_output=True, text=True, timeout=5
                     )
                     if r.returncode != 0:
-                        print(f"[watchdog] nvidia-smi error: {r.stderr.strip()}", flush=True)
+                        print(f"[watchdog] nvidia-smi failed rc={r.returncode} stdout={r.stdout.strip()!r} stderr={r.stderr.strip()!r}", flush=True)
                         time.sleep(5)
                         continue
                     p = [x.strip() for x in r.stdout.strip().split(",")]
