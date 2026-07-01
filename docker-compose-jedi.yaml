@@ -256,7 +256,7 @@ configs:
             model: openai/gpt-oss:120b
             api_base: http://vllm:8000/v1
             api_key: "dummy"
-            max_parallel_requests: 50
+            max_parallel_requests: 200
 
       router_settings:
         allowed_fails: 3

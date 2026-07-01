@@ -330,14 +330,14 @@ configs:
             model: openai/gemma4:31b
             api_base: http://vllm-gemma:8000/v1
             api_key: "dummy"
-            max_parallel_requests: 10
+            max_parallel_requests: 50
 
         - model_name: qwen3.6:27b
           litellm_params:
             model: openai/qwen3.6:27b
             api_base: http://vllm-qwen36:8001/v1
             api_key: "dummy"
-            max_parallel_requests: 50
+            max_parallel_requests: 200
 
       router_settings:
         allowed_fails: 3
