@@ -22,8 +22,7 @@ services:
   caddy:
     image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.18
     container_name: caddy-proxy
-    ports:
-      - "21434:21434"
+    network_mode: host
     volumes:
       - /mnt/secure/app_cert:/etc/ssl/certs:ro
       - /mnt/secure/app_cert:/etc/ssl/private:ro
@@ -41,7 +40,7 @@ services:
       - METERING_INTERVAL=1m
       - METERING_URL=https://secretai.scrtlabs.com
     healthcheck:
-      test: ["CMD", "curl", "http://localhost:80/"]
+      test: ["CMD", "curl", "-k", "-f", "https://127.0.0.1:21434/cpu"]
       interval: 30s
       timeout: 10s
       start_period: 15s
@@ -53,8 +52,6 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-    networks:
-      - secretai_network
 
   vllm:
     image: vllm/vllm-openai:v0.23.0
@@ -62,6 +59,8 @@ services:
     privileged: true
     runtime: nvidia
     ipc: host
+    ports:
+      - "127.0.0.1:8000:8000"
     deploy:
       resources:
         reservations:
@@ -139,6 +138,37 @@ configs:
           respond "" 204
         }
 
+        @teequote_evidence {
+          method GET
+          path /cpu /gpu /docker-compose
+        }
+        handle @teequote_evidence {
+          @has_origin header Origin *
+          header @has_origin {
+            Access-Control-Allow-Origin {header.origin}
+            Access-Control-Allow-Credentials "true"
+            Access-Control-Allow-Methods "GET, OPTIONS"
+            Access-Control-Allow-Headers "*"
+            Access-Control-Expose-Headers "*"
+            Vary "Origin"
+          }
+
+          reverse_proxy 127.0.0.1:29343 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Port {server_port}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-For {remote_host}
+            header_up -Authorization
+            header_up -Cookie
+          }
+        }
+
+        @teequote_path path /cpu /gpu /docker-compose
+        handle @teequote_path {
+          respond "method not allowed" 405
+        }
+
         handle {
           @has_origin header Origin *
           header @has_origin {
@@ -170,7 +200,7 @@ configs:
             x402_min_balance_usd {env.X402_MIN_BALANCE_USD}
           }
 
-          reverse_proxy vllm:8000 {
+          reverse_proxy 127.0.0.1:8000 {
             health_uri /v1/models
             health_interval 30s
             health_timeout 10s
@@ -179,6 +209,7 @@ configs:
             header_up X-Forwarded-Port {server_port}
             header_up X-Forwarded-Proto {scheme}
             header_up X-Forwarded-For {remote_host}
+            header_up -Cookie
           }
         }
 
