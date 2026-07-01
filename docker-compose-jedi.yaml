@@ -236,6 +236,7 @@ services:
       --gpu-memory-utilization 0.95
       --kv-cache-dtype fp8
       --enable-prefix-caching
+      --enable-prompt-tokens-details
       --max-num-batched-tokens 16384
       --max-model-len 131072
       --max-num-seqs 50
