@@ -10,7 +10,7 @@ x-gpu: &gpu
 services:
 
   init:
-    image: alpine:latest
+    image: alpine@sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f
     container_name: sys-init
     volumes:
       - /mnt/secure:/workdir
@@ -80,7 +80,7 @@ services:
       - secretai_network
 
   ollama-init:
-    image: alpine:latest
+    image: alpine@sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f
     container_name: ollama-llm-init
 
     depends_on:
@@ -176,7 +176,7 @@ services:
       - secretai_network
 
   ollama:
-    image: ollama/ollama:0.24.0
+    image: ollama/ollama@sha256:7db82c93ff9fae4011a2aa10931b1d2c2a228d508b8736366e3fbaee616b2e8c
     container_name: ollama-llm
     privileged: true
 

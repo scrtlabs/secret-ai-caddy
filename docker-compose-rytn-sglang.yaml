@@ -38,7 +38,7 @@
 services:
 
   init:
-    image: alpine:3.23.4
+    image: alpine@sha256:4d889c14e7d5a73929ab00be2ef8ff22437e7cbc545931e52554a7b00e123d8b
     container_name: sys-init
     volumes:
       - /mnt/secure:/workdir
@@ -52,7 +52,7 @@ services:
       - secretai_network
 
   caddy:
-    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.19
+    image: ghcr.io/scrtlabs/secret-ai-caddy@sha256:5538ef2ba3c01df6f33c572e613b1ce59642e5d92b8eef835848da6371e092bf
     container_name: caddy-proxy
     ports:
       - "21434:21434"
@@ -91,7 +91,7 @@ services:
 
   # ── LiteLLM router ──────────────────────────────────────────────────────
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm@sha256:64b0c74045c506ce62b3b53e0bc90ec717044285eef59bf015562644c316f159
     container_name: litellm-router
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "4"]
     configs:
@@ -119,7 +119,7 @@ services:
   # Full GPU budget available — mem-fraction-static 0.95 leaves 5% (~4 GiB)
   # for CUDA graphs, PyTorch caching allocator, and driver overhead.
   sglang-qwen36:
-    image: lmsysorg/sglang:latest
+    image: lmsysorg/sglang@sha256:9611bd4c5624b0e9e17829506188a12f17205f2083de0dd44d6c521733553a50
     container_name: sglang-qwen36
     privileged: true
     runtime: nvidia

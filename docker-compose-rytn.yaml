@@ -31,7 +31,7 @@
 services:
 
   init:
-    image: alpine:3.23.4
+    image: alpine@sha256:4d889c14e7d5a73929ab00be2ef8ff22437e7cbc545931e52554a7b00e123d8b
     container_name: sys-init
     volumes:
       - /mnt/secure:/workdir
@@ -46,7 +46,7 @@ services:
       - secretai_network
 
   caddy:
-    image: ghcr.io/scrtlabs/secret-ai-caddy:v0.1.19
+    image: ghcr.io/scrtlabs/secret-ai-caddy@sha256:5538ef2ba3c01df6f33c572e613b1ce59642e5d92b8eef835848da6371e092bf
     container_name: caddy-proxy
     ports:
       - "21434:21434"
@@ -85,7 +85,7 @@ services:
 
   # ── LiteLLM router ───────────────────────────────────────────────────────
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm@sha256:64b0c74045c506ce62b3b53e0bc90ec717044285eef59bf015562644c316f159
     container_name: litellm-router
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "4"]
     configs:
@@ -116,7 +116,7 @@ services:
   # Exposes JSON status at :9090/gpu-status — Caddy proxies it to /gpu-status.
   # Logs CRITICAL when GPU util >92% sustained for 120+ seconds.
   gpu-watchdog:
-    image: nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+    image: nvcr.io/nvidia/cuda@sha256:8767a245ed2c481eb245d8f6c625accc3788e1fb8612403d6b4cd4645a4f09c7
     container_name: gpu-watchdog
     runtime: nvidia
     environment:
@@ -208,7 +208,7 @@ services:
 
   # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
   vllm-gemma:
-    image: vllm/vllm-openai:v0.23.0
+    image: vllm/vllm-openai@sha256:3a1e7f5904e1a1192a02aa0086ceaffc33985d7044c7bb25b3a43d61bdbe3ac0
     container_name: vllm-gemma
     privileged: true
     runtime: nvidia
@@ -260,7 +260,7 @@ services:
 
   # ── vLLM: qwen3.6:27b ────────────────────────────────────────────────────
   vllm-qwen36:
-    image: vllm/vllm-openai:v0.23.0
+    image: vllm/vllm-openai@sha256:3a1e7f5904e1a1192a02aa0086ceaffc33985d7044c7bb25b3a43d61bdbe3ac0
     container_name: vllm-qwen36
     privileged: true
     runtime: nvidia

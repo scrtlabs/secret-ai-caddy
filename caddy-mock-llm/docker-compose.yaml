@@ -13,7 +13,7 @@ services:
       - secretai_network
 
   caddy:
-    image: ghcr.io/scrtlabs/secret-ai-caddy:latest
+    image: ghcr.io/scrtlabs/secret-ai-caddy@sha256:3dc30d59a42a60e9cbe27620a07d876e555396834ec11566ddc846a5d584805e
     container_name: secretai-caddy
     ports:
       - "21434:21434"
