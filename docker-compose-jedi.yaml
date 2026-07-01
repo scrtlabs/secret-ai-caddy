@@ -100,7 +100,7 @@ services:
   # Exposes JSON status at :9090/gpu-status — Caddy proxies it to /gpu-status.
   # Logs CRITICAL when GPU util >92% sustained for 120+ seconds.
   gpu-watchdog:
-    image: nvcr.io/nvidia/cuda@sha256:8767a245ed2c481eb245d8f6c625accc3788e1fb8612403d6b4cd4645a4f09c7
+    image: python@sha256:506f2951c04925a2a98fc0604e0e0a3ffd2788cc4aed0eb77c3517c98ac651c0
     container_name: gpu-watchdog
     runtime: nvidia
     environment:
@@ -118,7 +118,6 @@ services:
       - bash
       - -c
       - |
-        apt-get install -y python3 -qq 2>/dev/null
         cat > /tmp/watchdog.py << 'PYEOF'
         import subprocess, json, time, threading, datetime
         from http.server import HTTPServer, BaseHTTPRequestHandler
