@@ -19,6 +19,13 @@
 # Models start sequentially to avoid GPU memory profiling conflicts.
 #
 # Port 18800 (TGI Solidity LLM) is a separate deployment; Caddy routes only.
+#
+# Protection layers:
+#   1. LiteLLM max_parallel_requests — 429 when limit exceeded (gemma4:10, qwen36:50)
+#   2. LiteLLM circuit breaker — pauses model 60s after 3 consecutive failures
+#   3. vLLM --max-num-seqs — caps scheduler concurrency (gemma4:10, qwen36:50)
+#   4. gpu-watchdog — monitors GPU util/temp, exposes /gpu-status endpoint
+#   5. Caddy max_retries 2 / retry_backoff 30s (metering retries only)
 # =============================================================================
 
 services:
@@ -76,7 +83,7 @@ services:
     networks:
       - secretai_network
 
-  # ── LiteLLM router: single OpenAI-compatible endpoint for all models ────
+  # ── LiteLLM router ───────────────────────────────────────────────────────
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
     container_name: litellm-router
@@ -104,8 +111,102 @@ services:
       vllm-qwen36:
         condition: service_healthy
 
+  # ── GPU Watchdog ──────────────────────────────────────────────────────────
+  # Monitors GPU utilization, temperature, memory via nvidia-smi every 5s.
+  # Exposes JSON status at :9090/gpu-status — Caddy proxies it to /gpu-status.
+  # Logs CRITICAL when GPU util >92% sustained for 120+ seconds.
+  gpu-watchdog:
+    image: nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+    container_name: gpu-watchdog
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=utility
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - secretai_network
+    command:
+      - bash
+      - -c
+      - |
+        apt-get install -y python3 -qq 2>/dev/null
+        cat > /tmp/watchdog.py << 'PYEOF'
+        import subprocess, json, time, threading, datetime
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from collections import deque
+
+        # 24 samples × 5s = 120s sliding window
+        history = deque(maxlen=24)
+        gpu = {}
+        critical = False
+
+        def poll():
+            global gpu, critical
+            while True:
+                try:
+                    r = subprocess.run(
+                        ["nvidia-smi",
+                         "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    p = [x.strip() for x in r.stdout.strip().split(",")]
+                    util = int(p[0])
+                    mem_used = int(p[1])
+                    mem_total = int(p[2])
+                    gpu = {
+                        "util_pct": util,
+                        "memory_used_mb": mem_used,
+                        "memory_total_mb": mem_total,
+                        "memory_used_pct": round(mem_used / mem_total * 100),
+                        "temp_c": int(p[3]),
+                        "power_w": round(float(p[4]), 1),
+                    }
+                    history.append(util > 92)
+                    overload_score = sum(history)
+                    critical = len(history) >= 24 and overload_score >= 22
+                    if critical:
+                        ts = datetime.datetime.utcnow().isoformat()
+                        print(f"[{ts}] CRITICAL: sustained GPU overload "
+                              f"util={util}% temp={gpu['temp_c']}C "
+                              f"score={overload_score}/24", flush=True)
+                except Exception as e:
+                    print(f"[watchdog] error: {e}", flush=True)
+                time.sleep(5)
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/gpu-status":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = json.dumps({
+                    **gpu,
+                    "sustained_overload": critical,
+                    "overload_score": sum(history),
+                    "overload_threshold": 24,
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                }, indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+
+        threading.Thread(target=poll, daemon=True).start()
+        print("[watchdog] started on :9090/gpu-status", flush=True)
+        HTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+        PYEOF
+        exec python3 /tmp/watchdog.py
+
   # ── vLLM: gemma4:31b ──────────────────────────────────────────────────────
-  # HF model: cyankiwi/gemma-4-31B-it-AWQ-4bit (compressed-tensors, lower CUDA graph overhead)
   vllm-gemma:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-gemma
@@ -140,6 +241,7 @@ services:
       --gpu-memory-utilization 0.41
       --max-model-len 16384
       --max-num-batched-tokens 16384
+      --max-num-seqs 10
       --tensor-parallel-size 1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
@@ -157,8 +259,6 @@ services:
       - secretai_network
 
   # ── vLLM: qwen3.6:27b ────────────────────────────────────────────────────
-  # HF model: cyankiwi/Qwen3.6-27B-AWQ-INT4 (AWQ 4-bit; same author as gemma4 AWQ)
-  # Starts after gemma is healthy to avoid GPU memory profiling conflicts
   vllm-qwen36:
     image: vllm/vllm-openai:v0.23.0
     container_name: vllm-qwen36
@@ -196,7 +296,7 @@ services:
       --gpu-memory-utilization 0.55
       --max-model-len 131072
       --max-num-batched-tokens 8192
-      --max-num-seqs 256
+      --max-num-seqs 50
       --tensor-parallel-size 1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/v1/models"]
@@ -230,11 +330,19 @@ configs:
             model: openai/gemma4:31b
             api_base: http://vllm-gemma:8000/v1
             api_key: "dummy"
+            max_parallel_requests: 10
+
         - model_name: qwen3.6:27b
           litellm_params:
             model: openai/qwen3.6:27b
             api_base: http://vllm-qwen36:8001/v1
             api_key: "dummy"
+            max_parallel_requests: 50
+
+      router_settings:
+        allowed_fails: 3
+        cooldown_time: 60
+        num_retries: 0
 
       litellm_settings:
         drop_params: true
@@ -254,6 +362,11 @@ configs:
 
       :21434 {
         tls /etc/ssl/certs/secret_vm_app_fullchain.pem /etc/ssl/private/secret_vm_app_private.pem
+
+        # GPU status — public, no auth required
+        handle /gpu-status {
+          reverse_proxy gpu-watchdog:9090
+        }
 
         @cors_preflight method OPTIONS
         handle @cors_preflight {
@@ -290,8 +403,8 @@ configs:
             metering_url {env.METERING_URL}
             max_body_size 2097152
             token_counting_mode accurate
-            max_retries 5
-            retry_backoff 300s
+            max_retries 2
+            retry_backoff 30s
             enable_metrics true
             metrics_path /metrics
             x402_enabled {env.X402_ENABLED}
@@ -368,8 +481,8 @@ configs:
             metering_url {env.METERING_URL}
             max_body_size 2097152
             token_counting_mode accurate
-            max_retries 5
-            retry_backoff 300s
+            max_retries 2
+            retry_backoff 30s
             x402_enabled {env.X402_ENABLED}
             devportal_url {env.DEVPORTAL_URL}
             devportal_service_key {env.DEVPORTAL_SERVICE_KEY}
