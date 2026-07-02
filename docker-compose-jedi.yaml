@@ -102,6 +102,7 @@ services:
   gpu-watchdog:
     image: python@sha256:506f2951c04925a2a98fc0604e0e0a3ffd2788cc4aed0eb77c3517c98ac651c0
     container_name: gpu-watchdog
+    privileged: true
     runtime: nvidia
     deploy:
       resources:
