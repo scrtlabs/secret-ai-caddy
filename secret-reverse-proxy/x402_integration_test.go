@@ -482,6 +482,100 @@ func TestX402_NonInferenceGET_ProxiedFreeNoBalanceCheck(t *testing.T) {
 	}
 }
 
+func TestX402_EmbeddingsPathWithoutModel_Returns400(t *testing.T) {
+	// Residual bypass being closed: /v1/embeddings is not a "known inference
+	// path" under the old allowlist, so a model-less POST here used to be
+	// proxied through for free. Under the free-pass inversion it must be
+	// rejected like any other unrecognized billable route.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"input":"hello world"}` // no "model" field
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/embeddings", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for embeddings path without model")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_TrailingSlashInferencePathWithoutModel_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions/", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for trailing-slash inference path without model")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_ApiShowWithoutModel_ProxiedFreeNoBalanceCheck(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds — must not matter for this path
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"name":"llama3"}` // non-model JSON body
+	req := agentReq(t, privKey, walletAddr, "POST", "/api/show", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for /api/show")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
 func TestLegacy_InferencePathWithoutModel_Returns400(t *testing.T) {
 	portal := newTestPortalServer("test-service-key")
 	defer portal.close()

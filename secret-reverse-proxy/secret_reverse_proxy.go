@@ -536,13 +536,16 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Detect model from request body
 	modelName := detectModelFromRequestBody(requestBody)
 
-	// Fail closed: a POST to a known inference endpoint with no detectable model is
-	// not a legitimate non-LLM request — reject instead of proxying for free.
+	// Fail closed: a POST with no detectable model is billable by default and
+	// only proxied for free if the path is explicitly on the free-pass list
+	// (see isFreePassPath). Non-POST requests (GET/HEAD/OPTIONS/...) are
+	// always free-passed, preserving discovery/health-check behavior.
 	// Scoped to billing-enabled deployments only: when x402/billing is off, this
 	// middleware runs as a pure auth proxy and some backends legitimately default
 	// the model when the field is omitted, so we must not break that proxy-through
 	// behavior.
-	if m.Config.X402Enabled && m.portalClient != nil && modelName == "unknown" && r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
+	if m.Config.X402Enabled && m.portalClient != nil && modelName == "unknown" &&
+		r.Method == http.MethodPost && !isFreePassPath(r.URL.Path) {
 		logger.Info("Rejecting inference request with no detectable model",
 			zap.String("path", r.URL.Path),
 			zap.String("remote_addr", r.RemoteAddr))
@@ -1099,21 +1102,23 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 
 	// 4. For non-LLM requests (no "model" field in body), skip balance check entirely
 	// and proxy directly — these paths consume no tokens and should never be gated.
-	// Exception: a POST to a known inference endpoint with no detectable model is
-	// not a legitimate non-LLM request — fail closed instead of proxying for free.
+	// A GET/HEAD/etc. is always free-passed (discovery/health checks). A POST with
+	// no detectable model is billable by default and only proxied for free if the
+	// path is explicitly on the free-pass list (see isFreePassPath) — anything else
+	// fails closed instead of proxying for free.
 	if model == "unknown" {
-		if r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
-			logger.Info("x402: rejecting inference request with no detectable model",
+		if r.Method != http.MethodPost || isFreePassPath(r.URL.Path) {
+			logger.Debug("x402: non-LLM request, skipping balance check",
+				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.String("wallet", walletAddr))
-			http.Error(w, "Missing or invalid model in request body", http.StatusBadRequest)
-			return nil
+			return next.ServeHTTP(w, r)
 		}
-		logger.Debug("x402: non-LLM request, skipping balance check",
-			zap.String("method", r.Method),
+		logger.Info("x402: rejecting inference request with no detectable model",
 			zap.String("path", r.URL.Path),
 			zap.String("wallet", walletAddr))
-		return next.ServeHTTP(w, r)
+		http.Error(w, "Missing or invalid model in request body", http.StatusBadRequest)
+		return nil
 	}
 
 	// 5. Check balance with DevPortal (LLM requests only)
@@ -1616,22 +1621,33 @@ func looksLikeJSONObject(body string) bool {
 	return strings.HasPrefix(trimmed, "{")
 }
 
-// knownInferencePaths lists the URL path suffixes that identify a request as
-// an LLM inference call. Matched by suffix so endpoints mounted under a base
-// path (e.g. "/proxy/v1/chat/completions") are still covered.
-var knownInferencePaths = []string{
-	"/v1/chat/completions",
-	"/v1/completions",
-	"/api/chat",
-	"/api/generate",
+// freePassPaths lists the URL path suffixes that are allowed to proceed
+// without a detectable "model" field even on POST. This is deliberately an
+// allowlist of known-safe, non-token-consuming routes rather than an
+// allowlist of known inference routes: an inference-route allowlist fails
+// open for every LLM/embedding endpoint it doesn't yet know about (new
+// backends, new API surfaces, trailing-slash variants, ...), which is exactly
+// how the billing bypass this gate exists to close kept reappearing. A
+// free-pass list fails closed by default — anything not explicitly named
+// here is treated as billable and rejected when it has no model. Matched by
+// suffix so endpoints mounted under a base path (e.g. "/proxy/api/show") are
+// still covered.
+var freePassPaths = []string{
+	"/api/show", // Ollama model-metadata lookup — legitimate, non-token-consuming
 }
 
-// isInferencePath reports whether path is a known LLM inference endpoint.
-// Used to fail closed: a POST to one of these paths with no detectable model
-// must not be proxied for free (see BLOCK 4/serveX402 step 4).
-func isInferencePath(path string) bool {
-	for _, suffix := range knownInferencePaths {
-		if strings.HasSuffix(path, suffix) {
+// isFreePassPath reports whether path is on the free-pass list, i.e. safe to
+// proxy through on POST even without a detectable model. The path is
+// normalized (trailing slashes stripped) before matching. Used to fail
+// closed: a POST to any other path with no detectable model must not be
+// proxied for free (see BLOCK 4/serveX402 step 4).
+func isFreePassPath(path string) bool {
+	normalized := strings.TrimRight(path, "/")
+	if normalized == "" {
+		normalized = "/"
+	}
+	for _, suffix := range freePassPaths {
+		if strings.HasSuffix(normalized, suffix) {
 			return true
 		}
 	}

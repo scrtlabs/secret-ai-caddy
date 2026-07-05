@@ -100,27 +100,26 @@ func TestInjectStreamUsageOption_IgnoresContentType(t *testing.T) {
 	}
 }
 
-// TestIsInferencePath exercises the known-inference-endpoint matcher used to
-// decide whether a model-less POST should be fail-closed rejected.
-func TestIsInferencePath(t *testing.T) {
+// TestIsFreePassPath exercises the free-pass matcher used to decide whether
+// a model-less POST should be proxied through instead of fail-closed rejected.
+func TestIsFreePassPath(t *testing.T) {
 	testCases := []struct {
 		name     string
 		path     string
 		expected bool
 	}{
-		{"chat completions", "/v1/chat/completions", true},
-		{"completions", "/v1/completions", true},
-		{"ollama chat", "/api/chat", true},
-		{"ollama generate", "/api/generate", true},
-		{"base-path prefixed", "/proxy/v1/chat/completions", true},
-		{"trailing slash not matched", "/v1/chat/completions/", false},
-		{"unrelated path", "/v1/models", false},
+		{"ollama show", "/api/show", true},
+		{"ollama show trailing slash", "/api/show/", true},
+		{"base-path prefixed", "/proxy/api/show", true},
+		{"chat completions not free-pass", "/v1/chat/completions", false},
+		{"embeddings not free-pass", "/v1/embeddings", false},
+		{"ollama chat not free-pass", "/api/chat", false},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isInferencePath(tc.path); got != tc.expected {
-				t.Errorf("isInferencePath(%q) = %v, want %v", tc.path, got, tc.expected)
+			if got := isFreePassPath(tc.path); got != tc.expected {
+				t.Errorf("isFreePassPath(%q) = %v, want %v", tc.path, got, tc.expected)
 			}
 		})
 	}
