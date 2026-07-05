@@ -1,11 +1,14 @@
 package secret_reverse_proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -162,10 +165,21 @@ type mockLLMHandler struct {
 	// statusCode, when non-zero, is written via WriteHeader before the body
 	// so tests can simulate an upstream failure (e.g. 500).
 	statusCode int
+	// receivedBody captures the exact bytes the upstream saw, so tests can
+	// assert that forwarding did not mutate/re-encode the request body.
+	receivedBody []byte
+	// receivedContentEncoding captures the Content-Encoding header as seen
+	// by the upstream.
+	receivedContentEncoding string
 }
 
 func (h *mockLLMHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	h.called = true
+	h.receivedContentEncoding = r.Header.Get("Content-Encoding")
+	if r.Body != nil {
+		b, _ := io.ReadAll(r.Body)
+		h.receivedBody = b
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if h.statusCode != 0 {
 		w.WriteHeader(h.statusCode)
@@ -205,6 +219,20 @@ func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, 
 	m.x402MinBalance = minBalanceUSD
 
 	return m
+}
+
+// gzipCompress gzip-encodes s, for building gzip-encoded agent request bodies.
+func gzipCompress(t *testing.T, s string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(s)); err != nil {
+		t.Fatalf("failed to gzip-compress test body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("failed to close gzip writer: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // agentReq builds a signed agent request for tests.
@@ -758,5 +786,114 @@ func TestLegacy_UpstreamError_SkipsTokenAccumulator(t *testing.T) {
 	usage := m.tokenAccumulator.PeekUsage()
 	if len(usage) != 0 {
 		t.Errorf("expected no accumulated usage for a failed upstream request, got %#v", usage)
+	}
+}
+
+func TestX402_GzipBody_FundedWallet_ForwardsCompressedBytesUnchanged(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.02) // $0.02
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+	if next.receivedContentEncoding != "gzip" {
+		t.Errorf("expected upstream to see Content-Encoding: gzip, got %q", next.receivedContentEncoding)
+	}
+	if !bytes.Equal(next.receivedBody, compressed) {
+		t.Errorf("expected upstream to receive the original compressed bytes unchanged")
+	}
+
+	// Usage is reported from a goroutine; wait for it so it can't race with
+	// portal.close() and leak a connection-refused log into later tests.
+	select {
+	case <-portal.reportSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async usage report")
+	}
+}
+
+func TestX402_GzipBody_ZeroBalance_Returns402(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (model detected through compression), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_GzipContentEncodingWithGarbageBody_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	garbage := "this is not gzip data"
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", garbage)
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for undecodable gzip body")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
 	}
 }

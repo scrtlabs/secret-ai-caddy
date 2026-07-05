@@ -17,6 +17,7 @@ package secret_reverse_proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1069,6 +1070,29 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// decompressGzipBody gunzips a compressed request body for analysis purposes
+// only (model detection, message-content extraction, input-token counting).
+// The read is capped at maxBodySize+1 to guard against zip bombs; exceeding
+// the cap is reported as an error here just like any other decompression
+// failure — Task 3 is responsible for wiring up a dedicated 413 response for
+// oversized bodies.
+func decompressGzipBody(rawBody []byte, maxBodySize int64) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(rawBody))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	decoded, err := io.ReadAll(io.LimitReader(zr, maxBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(decoded)) > maxBodySize {
+		return nil, fmt.Errorf("decompressed body exceeds max size of %d bytes", maxBodySize)
+	}
+	return decoded, nil
+}
+
 // serveX402 handles requests from x402 agents identified by x-agent-address header.
 // Flow: verify EIP-191 signature → check portal balance → forward → report usage.
 func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, walletAddr string) error {
@@ -1111,7 +1135,30 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	// This determines whether the request is an LLM call (has "model" field) or not.
 	// We do this BEFORE the balance check so that non-LLM paths (e.g. GET /v1/models,
 	// health checks, embedding queries without billing) are never blocked by balance.
-	model := detectModelFromRequestBody(string(rawBody))
+	//
+	// A gzip-encoded body never sniffs as JSON, so for gzip requests we gunzip
+	// rawBody into an analysis-only copy here and reuse it below (step 7) for
+	// message-content extraction and input-token counting. This copy is never
+	// forwarded upstream: the signature above was verified over rawBody, and the
+	// bytes forwarded to next.ServeHTTP (step 8) stay exactly what step 1 restored,
+	// so the upstream still receives the original compressed body. If gunzip fails
+	// (or the decompressed size exceeds the configured cap, guarding against zip
+	// bombs), analysisBody is left empty, model detection reports "unknown", and
+	// the existing fail-closed gate below applies.
+	isGzipRequest := strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip")
+	analysisBody := rawBody
+	if isGzipRequest {
+		decoded, err := decompressGzipBody(rawBody, m.Config.MaxBodySize)
+		if err != nil {
+			logger.Info("x402: failed to gunzip request body for analysis",
+				zap.Error(err),
+				zap.String("wallet", walletAddr))
+			analysisBody = nil
+		} else {
+			analysisBody = decoded
+		}
+	}
+	model := detectModelFromRequestBody(string(analysisBody))
 
 	// 4. For non-LLM requests (no "model" field in body), skip balance check entirely
 	// and proxy directly — these paths consume no tokens and should never be gated.
@@ -1157,19 +1204,34 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	}
 
 	// 7. Count input tokens from message text only (not the full JSON envelope).
-	requestBody, _ := m.readRequestBody(r)
+	// readRequestBody decompresses gzip bodies itself via the metering BodyHandler,
+	// but for x402 requests we already have a decompressed analysis copy from step 3
+	// above — reuse it instead of gunzipping a second time, and skip readRequestBody's
+	// r.Body reassignment entirely so the compressed bytes restored in step 1 remain
+	// untouched for forwarding.
+	var requestBody string
+	if isGzipRequest {
+		requestBody = string(analysisBody)
+	} else {
+		requestBody, _ = m.readRequestBody(r)
+	}
 	inputContent := extractRequestMessageContent(requestBody)
 	if inputContent == "" {
 		inputContent = requestBody
 	}
 	inputTokens := m.countTokens(inputContent, "text/plain", model)
 
-	// Inject stream_options.include_usage=true so vLLM returns authoritative usage counts.
-	forwarded := injectStreamUsageOption(requestBody)
-	if forwarded != requestBody {
-		bodyBytes := []byte(forwarded)
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		r.ContentLength = int64(len(bodyBytes))
+	// Inject stream_options.include_usage=true so vLLM returns authoritative usage
+	// counts. Skipped for compressed requests: rewriting the body would produce
+	// plaintext JSON under a gzip Content-Encoding header, which the upstream can't
+	// decode — the original compressed body (restored in step 1) is forwarded as-is.
+	if !isGzipRequest {
+		forwarded := injectStreamUsageOption(requestBody)
+		if forwarded != requestBody {
+			bodyBytes := []byte(forwarded)
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
+		}
 	}
 
 	// 8. Forward to upstream with response capture
