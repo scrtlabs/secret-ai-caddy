@@ -843,6 +843,87 @@ func TestLegacy_UpstreamError_SkipsTokenAccumulator(t *testing.T) {
 	}
 }
 
+// fakeMetricsCollector is a lightweight interfaces.MetricsCollector shim used to
+// assert which metrics calls fire, since the production collector doesn't expose
+// queryable counters in tests.
+type fakeMetricsCollector struct {
+	authorizedCalls int
+	tokensCalls     int
+	lastInputTokens int64
+	lastOutputToken int64
+}
+
+func (f *fakeMetricsCollector) RecordRequest()     {}
+func (f *fakeMetricsCollector) RecordAuthorized()  { f.authorizedCalls++ }
+func (f *fakeMetricsCollector) RecordRejected()    {}
+func (f *fakeMetricsCollector) RecordRateLimited() {}
+func (f *fakeMetricsCollector) RecordTokens(inputTokens, outputTokens int64) {
+	f.tokensCalls++
+	f.lastInputTokens = inputTokens
+	f.lastOutputToken = outputTokens
+}
+func (f *fakeMetricsCollector) RecordProcessingTime(time.Duration)              {}
+func (f *fakeMetricsCollector) RecordTokenCountTime(time.Duration)              {}
+func (f *fakeMetricsCollector) RecordValidationError()                          {}
+func (f *fakeMetricsCollector) RecordTokenCountError()                          {}
+func (f *fakeMetricsCollector) RecordReportingError()                           {}
+func (f *fakeMetricsCollector) RecordCacheHit()                                 {}
+func (f *fakeMetricsCollector) RecordCacheMiss()                                {}
+func (f *fakeMetricsCollector) RecordSuccessfulReport()                         {}
+func (f *fakeMetricsCollector) RecordFailedReport()                             {}
+func (f *fakeMetricsCollector) UpdatePendingReports(int64)                      {}
+func (f *fakeMetricsCollector) GetMetrics() map[string]any                      { return nil }
+func (f *fakeMetricsCollector) ServeMetrics(http.ResponseWriter, *http.Request) {}
+
+func TestLegacy_UpstreamError_SkipsTokenMetrics(t *testing.T) {
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+	m.tokenCounter = factories.CreateTokenCounter()
+	m.tokenAccumulator = NewTokenAccumulator()
+	metrics := &fakeMetricsCollector{}
+	m.metricsCollector = metrics
+
+	next := &mockLLMHandler{
+		statusCode: http.StatusInternalServerError,
+		// No "usage" object, so the tokenizer would otherwise count this
+		// error body itself as output tokens.
+		responseBody: `{"error":"upstream exploded, this message is deliberately long enough to tokenize to a nonzero count"}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected upstream 500 to pass through, got %d", w.Code)
+	}
+
+	if metrics.authorizedCalls != 1 {
+		t.Errorf("expected RecordAuthorized to fire once (authorization succeeded), got %d", metrics.authorizedCalls)
+	}
+	if metrics.tokensCalls != 0 {
+		t.Errorf("expected RecordTokens to be skipped on upstream failure, got %d calls with (in=%d, out=%d)",
+			metrics.tokensCalls, metrics.lastInputTokens, metrics.lastOutputToken)
+	}
+}
+
 func TestX402_GzipBody_FundedWallet_ForwardsCompressedBytesUnchanged(t *testing.T) {
 	portal := newTestPortalServer("test-service-key")
 	defer portal.close()

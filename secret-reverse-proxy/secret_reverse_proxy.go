@@ -628,6 +628,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		return err
 	}
 
+	responseStatus := http.StatusOK
+	if statusWriter, ok := wrappedWriter.(*TokenMeteringResponseWriter); ok {
+		responseStatus = statusWriter.Status()
+	}
+	upstreamOK := responseStatus >= 200 && responseStatus < 300
+
 	// Count response tokens
 	responseTokenCountStart := time.Now()
 	responseBody, _ := m.extractResponseBody(wrappedWriter)
@@ -655,8 +661,11 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Record response token counting time
 	if m.metricsCollector != nil {
 		m.metricsCollector.RecordTokenCountTime(time.Since(responseTokenCountStart))
-		// Record token metrics
-		m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
+		// Record token metrics — only for successful upstream responses; a failed
+		// upstream shouldn't inflate token counters, matching the x402 path.
+		if upstreamOK {
+			m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
+		}
 		// Record processing time
 		m.metricsCollector.RecordProcessingTime(time.Since(startTime))
 	}
@@ -665,12 +674,7 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Non-LLM endpoints (GET /v1/models, GET /api/tags, /api/version, etc.) produce
 	// output tokens from their JSON responses but should never be billed.
 	if modelName != "unknown" {
-		responseStatus := http.StatusOK
-		if statusWriter, ok := wrappedWriter.(*TokenMeteringResponseWriter); ok {
-			responseStatus = statusWriter.Status()
-		}
-
-		if responseStatus < 200 || responseStatus >= 300 {
+		if !upstreamOK {
 			// The upstream failed: do not bill the caller for it.
 			caddy.Log().Info("Upstream error, skipping usage recording",
 				zap.Int("status", responseStatus),
