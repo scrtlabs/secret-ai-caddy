@@ -41,18 +41,27 @@ func TestDetectModelFromRequestBody_IgnoresContentType(t *testing.T) {
 		expectedModel string
 	}{
 		{
+			// Formerly gated on Content-Type: text/plain, which would have
+			// hidden this from billing entirely.
 			name:          "chat body mislabeled as text/plain still detected",
+			requestBody:   chatBody,
+			expectedModel: "llama3",
+		},
+		{
+			// Formerly gated on an empty/missing Content-Type header.
+			name:          "chat body with empty content type still detected",
+			requestBody:   chatBody,
+			expectedModel: "llama3",
+		},
+		{
+			// Regression: application/json must keep working.
+			name:          "chat body regression with application/json",
 			requestBody:   chatBody,
 			expectedModel: "llama3",
 		},
 		{
 			name:          "chat body with leading whitespace before brace",
 			requestBody:   "   " + chatBody,
-			expectedModel: "llama3",
-		},
-		{
-			name:          "chat body regression with application/json",
-			requestBody:   chatBody,
 			expectedModel: "llama3",
 		},
 		{
