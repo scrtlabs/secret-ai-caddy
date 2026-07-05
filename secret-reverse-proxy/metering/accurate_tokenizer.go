@@ -15,6 +15,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// hfCachePathMu serializes calls into tokenizer.CachedPath. That function
+// lazily initializes a package-level cache directory variable in the
+// sugarme/tokenizer library on first use without any synchronization of its
+// own, so calling it concurrently (e.g. from PreloadCommonModels, or from
+// multiple AccurateTokenizer instances at once) is unsafe. This mutex is
+// process-wide on purpose, since the hazard it guards against is itself
+// process-wide state owned by the dependency.
+var hfCachePathMu sync.Mutex
+
 // AccurateTokenizer provides model-specific accurate token counting
 type AccurateTokenizer struct {
 	logger       *zap.Logger
@@ -236,7 +245,9 @@ func (at *AccurateTokenizer) getOrLoadHFTokenizer(modelIdentifier string) (*toke
 	at.logger.Info("Loading HuggingFace tokenizer", zap.String("model", modelIdentifier))
 
 	// Try to get tokenizer.json from HuggingFace
+	hfCachePathMu.Lock()
 	configFile, err := tokenizer.CachedPath(modelIdentifier, "tokenizer.json")
+	hfCachePathMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tokenizer config: %w", err)
 	}

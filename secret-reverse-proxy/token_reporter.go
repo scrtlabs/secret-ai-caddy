@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -24,7 +25,7 @@ type ResilientReporter struct {
 	maxRetries       int
 	retryBackoff     time.Duration
 	stopChan         chan struct{}
-	running          bool
+	running          atomic.Bool
 }
 
 type FailedReport struct {
@@ -42,25 +43,24 @@ func NewResilientReporter(config *Config, accumulator *TokenAccumulator) *Resili
 		maxRetries:       3,
 		retryBackoff:     time.Minute * 5,
 		stopChan:         make(chan struct{}),
-		running:          false,
 	}
 }
 
 func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
-	if rr.running {
+	if rr.running.Load() {
 		rr.logger.Warn("Reporting loop is already running")
 		return
 	}
-	
+
 	// Ensure failed reports directory exists
 	if err := os.MkdirAll(rr.failedReportsDir, 0755); err != nil {
 		rr.logger.Error("Failed to create failed reports directory", zap.Error(err))
 	}
 
-	rr.running = true
+	rr.running.Store(true)
 	go func() {
 		defer func() {
-			rr.running = false
+			rr.running.Store(false)
 		}()
 		
 		ticker := time.NewTicker(interval)
@@ -84,19 +84,19 @@ func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
 
 // Stop gracefully stops the reporting loop
 func (rr *ResilientReporter) Stop() {
-	if !rr.running {
+	if !rr.running.Load() {
 		return
 	}
-	
+
 	rr.logger.Info("Requesting resilient reporter to stop")
 	close(rr.stopChan)
-	
+
 	// Wait a bit for goroutine to finish
-	for i := 0; i < 10 && rr.running; i++ {
+	for i := 0; i < 10 && rr.running.Load(); i++ {
 		time.Sleep(100 * time.Millisecond)
 	}
-	
-	if rr.running {
+
+	if rr.running.Load() {
 		rr.logger.Warn("Resilient reporter did not stop gracefully within timeout")
 	} else {
 		rr.logger.Info("Resilient reporter stopped successfully")
