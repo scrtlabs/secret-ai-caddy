@@ -59,15 +59,20 @@ type testPortalServer struct {
 	balances     map[string]float64 // wallet → USD balance
 	usageReports []x402.UsageReportRequest
 	balanceCheck int // number of GetBalance calls received
+	reportUsage  int // number of ReportUsage calls received
 	serviceKey   string
 	mu           sync.Mutex
 	server       *httptest.Server
+	// reportSignal fires once per ReportUsage call so tests can wait
+	// deterministically for the async report goroutine instead of sleeping.
+	reportSignal chan struct{}
 }
 
 func newTestPortalServer(serviceKey string) *testPortalServer {
 	p := &testPortalServer{
-		balances:   make(map[string]float64),
-		serviceKey: serviceKey,
+		balances:     make(map[string]float64),
+		serviceKey:   serviceKey,
+		reportSignal: make(chan struct{}, 16),
 	}
 
 	mux := http.NewServeMux()
@@ -109,7 +114,13 @@ func (p *testPortalServer) handleReportUsage(w http.ResponseWriter, r *http.Requ
 
 	p.mu.Lock()
 	p.usageReports = append(p.usageReports, report)
+	p.reportUsage++
 	p.mu.Unlock()
+
+	select {
+	case p.reportSignal <- struct{}{}:
+	default:
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -135,6 +146,12 @@ func (p *testPortalServer) getBalanceCheckCount() int {
 	return p.balanceCheck
 }
 
+func (p *testPortalServer) getReportUsageCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reportUsage
+}
+
 func (p *testPortalServer) close() { p.server.Close() }
 
 // --- Mock LLM Backend ---
@@ -142,11 +159,17 @@ func (p *testPortalServer) close() { p.server.Close() }
 type mockLLMHandler struct {
 	called       bool
 	responseBody string
+	// statusCode, when non-zero, is written via WriteHeader before the body
+	// so tests can simulate an upstream failure (e.g. 500).
+	statusCode int
 }
 
 func (h *mockLLMHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	h.called = true
 	w.Header().Set("Content-Type", "application/json")
+	if h.statusCode != 0 {
+		w.WriteHeader(h.statusCode)
+	}
 	if h.responseBody != "" {
 		w.Write([]byte(h.responseBody))
 	} else {
@@ -266,8 +289,17 @@ func TestX402_SufficientBalance_ProxiesRequest(t *testing.T) {
 		t.Error("expected next handler to be called")
 	}
 
-	// Wait briefly for async usage report
-	time.Sleep(100 * time.Millisecond)
+	// The usage report is sent from a goroutine; wait for the mock portal to
+	// signal it received the call instead of sleeping a fixed duration.
+	select {
+	case <-portal.reportSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async usage report")
+	}
+
+	if got := portal.getReportUsageCount(); got != 1 {
+		t.Fatalf("expected 1 usage report, got %d", got)
+	}
 
 	reports := portal.getUsageReports()
 	if len(reports) != 1 {
@@ -278,6 +310,48 @@ func TestX402_SufficientBalance_ProxiesRequest(t *testing.T) {
 	}
 	if len(reports[0].UsageData) != 1 {
 		t.Fatalf("expected 1 usage_data entry, got %d", len(reports[0].UsageData))
+	}
+}
+
+func TestX402_UpstreamError_SkipsUsageReport(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.02) // $0.02 — plenty of funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{
+		statusCode:   http.StatusInternalServerError,
+		responseBody: `{"error":"upstream exploded"}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected upstream 500 to pass through, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called")
+	}
+
+	// Give the (would-be) async report goroutine a bounded window to fire;
+	// it must never do so for a failed upstream response.
+	select {
+	case <-portal.reportSignal:
+		t.Fatal("expected no usage report for a failed upstream request")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if got := portal.getReportUsageCount(); got != 0 {
+		t.Errorf("expected 0 usage reports for failed upstream request, got %d", got)
 	}
 }
 
@@ -637,5 +711,52 @@ func TestLegacy_InferencePathWithoutModel_BillingDisabled_ProxiesThrough(t *test
 	}
 	if !next.called {
 		t.Error("expected next handler to be called when billing is disabled")
+	}
+}
+
+func TestLegacy_UpstreamError_SkipsTokenAccumulator(t *testing.T) {
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+	m.tokenCounter = factories.CreateTokenCounter()
+	m.tokenAccumulator = NewTokenAccumulator()
+
+	next := &mockLLMHandler{
+		statusCode: http.StatusInternalServerError,
+		// No "usage" object, so the tokenizer would otherwise count this
+		// error body itself as output tokens.
+		responseBody: `{"error":"upstream exploded, this message is deliberately long enough to tokenize to a nonzero count"}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected upstream 500 to pass through, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called")
+	}
+
+	usage := m.tokenAccumulator.PeekUsage()
+	if len(usage) != 0 {
+		t.Errorf("expected no accumulated usage for a failed upstream request, got %#v", usage)
 	}
 }

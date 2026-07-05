@@ -648,21 +648,34 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Non-LLM endpoints (GET /v1/models, GET /api/tags, /api/version, etc.) produce
 	// output tokens from their JSON responses but should never be billed.
 	if modelName != "unknown" {
-		if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
-			hasher := sha256.New()
-			hasher.Write([]byte(apiKey))
-			apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
-
-			m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens, cachedTokens)
+		responseStatus := http.StatusOK
+		if statusWriter, ok := wrappedWriter.(*TokenMeteringResponseWriter); ok {
+			responseStatus = statusWriter.Status()
 		}
 
-		// Log token usage for monitoring (enhanced system handles reporting internally)
-		caddy.Log().Info("Token usage recorded",
-			zap.Int("input_tokens", inputTokens),
-			zap.Int("output_tokens", outputTokens),
-			zap.Int("cached_tokens", cachedTokens),
-			zap.String("model", modelName),
-			zap.String("endpoint", r.URL.Path))
+		if responseStatus < 200 || responseStatus >= 300 {
+			// The upstream failed: do not bill the caller for it.
+			caddy.Log().Info("Upstream error, skipping usage recording",
+				zap.Int("status", responseStatus),
+				zap.String("model", modelName),
+				zap.String("endpoint", r.URL.Path))
+		} else {
+			if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
+				hasher := sha256.New()
+				hasher.Write([]byte(apiKey))
+				apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
+
+				m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens, cachedTokens)
+			}
+
+			// Log token usage for monitoring (enhanced system handles reporting internally)
+			caddy.Log().Info("Token usage recorded",
+				zap.Int("input_tokens", inputTokens),
+				zap.Int("output_tokens", outputTokens),
+				zap.Int("cached_tokens", cachedTokens),
+				zap.String("model", modelName),
+				zap.String("endpoint", r.URL.Path))
+		}
 	}
 
 	return nil
@@ -1163,6 +1176,22 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	tw := NewTokenMeteringResponseWriter(w)
 	if err := next.ServeHTTP(tw, r); err != nil {
 		return err
+	}
+
+	// If the upstream failed, the client must not be billed for it: skip output-token
+	// counting (an error body has no "usage" object, so the tokenizer would otherwise
+	// count the error body itself as output tokens), skip reporting usage to the
+	// portal, and skip token metrics. The balance check already succeeded, so the
+	// request is still recorded as authorized.
+	if status := tw.Status(); status < 200 || status >= 300 {
+		logger.Info("x402: upstream error, skipping usage reporting",
+			zap.Int("status", status),
+			zap.String("wallet", walletAddr),
+			zap.String("model", model))
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordAuthorized()
+		}
+		return nil
 	}
 
 	// 9. Count output tokens — prefer authoritative usage from backend response,
