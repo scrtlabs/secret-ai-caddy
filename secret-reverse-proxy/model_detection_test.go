@@ -41,21 +41,10 @@ func TestDetectModelFromRequestBody_IgnoresContentType(t *testing.T) {
 		expectedModel string
 	}{
 		{
-			// Formerly gated on Content-Type: text/plain, which would have
-			// hidden this from billing entirely.
-			name:          "chat body mislabeled as text/plain still detected",
-			requestBody:   chatBody,
-			expectedModel: "llama3",
-		},
-		{
-			// Formerly gated on an empty/missing Content-Type header.
-			name:          "chat body with empty content type still detected",
-			requestBody:   chatBody,
-			expectedModel: "llama3",
-		},
-		{
-			// Regression: application/json must keep working.
-			name:          "chat body regression with application/json",
+			// Content-Type is no longer consulted at all — detection is driven
+			// purely by sniffing the body — so there is nothing left to vary
+			// across a text/plain vs. empty vs. application/json header here.
+			name:          "chat body detected regardless of content type",
 			requestBody:   chatBody,
 			expectedModel: "llama3",
 		},
@@ -108,5 +97,31 @@ func TestInjectStreamUsageOption_IgnoresContentType(t *testing.T) {
 	}
 	if !strings.Contains(result, `"include_usage":true`) {
 		t.Errorf("expected injected body to contain include_usage:true, got %q", result)
+	}
+}
+
+// TestIsInferencePath exercises the known-inference-endpoint matcher used to
+// decide whether a model-less POST should be fail-closed rejected.
+func TestIsInferencePath(t *testing.T) {
+	testCases := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{"chat completions", "/v1/chat/completions", true},
+		{"completions", "/v1/completions", true},
+		{"ollama chat", "/api/chat", true},
+		{"ollama generate", "/api/generate", true},
+		{"base-path prefixed", "/proxy/v1/chat/completions", true},
+		{"trailing slash not matched", "/v1/chat/completions/", false},
+		{"unrelated path", "/v1/models", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isInferencePath(tc.path); got != tc.expected {
+				t.Errorf("isInferencePath(%q) = %v, want %v", tc.path, got, tc.expected)
+			}
+		})
 	}
 }

@@ -507,3 +507,41 @@ func TestLegacy_InferencePathWithoutModel_Returns400(t *testing.T) {
 		t.Error("expected next handler NOT to be called for inference path without model")
 	}
 }
+
+func TestLegacy_InferencePathWithoutModel_BillingDisabled_ProxiesThrough(t *testing.T) {
+	// With x402/billing disabled, this middleware runs as a pure auth proxy —
+	// a model-less POST to an inference path must be proxied through, not
+	// rejected, since some backends legitimately default the model themselves.
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called when billing is disabled")
+	}
+}

@@ -538,10 +538,17 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 	// Fail closed: a POST to a known inference endpoint with no detectable model is
 	// not a legitimate non-LLM request — reject instead of proxying for free.
-	if modelName == "unknown" && r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
+	// Scoped to billing-enabled deployments only: when x402/billing is off, this
+	// middleware runs as a pure auth proxy and some backends legitimately default
+	// the model when the field is omitted, so we must not break that proxy-through
+	// behavior.
+	if m.Config.X402Enabled && m.portalClient != nil && modelName == "unknown" && r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
 		logger.Info("Rejecting inference request with no detectable model",
 			zap.String("path", r.URL.Path),
 			zap.String("remote_addr", r.RemoteAddr))
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
+		}
 		http.Error(w, "Missing or invalid model in request body", http.StatusBadRequest)
 		return nil
 	}
