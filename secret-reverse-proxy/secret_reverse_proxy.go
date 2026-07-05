@@ -536,6 +536,16 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Detect model from request body
 	modelName := detectModelFromRequestBody(requestBody)
 
+	// Fail closed: a POST to a known inference endpoint with no detectable model is
+	// not a legitimate non-LLM request — reject instead of proxying for free.
+	if modelName == "unknown" && r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
+		logger.Info("Rejecting inference request with no detectable model",
+			zap.String("path", r.URL.Path),
+			zap.String("remote_addr", r.RemoteAddr))
+		http.Error(w, "Missing or invalid model in request body", http.StatusBadRequest)
+		return nil
+	}
+
 	// Pre-request balance check for legacy users (only for LLM requests that have a model field)
 	if m.Config.X402Enabled && m.portalClient != nil && modelName != "unknown" {
 		hasher := sha256.New()
@@ -1082,7 +1092,16 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 
 	// 4. For non-LLM requests (no "model" field in body), skip balance check entirely
 	// and proxy directly — these paths consume no tokens and should never be gated.
+	// Exception: a POST to a known inference endpoint with no detectable model is
+	// not a legitimate non-LLM request — fail closed instead of proxying for free.
 	if model == "unknown" {
+		if r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
+			logger.Info("x402: rejecting inference request with no detectable model",
+				zap.String("path", r.URL.Path),
+				zap.String("wallet", walletAddr))
+			http.Error(w, "Missing or invalid model in request body", http.StatusBadRequest)
+			return nil
+		}
 		logger.Debug("x402: non-LLM request, skipping balance check",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path),
@@ -1588,6 +1607,28 @@ func detectModelFromResponseBody(content string) string {
 func looksLikeJSONObject(body string) bool {
 	trimmed := strings.TrimLeft(body, " \t\r\n")
 	return strings.HasPrefix(trimmed, "{")
+}
+
+// knownInferencePaths lists the URL path suffixes that identify a request as
+// an LLM inference call. Matched by suffix so endpoints mounted under a base
+// path (e.g. "/proxy/v1/chat/completions") are still covered.
+var knownInferencePaths = []string{
+	"/v1/chat/completions",
+	"/v1/completions",
+	"/api/chat",
+	"/api/generate",
+}
+
+// isInferencePath reports whether path is a known LLM inference endpoint.
+// Used to fail closed: a POST to one of these paths with no detectable model
+// must not be proxied for free (see BLOCK 4/serveX402 step 4).
+func isInferencePath(path string) bool {
+	for _, suffix := range knownInferencePaths {
+		if strings.HasSuffix(path, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectModelFromRequestBody extracts the model name from a JSON request body.

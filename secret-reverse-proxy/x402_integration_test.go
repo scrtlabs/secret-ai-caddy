@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
+	"github.com/scrtlabs/secret-reverse-proxy/factories"
 	validators "github.com/scrtlabs/secret-reverse-proxy/validators"
 	"github.com/scrtlabs/secret-reverse-proxy/x402"
 )
@@ -57,6 +58,7 @@ func signRequest(t *testing.T, privKey *ecdsa.PrivateKey, method, path, body, ti
 type testPortalServer struct {
 	balances     map[string]float64 // wallet → USD balance
 	usageReports []x402.UsageReportRequest
+	balanceCheck int // number of GetBalance calls received
 	serviceKey   string
 	mu           sync.Mutex
 	server       *httptest.Server
@@ -91,6 +93,7 @@ func (p *testPortalServer) handleBalance(w http.ResponseWriter, r *http.Request)
 	}
 
 	p.mu.Lock()
+	p.balanceCheck++
 	balance := p.balances[strings.ToLower(walletAddr)]
 	p.mu.Unlock()
 
@@ -124,6 +127,12 @@ func (p *testPortalServer) getUsageReports() []x402.UsageReportRequest {
 	out := make([]x402.UsageReportRequest, len(p.usageReports))
 	copy(out, p.usageReports)
 	return out
+}
+
+func (p *testPortalServer) getBalanceCheckCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.balanceCheck
 }
 
 func (p *testPortalServer) close() { p.server.Close() }
@@ -167,6 +176,7 @@ func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, 
 		validator: validators.NewAPIKeyValidator(config),
 	}
 
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
 	m.portalClient = x402.NewPortalClient(portalURL, config.DevPortalServiceKey, logger)
 	m.challengeBuilder = x402.NewChallengeBuilder(portalURL + "/api/agent/add-funds")
 	m.x402MinBalance = minBalanceUSD
@@ -379,5 +389,121 @@ func TestX402_InvalidSignature_Returns401(t *testing.T) {
 	}
 	if next.called {
 		t.Error("expected next handler NOT to be called with invalid signature")
+	}
+}
+
+func TestX402_InferencePathWithoutModel_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for inference path without model")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_InferencePathModelViaTextPlain_BalanceStillChecked(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "text/plain") // client mislabels content-type
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (balance checked and found insufficient), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called when balance is insufficient")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_NonInferenceGET_ProxiedFreeNoBalanceCheck(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds — must not matter for this path
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	req := agentReq(t, privKey, walletAddr, "GET", "/v1/models", "")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for non-inference GET")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestLegacy_InferencePathWithoutModel_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for inference path without model")
 	}
 }
