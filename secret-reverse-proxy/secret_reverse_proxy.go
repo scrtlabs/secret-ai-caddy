@@ -532,7 +532,23 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 	// Read request body BEFORE forwarding to downstream handlers
 	tokenCountStart := time.Now()
-	requestBody, _ := m.readRequestBody(r)
+	requestBody, _, bodyTruncated := m.readRequestBody(r)
+
+	// A truncated body can't be reliably model-detected or billed. Scoped to
+	// billing-enabled deployments only, same as the "no detectable model" gate
+	// below: with billing off this middleware is a pure auth proxy and must
+	// keep proxying oversized bodies through unchanged (some backends handle
+	// their own limits).
+	if bodyTruncated && m.Config.X402Enabled && m.portalClient != nil {
+		logger.Info("Rejecting request with oversized body",
+			zap.String("path", r.URL.Path),
+			zap.String("remote_addr", r.RemoteAddr))
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
+		}
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return nil
+	}
 
 	// Detect model from request body
 	modelName := detectModelFromRequestBody(requestBody)
@@ -1070,12 +1086,30 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// defaultMaxBodySize is the fallback cap applied when Config.MaxBodySize is
+// unset/zero, matching metering.NewBodyHandler's own fallback buffer size so
+// the x402 path enforces the same effective limit the body handler would.
+const defaultMaxBodySize int64 = 5 * 1024 * 1024
+
+// effectiveMaxBodySize returns configured, falling back to defaultMaxBodySize
+// when configured is unset/zero.
+func effectiveMaxBodySize(configured int64) int64 {
+	if configured <= 0 {
+		return defaultMaxBodySize
+	}
+	return configured
+}
+
+// errGzipBodyTooLarge indicates the gzip stream decompressed past maxBodySize.
+// It is distinct from a gzip-format/decode error so callers can respond 413
+// instead of treating the body as unparseable.
+var errGzipBodyTooLarge = errors.New("decompressed body exceeds max size")
+
 // decompressGzipBody gunzips a compressed request body for analysis purposes
 // only (model detection, message-content extraction, input-token counting).
 // The read is capped at maxBodySize+1 to guard against zip bombs; exceeding
-// the cap is reported as an error here just like any other decompression
-// failure — Task 3 is responsible for wiring up a dedicated 413 response for
-// oversized bodies.
+// the cap returns errGzipBodyTooLarge so callers can distinguish it from a
+// genuine decode failure.
 func decompressGzipBody(rawBody []byte, maxBodySize int64) ([]byte, error) {
 	zr, err := gzip.NewReader(bytes.NewReader(rawBody))
 	if err != nil {
@@ -1088,7 +1122,7 @@ func decompressGzipBody(rawBody []byte, maxBodySize int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(decoded)) > maxBodySize {
-		return nil, fmt.Errorf("decompressed body exceeds max size of %d bytes", maxBodySize)
+		return nil, fmt.Errorf("%w: %d bytes", errGzipBodyTooLarge, maxBodySize)
 	}
 	return decoded, nil
 }
@@ -1098,16 +1132,27 @@ func decompressGzipBody(rawBody []byte, maxBodySize int64) ([]byte, error) {
 func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, walletAddr string) error {
 	logger := caddy.Log()
 
-	// 1. Read raw body before anything else (needed for EIP-191 signature verification)
+	// 1. Read raw body before anything else (needed for EIP-191 signature verification).
+	// The read is capped at the configured max body size: a body we cannot fully
+	// buffer can't be verified (the signature covers the whole body) or billed,
+	// so we reject it with 413 here, before signature verification even runs.
 	var rawBody []byte
 	if r.Body != nil {
-		var err error
-		rawBody, err = io.ReadAll(r.Body)
+		maxBodySize := effectiveMaxBodySize(m.Config.MaxBodySize)
+		limited, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
 		if err != nil {
 			http.Error(w, "Failed to read request body", http.StatusBadRequest)
 			return nil
 		}
 		r.Body.Close()
+		if int64(len(limited)) > maxBodySize {
+			logger.Info("x402: request body exceeds max size",
+				zap.Int64("max_size", maxBodySize),
+				zap.String("wallet", walletAddr))
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return nil
+		}
+		rawBody = limited
 		// Restore body so readRequestBody and next.ServeHTTP can consume it
 		r.Body = io.NopCloser(bytes.NewReader(rawBody))
 	}
@@ -1148,8 +1193,14 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	isGzipRequest := strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip")
 	analysisBody := rawBody
 	if isGzipRequest {
-		decoded, err := decompressGzipBody(rawBody, m.Config.MaxBodySize)
+		decoded, err := decompressGzipBody(rawBody, effectiveMaxBodySize(m.Config.MaxBodySize))
 		if err != nil {
+			if errors.Is(err, errGzipBodyTooLarge) {
+				logger.Info("x402: decompressed gzip body exceeds max size",
+					zap.String("wallet", walletAddr))
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return nil
+			}
 			logger.Info("x402: failed to gunzip request body for analysis",
 				zap.Error(err),
 				zap.String("wallet", walletAddr))
@@ -1213,7 +1264,7 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	if isGzipRequest {
 		requestBody = string(analysisBody)
 	} else {
-		requestBody, _ = m.readRequestBody(r)
+		requestBody, _, _ = m.readRequestBody(r)
 	}
 	inputContent := extractRequestMessageContent(requestBody)
 	if inputContent == "" {
@@ -1379,8 +1430,11 @@ func (m *Middleware) countTokens(content, contentType, model string) int {
 	return 0
 }
 
-// readRequestBody reads request body using the enhanced body handler
-func (m *Middleware) readRequestBody(r *http.Request) (content, contentType string) {
+// readRequestBody reads request body using the enhanced body handler.
+// truncated reports whether the body exceeded the handler's buffer cap
+// (BodyInfo.IsTruncated) — callers on billing paths use it to distinguish a
+// merely-oversized body from one that is genuinely missing/invalid.
+func (m *Middleware) readRequestBody(r *http.Request) (content, contentType string, truncated bool) {
 	if m.bodyHandler != nil {
 		// Use enhanced body handler
 		bodyInfo, err := m.bodyHandler.SafeReadRequestBody(r)
@@ -1389,7 +1443,7 @@ func (m *Middleware) readRequestBody(r *http.Request) (content, contentType stri
 			if m.metricsCollector != nil {
 				m.metricsCollector.RecordValidationError()
 			}
-			return "", r.Header.Get("Content-Type")
+			return "", r.Header.Get("Content-Type"), false
 		}
 
 		// Record metrics if available
@@ -1401,12 +1455,12 @@ func (m *Middleware) readRequestBody(r *http.Request) (content, contentType stri
 			}
 		}
 
-		return bodyInfo.Content, bodyInfo.ContentType
+		return bodyInfo.Content, bodyInfo.ContentType, bodyInfo.IsTruncated
 	}
 
 	// If enhanced system is not available, log error
 	caddy.Log().Warn("Enhanced body handler not available, cannot read request body")
-	return "", r.Header.Get("Content-Type")
+	return "", r.Header.Get("Content-Type"), false
 }
 
 // createResponseWriter creates the response writer for token metering

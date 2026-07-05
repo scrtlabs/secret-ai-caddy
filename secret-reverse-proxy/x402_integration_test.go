@@ -196,6 +196,13 @@ func (h *mockLLMHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error
 
 func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, serviceKey string) *Middleware {
 	t.Helper()
+	return buildX402MiddlewareWithMaxBodySize(t, portalURL, minBalanceUSD, serviceKey, 10*1024*1024)
+}
+
+// buildX402MiddlewareWithMaxBodySize is like buildX402Middleware but lets tests
+// pin a small MaxBodySize so oversized-body tests don't need multi-MB payloads.
+func buildX402MiddlewareWithMaxBodySize(t *testing.T, portalURL string, minBalanceUSD float64, serviceKey string, maxBodySize int64) *Middleware {
+	t.Helper()
 	config := &proxyconfig.Config{
 		APIKey:              "master-key-123",
 		CacheTTL:            time.Hour,
@@ -203,7 +210,7 @@ func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, 
 		DevPortalURL:        portalURL,
 		DevPortalServiceKey: serviceKey,
 		X402MinBalanceUSD:   minBalanceUSD,
-		MaxBodySize:         10 * 1024 * 1024,
+		MaxBodySize:         maxBodySize,
 	}
 
 	logger := zap.NewNop()
@@ -895,5 +902,132 @@ func TestX402_GzipContentEncodingWithGarbageBody_Returns400(t *testing.T) {
 	}
 	if portal.getBalanceCheckCount() != 0 {
 		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_GzipDecompressedBodyTooLarge_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 1024)
+	next := &mockLLMHandler{}
+
+	// The compressed bytes stay well under the cap, but the decompressed
+	// content does not — this is a legitimate gzip stream, not garbage.
+	plainBody := `{"model":"llama-3","padding":"` + strings.Repeat("x", 4096) + `"}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for oversized decompressed body")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_OversizedBody_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 1024)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"` + strings.Repeat("x", 2000) + `"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for oversized body")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestLegacy_OversizedBody_BillingEnabled_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 1024)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"` + strings.Repeat("x", 2000) + `"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for oversized body")
+	}
+}
+
+func TestLegacy_OversizedBody_BillingDisabled_ProxiesThrough(t *testing.T) {
+	// With x402/billing disabled, an oversized body is proxied through unchanged —
+	// today's behavior, pinned so the new 413 gate stays scoped to billing paths.
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"` + strings.Repeat("x", 2000) + `"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called when billing is disabled")
 	}
 }
