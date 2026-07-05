@@ -60,8 +60,9 @@ func signRequest(t *testing.T, privKey *ecdsa.PrivateKey, method, path, body, ti
 
 type testPortalServer struct {
 	balances     map[string]float64 // wallet → USD balance
+	userBalances map[string]float64 // api key hash → USD balance (legacy path)
 	usageReports []x402.UsageReportRequest
-	balanceCheck int // number of GetBalance calls received
+	balanceCheck int // number of GetBalance/GetUserBalance calls received
 	reportUsage  int // number of ReportUsage calls received
 	serviceKey   string
 	mu           sync.Mutex
@@ -74,12 +75,14 @@ type testPortalServer struct {
 func newTestPortalServer(serviceKey string) *testPortalServer {
 	p := &testPortalServer{
 		balances:     make(map[string]float64),
+		userBalances: make(map[string]float64),
 		serviceKey:   serviceKey,
 		reportSignal: make(chan struct{}, 16),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/balance", p.handleBalance)
+	mux.HandleFunc("/api/user/balance", p.handleUserBalance)
 	mux.HandleFunc("/api/user/report-usage", p.handleReportUsage)
 	p.server = httptest.NewServer(mux)
 	return p
@@ -111,6 +114,37 @@ func (p *testPortalServer) handleBalance(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// handleUserBalance backs the DevPortal /api/user/balance endpoint used by
+// the legacy (non-x402-agent) pre-request balance check, keyed by API key
+// hash rather than wallet address.
+func (p *testPortalServer) handleUserBalance(w http.ResponseWriter, r *http.Request) {
+	svcKey := r.Header.Get("X-Agent-Service-Key")
+	if svcKey == "" {
+		http.Error(w, "missing service key", http.StatusUnauthorized)
+		return
+	}
+	apiKeyHash := r.URL.Query().Get("api_key_hash")
+	if apiKeyHash == "" {
+		http.Error(w, "missing api key hash", http.StatusBadRequest)
+		return
+	}
+
+	p.mu.Lock()
+	p.balanceCheck++
+	balance, known := p.userBalances[apiKeyHash]
+	p.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	if !known {
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_found"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"user":   map[string]float64{"balance": balance},
+	})
+}
+
 func (p *testPortalServer) handleReportUsage(w http.ResponseWriter, r *http.Request) {
 	var report x402.UsageReportRequest
 	json.NewDecoder(r.Body).Decode(&report)
@@ -133,6 +167,12 @@ func (p *testPortalServer) setBalance(walletAddr string, usd float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.balances[strings.ToLower(walletAddr)] = usd
+}
+
+func (p *testPortalServer) setUserBalance(apiKeyHash string, usd float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.userBalances[apiKeyHash] = usd
 }
 
 func (p *testPortalServer) getUsageReports() []x402.UsageReportRequest {
@@ -171,11 +211,18 @@ type mockLLMHandler struct {
 	// receivedContentEncoding captures the Content-Encoding header as seen
 	// by the upstream.
 	receivedContentEncoding string
+	// receivedContentLengthHeader captures the literal Content-Length header
+	// value as seen by the upstream (empty if never set).
+	receivedContentLengthHeader string
+	// receivedContentLength captures r.ContentLength as seen by the upstream.
+	receivedContentLength int64
 }
 
 func (h *mockLLMHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	h.called = true
 	h.receivedContentEncoding = r.Header.Get("Content-Encoding")
+	h.receivedContentLengthHeader = r.Header.Get("Content-Length")
+	h.receivedContentLength = r.ContentLength
 	if r.Body != nil {
 		b, _ := io.ReadAll(r.Body)
 		h.receivedBody = b
@@ -1029,5 +1076,131 @@ func TestLegacy_OversizedBody_BillingDisabled_ProxiesThrough(t *testing.T) {
 	}
 	if !next.called {
 		t.Error("expected next handler to be called when billing is disabled")
+	}
+}
+
+// legacyAPIKeyHash reproduces the sha256(apiKey) hex hash that the legacy
+// pre-request balance check sends to DevPortal as api_key_hash, so tests can
+// pre-seed testPortalServer.userBalances for a given Bearer API key.
+func legacyAPIKeyHash(apiKey string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(apiKey))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func TestLegacy_GzipBody_FundedBalance_ForwardsDecompressedBody(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+	portal.setUserBalance(legacyAPIKeyHash("master-key-123"), 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(compressed))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+	if next.receivedContentEncoding != "" {
+		t.Errorf("expected upstream to see no Content-Encoding header, got %q", next.receivedContentEncoding)
+	}
+	if string(next.receivedBody) != plainBody {
+		t.Errorf("expected upstream to receive the decompressed JSON %q, got %q", plainBody, string(next.receivedBody))
+	}
+	wantCL := strconv.Itoa(len(plainBody))
+	if next.receivedContentLengthHeader != wantCL {
+		t.Errorf("expected upstream Content-Length header %q, got %q", wantCL, next.receivedContentLengthHeader)
+	}
+	if next.receivedContentLength != int64(len(plainBody)) {
+		t.Errorf("expected upstream r.ContentLength %d, got %d", len(plainBody), next.receivedContentLength)
+	}
+}
+
+func TestLegacy_GzipBody_ZeroBalance_Returns402(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+	portal.setUserBalance(legacyAPIKeyHash("master-key-123"), 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(compressed))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (model detected through compression), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+// TestLegacy_NonGzipBody_ForwardsUnchanged is a regression pin: a legacy
+// request with no Content-Encoding must be forwarded exactly as before the
+// gzip-coherence fix — the fix must only engage when the body was actually
+// decompressed.
+func TestLegacy_NonGzipBody_ForwardsUnchanged(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+	portal.setUserBalance(legacyAPIKeyHash("master-key-123"), 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+	if next.receivedContentEncoding != "" {
+		t.Errorf("expected no Content-Encoding header, got %q", next.receivedContentEncoding)
+	}
+	if next.receivedContentLengthHeader != "" {
+		t.Errorf("expected Content-Length header to remain unset (today's behavior), got %q", next.receivedContentLengthHeader)
+	}
+	if string(next.receivedBody) != body {
+		t.Errorf("expected upstream to receive the original body unchanged, got %q", string(next.receivedBody))
 	}
 }

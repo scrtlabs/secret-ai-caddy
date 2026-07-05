@@ -85,7 +85,7 @@ func (bh *BodyHandler) SafeReadRequestBody(r *http.Request) (*RequestBodyInfo, e
 	}
 
 	// Handle compressed content
-	reader, err := bh.getDecompressedReader(r)
+	reader, decompressed, err := bh.getDecompressedReader(r)
 	if err != nil {
 		bh.logger.Error("Failed to create decompressed reader", zap.Error(err))
 		info.Error = err
@@ -148,7 +148,17 @@ func (bh *BodyHandler) SafeReadRequestBody(r *http.Request) (*RequestBodyInfo, e
 
 	// Restore the body for downstream handlers
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	
+
+	// If we decompressed the body, r.Body now holds plaintext that no longer
+	// matches the original Content-Encoding/Content-Length — without this,
+	// downstream forwarders would send decompressed bytes still labeled as
+	// gzip, and upstream would fail trying to gunzip plaintext.
+	if decompressed {
+		r.Header.Del("Content-Encoding")
+		r.ContentLength = totalRead
+		r.Header.Set("Content-Length", strconv.FormatInt(totalRead, 10))
+	}
+
 	// Parse content if it's JSON
 	if bh.IsJSONContent(info.ContentType) {
 		if parsedJSON, err := bh.parseJSON(bodyBytes); err == nil {
@@ -160,18 +170,22 @@ func (bh *BodyHandler) SafeReadRequestBody(r *http.Request) (*RequestBodyInfo, e
 	return info, nil
 }
 
-// getDecompressedReader handles compressed request bodies
-func (bh *BodyHandler) getDecompressedReader(r *http.Request) (io.Reader, error) {
+// getDecompressedReader handles compressed request bodies. The returned bool
+// reports whether the body is actually being decompressed (true only for the
+// "gzip" case) — callers use it to know whether the restored r.Body no
+// longer matches the original Content-Encoding/Content-Length.
+func (bh *BodyHandler) getDecompressedReader(r *http.Request) (io.Reader, bool, error) {
 	encoding := r.Header.Get("Content-Encoding")
-	
+
 	switch strings.ToLower(encoding) {
 	case "gzip":
-		return gzip.NewReader(r.Body)
+		reader, err := gzip.NewReader(r.Body)
+		return reader, true, err
 	case "":
-		return r.Body, nil
+		return r.Body, false, nil
 	default:
 		bh.logger.Warn("Unsupported content encoding", zap.String("encoding", encoding))
-		return r.Body, nil // Return original body, let downstream handle it
+		return r.Body, false, nil // Return original body, let downstream handle it
 	}
 }
 
