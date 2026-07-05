@@ -531,10 +531,10 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 	// Read request body BEFORE forwarding to downstream handlers
 	tokenCountStart := time.Now()
-	requestBody, contentType := m.readRequestBody(r)
+	requestBody, _ := m.readRequestBody(r)
 
 	// Detect model from request body
-	modelName := detectModelFromRequestBody(requestBody, contentType)
+	modelName := detectModelFromRequestBody(requestBody)
 
 	// Pre-request balance check for legacy users (only for LLM requests that have a model field)
 	if m.Config.X402Enabled && m.portalClient != nil && modelName != "unknown" {
@@ -574,10 +574,10 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	{
 		forwarded := requestBody
 		if m.Config != nil && (m.Config.DefaultThink != "" || m.Config.DefaultNumPredict != 0) {
-			forwarded = injectRequestDefaults(forwarded, contentType,
+			forwarded = injectRequestDefaults(forwarded,
 				m.Config.DefaultThink, m.Config.DefaultNumPredict)
 		}
-		forwarded = injectStreamUsageOption(forwarded, contentType)
+		forwarded = injectStreamUsageOption(forwarded)
 		if forwarded != requestBody {
 			bodyBytes := []byte(forwarded)
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -1078,8 +1078,7 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	// This determines whether the request is an LLM call (has "model" field) or not.
 	// We do this BEFORE the balance check so that non-LLM paths (e.g. GET /v1/models,
 	// health checks, embedding queries without billing) are never blocked by balance.
-	contentType := r.Header.Get("Content-Type")
-	model := detectModelFromRequestBody(string(rawBody), contentType)
+	model := detectModelFromRequestBody(string(rawBody))
 
 	// 4. For non-LLM requests (no "model" field in body), skip balance check entirely
 	// and proxy directly — these paths consume no tokens and should never be gated.
@@ -1122,7 +1121,7 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	inputTokens := m.countTokens(inputContent, "text/plain", model)
 
 	// Inject stream_options.include_usage=true so vLLM returns authoritative usage counts.
-	forwarded := injectStreamUsageOption(requestBody, contentType)
+	forwarded := injectStreamUsageOption(requestBody)
 	if forwarded != requestBody {
 		bodyBytes := []byte(forwarded)
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -1526,8 +1525,10 @@ func extractRequestMessageContent(body string) string {
 // injectStreamUsageOption adds stream_options.include_usage=true to streaming requests.
 // This ensures vLLM returns authoritative token counts in the final SSE chunk.
 // Only modifies the body when stream=true and include_usage is not already set.
-func injectStreamUsageOption(body, contentType string) string {
-	if body == "" || !strings.Contains(strings.ToLower(contentType), "application/json") {
+// Whether the body is treated as JSON is determined by sniffing the body itself
+// (see looksLikeJSONObject), not by the client-controlled Content-Type header.
+func injectStreamUsageOption(body string) string {
+	if body == "" || !looksLikeJSONObject(body) {
 		return body
 	}
 	var parsed map[string]any
@@ -1580,18 +1581,29 @@ func detectModelFromResponseBody(content string) string {
 	return "unknown"
 }
 
-// detectModelFromRequestBody extracts the model name from JSON request body.
+// looksLikeJSONObject reports whether body, after trimming leading whitespace,
+// starts with '{'. This is a cheap body-sniffing check used to decide whether
+// a request should be treated as an LLM JSON call, since the client-controlled
+// Content-Type header cannot be trusted for that decision.
+func looksLikeJSONObject(body string) bool {
+	trimmed := strings.TrimLeft(body, " \t\r\n")
+	return strings.HasPrefix(trimmed, "{")
+}
+
+// detectModelFromRequestBody extracts the model name from a JSON request body.
 // This function parses the request body as JSON and searches for a "model" field.
+// Whether the body is treated as JSON is determined by sniffing the body itself
+// (see looksLikeJSONObject), not by the client-controlled Content-Type header,
+// so billing cannot be bypassed by mislabeling the request.
 //
 // Parameters:
 //   - requestBody: The request body content
-//   - contentType: The content type of the request
 //
 // Returns:
 //   - string: The detected model name, or "unknown" if not found or not JSON
-func detectModelFromRequestBody(requestBody, contentType string) string {
-	// Only process JSON content
-	if !strings.Contains(strings.ToLower(contentType), "application/json") {
+func detectModelFromRequestBody(requestBody string) string {
+	// Only process bodies that look like a JSON object
+	if !looksLikeJSONObject(requestBody) {
 		return "unknown"
 	}
 
@@ -1615,15 +1627,17 @@ func detectModelFromRequestBody(requestBody, contentType string) string {
 // injectRequestDefaults adds operator-defined default values to an LLM request body.
 // It only sets fields that the client has not already provided, so client values
 // always take precedence.  Returns the (possibly modified) body as a string.
+// Whether the body is treated as JSON is determined by sniffing the body itself
+// (see looksLikeJSONObject), not by the client-controlled Content-Type header.
 //
 // Supported defaults (controlled via Caddyfile directives):
 //   - default_think      → sets top-level "think" field  (e.g. "low")
 //   - default_num_predict → sets "options.num_predict"   (e.g. 512)
-func injectRequestDefaults(body, contentType, defaultThink string, defaultNumPredict int) string {
+func injectRequestDefaults(body, defaultThink string, defaultNumPredict int) string {
 	if body == "" {
 		return body
 	}
-	if !strings.Contains(strings.ToLower(contentType), "application/json") {
+	if !looksLikeJSONObject(body) {
 		return body
 	}
 	if defaultThink == "" && defaultNumPredict == 0 {

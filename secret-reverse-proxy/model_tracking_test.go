@@ -10,44 +10,38 @@ func TestModelAwareTokenTracking(t *testing.T) {
 	testCases := []struct {
 		name          string
 		requestBody   string
-		contentType   string
 		expectedModel string
 	}{
 		{
 			name:          "Valid JSON with model",
 			requestBody:   `{"model": "gpt-4", "prompt": "Hello world"}`,
-			contentType:   "application/json",
 			expectedModel: "gpt-4",
 		},
 		{
 			name:          "Valid JSON with different model",
 			requestBody:   `{"model": "gpt-3.5-turbo", "messages": []}`,
-			contentType:   "application/json",
 			expectedModel: "gpt-3.5-turbo",
 		},
 		{
 			name:          "JSON without model field",
 			requestBody:   `{"prompt": "Hello world"}`,
-			contentType:   "application/json",
 			expectedModel: "unknown",
 		},
 		{
 			name:          "Non-JSON content",
 			requestBody:   "plain text",
-			contentType:   "text/plain",
 			expectedModel: "unknown",
 		},
 		{
 			name:          "Invalid JSON",
 			requestBody:   `{"model": "gpt-4", "invalid": }`,
-			contentType:   "application/json",
 			expectedModel: "unknown",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := detectModelFromRequestBody(tc.requestBody, tc.contentType)
+			result := detectModelFromRequestBody(tc.requestBody)
 			if result != tc.expectedModel {
 				t.Errorf("Expected model %q, got %q", tc.expectedModel, result)
 			}
