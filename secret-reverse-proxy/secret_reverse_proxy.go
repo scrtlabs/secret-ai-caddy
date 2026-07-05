@@ -1087,8 +1087,9 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // defaultMaxBodySize is the fallback cap applied when Config.MaxBodySize is
-// unset/zero, matching metering.NewBodyHandler's own fallback buffer size so
-// the x402 path enforces the same effective limit the body handler would.
+// unset/zero. This is independent of metering.NewBodyHandler's own default
+// (10MB when its maxBodySize argument is <= 0); the two are unrelated
+// fallbacks for different call sites and are not expected to match.
 const defaultMaxBodySize int64 = 5 * 1024 * 1024
 
 // effectiveMaxBodySize returns configured, falling back to defaultMaxBodySize
@@ -1264,7 +1265,19 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	if isGzipRequest {
 		requestBody = string(analysisBody)
 	} else {
-		requestBody, _, _ = m.readRequestBody(r)
+		var truncated bool
+		requestBody, _, truncated = m.readRequestBody(r)
+		// Defense in depth: step 1 already capped rawBody at maxBodySize, so
+		// readRequestBody should never report truncation here. If it ever
+		// does (e.g. bodyHandler configured with a smaller cap than the
+		// step-1 check), fail the same way the legacy path does rather than
+		// billing/proxying a request we can't fully account for.
+		if truncated {
+			logger.Info("x402: request body unexpectedly truncated after size check",
+				zap.String("wallet", walletAddr))
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return nil
+		}
 	}
 	inputContent := extractRequestMessageContent(requestBody)
 	if inputContent == "" {

@@ -31,12 +31,12 @@ func NewBodyHandler(maxBodySize int64) *BodyHandler {
 	if maxBodySize <= 0 {
 		maxBodySize = 10 * 1024 * 1024 // 10MB default
 	}
-	
+
+	// The buffer cap tracks maxBodySize exactly (no independent clamp) so
+	// this handler enforces the same effective limit as the x402 path's own
+	// maxBodySize check, rather than silently truncating at a lower value.
 	maxBufferSize := maxBodySize
-	if maxBufferSize > 5*1024*1024 {
-		maxBufferSize = 5 * 1024 * 1024 // 5MB max buffer
-	}
-	
+
 	return &BodyHandler{
 		maxBodySize:        maxBodySize,
 		maxBufferSize:      maxBufferSize,

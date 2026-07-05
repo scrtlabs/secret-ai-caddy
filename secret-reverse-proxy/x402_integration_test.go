@@ -1016,6 +1016,45 @@ func TestX402_OversizedBody_Returns413(t *testing.T) {
 	}
 }
 
+// TestX402_ReadRequestBodyTruncated_Returns413 exercises the step 7
+// defense-in-depth guard directly: step 1 already caps rawBody at
+// effectiveMaxBodySize(m.Config.MaxBodySize), so readRequestBody normally
+// can never report truncation for a request that reached step 7. To force
+// that condition anyway, this test points m.bodyHandler at a cap smaller
+// than the step-1 check, simulating any future drift between the two, and
+// asserts the guard 413s instead of silently billing/proxying.
+func TestX402_ReadRequestBodyTruncated_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 4096)
+	// Force readRequestBody (step 7) to see a stricter cap than step 1 used.
+	m.bodyHandler = factories.CreateBodyHandler(16)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called when readRequestBody reports truncation")
+	}
+	if portal.getReportUsageCount() != 0 {
+		t.Errorf("expected no usage report, got %d", portal.getReportUsageCount())
+	}
+}
+
 func TestLegacy_OversizedBody_BillingEnabled_Returns413(t *testing.T) {
 	portal := newTestPortalServer("test-service-key")
 	defer portal.close()

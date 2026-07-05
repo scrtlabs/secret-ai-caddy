@@ -6,8 +6,64 @@ import (
 	"io"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 )
+
+// TestNewBodyHandler_BufferCapMatchesBodySize pins that maxBufferSize is no
+// longer independently clamped to 5MB: it must always equal the configured
+// maxBodySize, both below and above the old clamp value, so the legacy
+// billing path and the x402 path enforce the same effective limit.
+func TestNewBodyHandler_BufferCapMatchesBodySize(t *testing.T) {
+	cases := []int64{
+		1 * 1024 * 1024,  // below old 5MB clamp
+		5 * 1024 * 1024,  // at old clamp boundary
+		10 * 1024 * 1024, // above old 5MB clamp
+	}
+
+	for _, maxBodySize := range cases {
+		bh := NewBodyHandler(maxBodySize)
+		if bh.maxBufferSize != maxBodySize {
+			t.Errorf("NewBodyHandler(%d): maxBufferSize = %d, want %d", maxBodySize, bh.maxBufferSize, maxBodySize)
+		}
+		if bh.maxBodySize != maxBodySize {
+			t.Errorf("NewBodyHandler(%d): maxBodySize = %d, want %d", maxBodySize, bh.maxBodySize, maxBodySize)
+		}
+	}
+}
+
+// TestBodyHandler_SafeReadRequestBody_TruncatesAtConfiguredSize is a small-N
+// behavioral check that buffering still truncates right at maxBodySize (not
+// at the old, independent 5MB buffer clamp) in both directions.
+func TestBodyHandler_SafeReadRequestBody_TruncatesAtConfiguredSize(t *testing.T) {
+	const maxBodySize = 20 // bytes; small enough to keep the test fast
+
+	bh := NewBodyHandler(maxBodySize)
+
+	t.Run("under limit is not truncated", func(t *testing.T) {
+		body := strings.Repeat("a", maxBodySize-1)
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		info, err := bh.SafeReadRequestBody(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if info.IsTruncated {
+			t.Errorf("expected body of length %d (under limit %d) not to be truncated", len(body), maxBodySize)
+		}
+	})
+
+	t.Run("over limit is truncated", func(t *testing.T) {
+		body := strings.Repeat("a", maxBodySize+1)
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		info, err := bh.SafeReadRequestBody(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !info.IsTruncated {
+			t.Errorf("expected body of length %d (over limit %d) to be truncated", len(body), maxBodySize)
+		}
+	})
+}
 
 // TestBodyHandler_SafeReadRequestBody_Gzip_RestoresCoherentRequest pins that
 // when the request body was gzip-compressed, SafeReadRequestBody restores
