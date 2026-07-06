@@ -122,11 +122,11 @@ func DefaultConfig() *Config {
 
 		// Enhanced metering defaults (always enabled)
 		MaxBodySize:       DefaultMaxBodySize, // 10MB default
-		TokenCountingMode: "accurate",       // Use enhanced accurate counting by default
-		MaxRetries:        3,                // 3 retry attempts
-		RetryBackoff:      5 * time.Minute,  // 5 minute base backoff
-		EnableMetrics:     false,            // Disabled by default
-		MetricsPath:       "/metrics",       // Standard metrics path
+		TokenCountingMode: "accurate",         // Use enhanced accurate counting by default
+		MaxRetries:        3,                  // 3 retry attempts
+		RetryBackoff:      5 * time.Minute,    // 5 minute base backoff
+		EnableMetrics:     false,              // Disabled by default
+		MetricsPath:       "/metrics",         // Standard metrics path
 
 		// Tokenizer defaults
 		TokenizerCacheDir: "/tmp/tokenizers",              // Default cache directory
