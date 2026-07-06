@@ -6,9 +6,9 @@
 #   Caddy :21434 -> LiteLLM :4000 --> vllm-llm :8000  (gpt-oss:120b)
 #
 # Protection layers:
-#   1. LiteLLM max_parallel_requests 50 — 429 when exceeded
+#   1. LiteLLM max_parallel_requests 250 — 429 when exceeded
 #   2. LiteLLM circuit breaker — pauses model 60s after 3 consecutive failures
-#   3. vLLM --max-num-seqs 50, --max-model-len 32768 — scheduler + KV cap
+#   3. vLLM --max-num-seqs 85, --max-model-len 32768 — scheduler + KV cap
 #   4. gpu-watchdog — monitors GPU util/temp, exposes /gpu-status endpoint
 #   5. Caddy max_retries 2 / retry_backoff 30s (metering retries only)
 # =============================================================================
@@ -247,7 +247,7 @@ services:
       --enable-prompt-tokens-details
       --max-num-batched-tokens 16384
       --max-model-len 131072
-      --max-num-seqs 50
+      --max-num-seqs 85
       --tool-call-parser openai
       --enable-auto-tool-choice
     healthcheck:
@@ -278,7 +278,7 @@ configs:
             model: openai/gpt-oss:120b
             api_base: http://vllm:8000/v1
             api_key: "dummy"
-            max_parallel_requests: 200
+            max_parallel_requests: 250
 
       router_settings:
         allowed_fails: 3
