@@ -631,7 +631,16 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Prepare forwarded body: inject operator defaults + stream_options.include_usage=true.
 	// stream_options injection ensures vLLM returns authoritative usage in the final SSE chunk.
 	// This runs AFTER token counting so input billing uses the original prompt length.
-	{
+	//
+	// Guarded by !bodyTruncated: when billing is disabled, a truncated body
+	// reaches this point with requestBody holding only the buffered prefix
+	// while r.Body was already restored (by SafeReadRequestBody) to the
+	// prefix chained with the unread remainder. If that prefix happens to
+	// parse as complete, valid JSON, injecting into it and replacing r.Body
+	// with the prefix-derived result would silently drop the unread
+	// remainder. The complete-forward guarantee must be unconditional, so
+	// this block never runs against a truncated body.
+	if !bodyTruncated {
 		forwarded := requestBody
 		if m.Config != nil && (m.Config.DefaultThink != "" || m.Config.DefaultNumPredict != 0) {
 			forwarded = injectRequestDefaults(forwarded,
@@ -671,6 +680,11 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	if promptTok, completionTok, cachedTok, ok := extractUsageFromResponse(responseBody); ok {
 		cachedTokens = cachedTok
 		inputTokens = promptTok - cachedTok // non-cached input only; cached billed separately
+		if inputTokens < 0 {
+			// A backend that reports cached_tokens > prompt_tokens (seen with some
+			// vLLM cache-hit accounting quirks) must never bill a negative amount.
+			inputTokens = 0
+		}
 		outputTokens = completionTok
 	} else {
 		// Priority 2: extract only the generated text, then tokenize.
