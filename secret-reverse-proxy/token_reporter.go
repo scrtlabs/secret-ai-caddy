@@ -47,7 +47,7 @@ func NewResilientReporter(config *Config, accumulator *TokenAccumulator) *Resili
 }
 
 func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
-	if rr.running.Load() {
+	if !rr.running.CompareAndSwap(false, true) {
 		rr.logger.Warn("Reporting loop is already running")
 		return
 	}
@@ -57,7 +57,6 @@ func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
 		rr.logger.Error("Failed to create failed reports directory", zap.Error(err))
 	}
 
-	rr.running.Store(true)
 	go func() {
 		defer func() {
 			rr.running.Store(false)
@@ -84,7 +83,7 @@ func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
 
 // Stop gracefully stops the reporting loop
 func (rr *ResilientReporter) Stop() {
-	if !rr.running.Load() {
+	if !rr.running.CompareAndSwap(true, false) {
 		return
 	}
 
