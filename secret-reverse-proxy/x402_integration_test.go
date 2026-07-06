@@ -1187,11 +1187,52 @@ func TestX402_GzipContentEncodingWithGarbageBody_Returns400(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected status 400, got %d", w.Code)
 	}
+	wantMsg := "Invalid gzip request body\n"
+	if got := w.Body.String(); got != wantMsg {
+		t.Errorf("expected body %q, got %q", wantMsg, got)
+	}
 	if next.called {
 		t.Error("expected next handler NOT to be called for undecodable gzip body")
 	}
 	if portal.getBalanceCheckCount() != 0 {
 		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+// TestX402_XGzipContentEncodingAlias_TreatedAsGzip pins that "x-gzip" (the
+// long-standing pre-standardization alias some clients still send) is
+// accepted exactly like "gzip" in the x402 path's encoding check — a
+// legitimately gzip-compressed body under that header must still be
+// decompressed for model detection rather than treated as unencoded garbage.
+func TestX402_XGzipContentEncodingAlias_TreatedAsGzip(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "x-gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (model detected through x-gzip compression), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
 	}
 }
 
@@ -1325,8 +1366,10 @@ func TestLegacy_OversizedBody_BillingEnabled_Returns413(t *testing.T) {
 }
 
 func TestLegacy_OversizedBody_BillingDisabled_ProxiesThrough(t *testing.T) {
-	// With x402/billing disabled, an oversized body is proxied through unchanged —
-	// today's behavior, pinned so the new 413 gate stays scoped to billing paths.
+	// With x402/billing disabled, an oversized body is proxied through complete
+	// and unmodified — the new 413 gate stays scoped to billing paths, and the
+	// upstream must receive every byte of the original body, not just the
+	// prefix SafeReadRequestBody buffered for token counting before truncating.
 	config := &proxyconfig.Config{
 		APIKey:      "master-key-123",
 		CacheTTL:    time.Hour,
@@ -1358,6 +1401,10 @@ func TestLegacy_OversizedBody_BillingDisabled_ProxiesThrough(t *testing.T) {
 	}
 	if !next.called {
 		t.Error("expected next handler to be called when billing is disabled")
+	}
+	if string(next.receivedBody) != body {
+		t.Errorf("expected upstream to receive the COMPLETE body (%d bytes), got %d bytes",
+			len(body), len(next.receivedBody))
 	}
 }
 
@@ -1484,5 +1531,147 @@ func TestLegacy_NonGzipBody_ForwardsUnchanged(t *testing.T) {
 	}
 	if string(next.receivedBody) != body {
 		t.Errorf("expected upstream to receive the original body unchanged, got %q", string(next.receivedBody))
+	}
+}
+
+// TestLegacy_StreamInjection_ContentLengthHeaderMatchesInjectedBody pins that
+// when the legacy path's stream_options injection replaces the request body,
+// the upstream-visible Content-Length HEADER (not just r.ContentLength) is
+// kept in sync with the injected body's actual length — otherwise a
+// downstream forwarder that reads the header directly would send a stale
+// length alongside the new, longer body.
+func TestLegacy_StreamInjection_ContentLengthHeaderMatchesInjectedBody(t *testing.T) {
+	m := buildMeteringOnlyMiddleware(t)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+
+	if string(next.receivedBody) == body {
+		t.Fatal("expected stream_options.include_usage to be injected, body was forwarded unchanged")
+	}
+	if !strings.Contains(string(next.receivedBody), "include_usage") {
+		t.Errorf("expected injected body to contain include_usage, got %q", string(next.receivedBody))
+	}
+
+	wantCL := strconv.Itoa(len(next.receivedBody))
+	if next.receivedContentLengthHeader != wantCL {
+		t.Errorf("expected upstream Content-Length header %q (matching injected body length), got %q",
+			wantCL, next.receivedContentLengthHeader)
+	}
+	if next.receivedContentLength != int64(len(next.receivedBody)) {
+		t.Errorf("expected upstream r.ContentLength %d, got %d", len(next.receivedBody), next.receivedContentLength)
+	}
+}
+
+// TestX402_StreamInjection_ContentLengthHeaderMatchesInjectedBody is the
+// x402-path counterpart of the legacy test above, exercising the step 7
+// injection call site.
+func TestX402_StreamInjection_ContentLengthHeaderMatchesInjectedBody(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+
+	if string(next.receivedBody) == body {
+		t.Fatal("expected stream_options.include_usage to be injected, body was forwarded unchanged")
+	}
+	if !strings.Contains(string(next.receivedBody), "include_usage") {
+		t.Errorf("expected injected body to contain include_usage, got %q", string(next.receivedBody))
+	}
+
+	wantCL := strconv.Itoa(len(next.receivedBody))
+	if next.receivedContentLengthHeader != wantCL {
+		t.Errorf("expected upstream Content-Length header %q (matching injected body length), got %q",
+			wantCL, next.receivedContentLengthHeader)
+	}
+	if next.receivedContentLength != int64(len(next.receivedBody)) {
+		t.Errorf("expected upstream r.ContentLength %d, got %d", len(next.receivedBody), next.receivedContentLength)
+	}
+}
+
+// TestX402_CachedTokensExceedPromptTokens_InputTokensClampedToZero pins step
+// 9's defense against a backend reporting cached_tokens greater than
+// prompt_tokens (seen with some cache-accounting quirks): non-cached input
+// tokens (prompt_tokens - cached_tokens) must never go negative and be
+// reported to the portal as such.
+func TestX402_CachedTokensExceedPromptTokens_InputTokensClampedToZero(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{
+		// cached_tokens (50) exceeds prompt_tokens (10): a naive
+		// prompt_tokens - cached_tokens would go negative.
+		responseBody: `{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}],` +
+			`"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":50}}}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	select {
+	case <-portal.reportSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async usage report")
+	}
+
+	reports := portal.getUsageReports()
+	if len(reports) != 1 {
+		t.Fatalf("expected 1 usage report, got %d", len(reports))
+	}
+	if len(reports[0].UsageData) != 1 {
+		t.Fatalf("expected 1 usage_data entry, got %d", len(reports[0].UsageData))
+	}
+	if got := reports[0].UsageData[0].InputTokens; got != 0 {
+		t.Errorf("expected input_tokens clamped to 0, got %d", got)
+	}
+	if got := reports[0].UsageData[0].OutputTokens; got != 5 {
+		t.Errorf("expected output_tokens 5, got %d", got)
 	}
 }

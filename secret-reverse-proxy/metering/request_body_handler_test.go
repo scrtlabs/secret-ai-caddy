@@ -120,3 +120,97 @@ func TestBodyHandler_SafeReadRequestBody_Gzip_RestoresCoherentRequest(t *testing
 		t.Errorf("expected Content-Length header %q, got %q", wantCL, cl)
 	}
 }
+
+// TestBodyHandler_SafeReadRequestBody_Truncated_RestoresCompleteBody pins that
+// when the body exceeds maxBodySize (IsTruncated), r.Body is still restored
+// as the COMPLETE original body — the buffered prefix chained with the
+// unread remainder — not just the truncated prefix used for token counting.
+// Billing-disabled deployments rely on this to forward oversized bodies
+// through unchanged instead of silently corrupting them.
+func TestBodyHandler_SafeReadRequestBody_Truncated_RestoresCompleteBody(t *testing.T) {
+	const maxBodySize = 20 // bytes
+	body := strings.Repeat("a", maxBodySize*3)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+
+	bh := NewBodyHandler(maxBodySize)
+	info, err := bh.SafeReadRequestBody(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !info.IsTruncated {
+		t.Fatalf("expected body of length %d (over limit %d) to be truncated", len(body), maxBodySize)
+	}
+
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read restored body: %v", err)
+	}
+	if string(restored) != body {
+		t.Errorf("expected restored r.Body to contain the COMPLETE original body (%d bytes), got %d bytes: %q",
+			len(body), len(restored), string(restored))
+	}
+
+	if req.ContentLength != -1 {
+		t.Errorf("expected r.ContentLength -1 (unknown) for a truncated body, got %d", req.ContentLength)
+	}
+	if cl := req.Header.Get("Content-Length"); cl != "" {
+		t.Errorf("expected Content-Length header to be removed for a truncated body, got %q", cl)
+	}
+}
+
+// TestBodyHandler_SafeReadRequestBody_Truncated_Gzip_RestoresCompleteBody is
+// the gzip counterpart: the remainder after truncation is the SAME gzip
+// reader already partially consumed (gzip streams can only be read once), so
+// draining the restored r.Body must yield the complete decompressed
+// plaintext, and the coherent-restore rules (Content-Encoding removed) still
+// apply even though Content-Length can no longer be known up front.
+func TestBodyHandler_SafeReadRequestBody_Truncated_Gzip_RestoresCompleteBody(t *testing.T) {
+	const maxBodySize = 20 // bytes; plaintext below is far larger once decompressed
+	plain := strings.Repeat("b", maxBodySize*4)
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(plain)); err != nil {
+		t.Fatalf("failed to gzip-compress test body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("failed to close gzip writer: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(buf.Bytes()))
+	req.Header.Set("Content-Encoding", "gzip")
+
+	bh := NewBodyHandler(maxBodySize)
+	info, err := bh.SafeReadRequestBody(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !info.IsTruncated {
+		t.Fatalf("expected decompressed body of length %d (over limit %d) to be truncated", len(plain), maxBodySize)
+	}
+
+	if enc := req.Header.Get("Content-Encoding"); enc != "" {
+		t.Errorf("expected Content-Encoding header to be removed after decompression, got %q", enc)
+	}
+
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read restored body: %v", err)
+	}
+	if string(restored) != plain {
+		t.Errorf("expected restored r.Body to contain the COMPLETE decompressed body (%d bytes), got %d bytes",
+			len(plain), len(restored))
+	}
+
+	if req.ContentLength != -1 {
+		t.Errorf("expected r.ContentLength -1 (unknown) for a truncated body, got %d", req.ContentLength)
+	}
+	if cl := req.Header.Get("Content-Length"); cl != "" {
+		t.Errorf("expected Content-Length header to be removed for a truncated body, got %q", cl)
+	}
+
+	if err := req.Body.Close(); err != nil {
+		t.Errorf("expected restored r.Body to close cleanly, got: %v", err)
+	}
+}

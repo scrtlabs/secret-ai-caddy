@@ -4,6 +4,14 @@ import (
 	"time"
 )
 
+// DefaultMaxBodySize is the shared fallback request body size cap used
+// wherever a caller needs a sane default in the absence of an explicit
+// Config.MaxBodySize: DefaultConfig below, secret_reverse_proxy.go's
+// defaultMaxBodySize, and metering.NewBodyHandler's own zero-value default
+// all reference this single value so the three fallbacks can never drift
+// apart from each other.
+const DefaultMaxBodySize int64 = 10 * 1024 * 1024 // 10MB
+
 // Config holds the configuration parameters for the secret reverse proxy middleware.
 // This struct defines all the configurable aspects of the authentication system.
 type Config struct {
@@ -113,7 +121,7 @@ func DefaultConfig() *Config {
 		MeteringInterval: 10 * time.Minute,
 
 		// Enhanced metering defaults (always enabled)
-		MaxBodySize:       10 * 1024 * 1024, // 10MB default
+		MaxBodySize:       DefaultMaxBodySize, // 10MB default
 		TokenCountingMode: "accurate",       // Use enhanced accurate counting by default
 		MaxRetries:        3,                // 3 retry attempts
 		RetryBackoff:      5 * time.Minute,  // 5 minute base backoff

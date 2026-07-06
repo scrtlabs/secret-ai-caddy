@@ -28,8 +28,18 @@ type PortalClient struct {
 // NewPortalClient creates a new DevPortal API client.
 // Respects SKIP_SSL_VALIDATION env var (via utils.GetHTTPClient) for dev/test environments.
 func NewPortalClient(baseURL, serviceKey string, logger *zap.Logger) *PortalClient {
-	httpClient := utils.GetHTTPClient()
-	httpClient.Timeout = 10 * time.Second
+	// utils.GetHTTPClient() returns http.DefaultClient when SKIP_SSL_VALIDATION
+	// isn't set — a process-wide shared client also used elsewhere (e.g.
+	// token_reporter.go, query-contract). Copy it into our own *http.Client
+	// before setting Timeout: mutating the shared client's Timeout field here
+	// would race against any concurrent Do()/Get() on that same global client.
+	base := utils.GetHTTPClient()
+	httpClient := &http.Client{
+		Transport:     base.Transport,
+		CheckRedirect: base.CheckRedirect,
+		Jar:           base.Jar,
+		Timeout:       10 * time.Second,
+	}
 	return &PortalClient{
 		baseURL:    baseURL,
 		serviceKey: serviceKey,

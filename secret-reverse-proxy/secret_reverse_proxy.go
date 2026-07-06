@@ -550,8 +550,10 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// A truncated body can't be reliably model-detected or billed. Scoped to
 	// billing-enabled deployments only, same as the "no detectable model" gate
 	// below: with billing off this middleware is a pure auth proxy and must
-	// keep proxying oversized bodies through unchanged (some backends handle
-	// their own limits).
+	// keep proxying oversized bodies through complete and unmodified (some
+	// backends handle their own limits) — SafeReadRequestBody restores the
+	// full body (buffered prefix + unread remainder) precisely so this proxy
+	// path never forwards a silently truncated request.
 	if bodyTruncated && m.billingEnabled() {
 		logger.Info("Rejecting request with oversized body",
 			zap.String("path", r.URL.Path),
@@ -640,6 +642,7 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 			bodyBytes := []byte(forwarded)
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			r.ContentLength = int64(len(bodyBytes))
+			r.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
 		}
 	}
 
@@ -1114,10 +1117,10 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // defaultMaxBodySize is the fallback cap applied when Config.MaxBodySize is
-// unset/zero. This is independent of metering.NewBodyHandler's own default
-// (10MB when its maxBodySize argument is <= 0); the two are unrelated
-// fallbacks for different call sites and are not expected to match.
-const defaultMaxBodySize int64 = 5 * 1024 * 1024
+// unset/zero. Kept equal to proxyconfig.DefaultMaxBodySize (which also backs
+// config.DefaultConfig() and metering.NewBodyHandler's own <= 0 fallback) so
+// all three defaults move together instead of silently drifting apart.
+const defaultMaxBodySize int64 = proxyconfig.DefaultMaxBodySize
 
 // effectiveMaxBodySize returns configured, falling back to defaultMaxBodySize
 // when configured is unset/zero.
@@ -1126,6 +1129,13 @@ func effectiveMaxBodySize(configured int64) int64 {
 		return defaultMaxBodySize
 	}
 	return configured
+}
+
+// isGzipContentEncoding reports whether encoding names a gzip-compressed
+// body. "x-gzip" is a long-standing alias for "gzip" (predating the
+// standardized token) that some HTTP clients still send.
+func isGzipContentEncoding(encoding string) bool {
+	return strings.EqualFold(encoding, "gzip") || strings.EqualFold(encoding, "x-gzip")
 }
 
 // errGzipBodyTooLarge indicates the gzip stream decompressed past maxBodySize.
@@ -1227,11 +1237,12 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	// message-content extraction and input-token counting. This copy is never
 	// forwarded upstream: the signature above was verified over rawBody, and the
 	// bytes forwarded to next.ServeHTTP (step 8) stay exactly what step 1 restored,
-	// so the upstream still receives the original compressed body. If gunzip fails
-	// (or the decompressed size exceeds the configured cap, guarding against zip
-	// bombs), analysisBody is left empty, model detection reports "unknown", and
-	// the existing fail-closed gate below applies.
-	isGzipRequest := strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip")
+	// so the upstream still receives the original compressed body. If the decompressed
+	// size exceeds the configured cap (guarding against zip bombs), that's a 413, not a
+	// format problem; any other gunzip failure means the body isn't valid gzip at all,
+	// so we reject it immediately with a 400 rather than falling through to model
+	// detection and reporting the misleading "missing model" error.
+	isGzipRequest := isGzipContentEncoding(r.Header.Get("Content-Encoding"))
 	analysisBody := rawBody
 	if isGzipRequest {
 		decoded, err := decompressGzipBody(rawBody, effectiveMaxBodySize(m.Config.MaxBodySize))
@@ -1242,13 +1253,13 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
 				return nil
 			}
-			logger.Info("x402: failed to gunzip request body for analysis",
+			logger.Info("x402: failed to gunzip request body",
 				zap.Error(err),
 				zap.String("wallet", walletAddr))
-			analysisBody = nil
-		} else {
-			analysisBody = decoded
+			http.Error(w, "Invalid gzip request body", http.StatusBadRequest)
+			return nil
 		}
+		analysisBody = decoded
 	}
 	model := detectModelFromRequestBody(string(analysisBody))
 
@@ -1335,6 +1346,7 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 			bodyBytes := []byte(forwarded)
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			r.ContentLength = int64(len(bodyBytes))
+			r.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
 		}
 	}
 
@@ -1370,6 +1382,11 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	if promptTok, completionTok, cachedTok, ok := extractUsageFromResponse(respBody); ok {
 		cachedTokens = cachedTok
 		inputTokens = promptTok - cachedTok // non-cached input only; cached billed separately
+		if inputTokens < 0 {
+			// A backend that reports cached_tokens > prompt_tokens (seen with some
+			// vLLM cache-hit accounting quirks) must never bill a negative amount.
+			inputTokens = 0
+		}
 		outputTokens = completionTok
 		_ = cachedTokens // x402 path: portal ReportUsage API doesn't support cached yet
 	} else if m.tokenCounter != nil {
