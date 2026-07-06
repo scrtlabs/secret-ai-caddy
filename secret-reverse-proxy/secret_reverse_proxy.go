@@ -372,6 +372,17 @@ func (m *Middleware) Validate() error {
 	return nil
 }
 
+// billingEnabled reports whether any billing mode is active for this
+// middleware instance: x402 portal-based billing (agent requests) or
+// metering-based billing (accumulator → ResilientReporter, for legacy
+// Bearer-token users). The legacy body gates below (oversized-body 413,
+// model-less-POST 400) apply only when billing is enabled; with billing off
+// this middleware is a pure auth proxy and must keep proxying such requests
+// unchanged.
+func (m Middleware) billingEnabled() bool {
+	return (m.Config.X402Enabled && m.portalClient != nil) || m.Config.Metering
+}
+
 // ServeHTTP implements caddyhttp.MiddlewareHandler and is the main request processing method.
 // This method is called for every HTTP request that passes through this middleware.
 // It performs API key authentication and either blocks or forwards the request.
@@ -525,21 +536,23 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// logger.Debug("API key validation successful, forwarding request")
 	// return next.ServeHTTP(w, r)
 
-	// Record successful authorization
-	if m.metricsCollector != nil {
-		m.metricsCollector.RecordAuthorized()
-	}
-
 	// Read request body BEFORE forwarding to downstream handlers
 	tokenCountStart := time.Now()
 	requestBody, _, bodyTruncated := m.readRequestBody(r)
+
+	// Computed once and reused below: free-pass paths (e.g. /api/show) skip
+	// the model-less-POST 400 gate, the balance check, and token-accumulator
+	// recording even when their body happens to contain a "model" field. The
+	// 413 truncation gate below still applies to them — an unbufferable body
+	// is unbufferable regardless of path.
+	freePass := isFreePassPath(r.URL.Path)
 
 	// A truncated body can't be reliably model-detected or billed. Scoped to
 	// billing-enabled deployments only, same as the "no detectable model" gate
 	// below: with billing off this middleware is a pure auth proxy and must
 	// keep proxying oversized bodies through unchanged (some backends handle
 	// their own limits).
-	if bodyTruncated && m.Config.X402Enabled && m.portalClient != nil {
+	if bodyTruncated && m.billingEnabled() {
 		logger.Info("Rejecting request with oversized body",
 			zap.String("path", r.URL.Path),
 			zap.String("remote_addr", r.RemoteAddr))
@@ -557,12 +570,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// only proxied for free if the path is explicitly on the free-pass list
 	// (see isFreePassPath). Non-POST requests (GET/HEAD/OPTIONS/...) are
 	// always free-passed, preserving discovery/health-check behavior.
-	// Scoped to billing-enabled deployments only: when x402/billing is off, this
+	// Scoped to billing-enabled deployments only: when billing is off, this
 	// middleware runs as a pure auth proxy and some backends legitimately default
 	// the model when the field is omitted, so we must not break that proxy-through
 	// behavior.
-	if m.Config.X402Enabled && m.portalClient != nil && modelName == "unknown" &&
-		r.Method == http.MethodPost && !isFreePassPath(r.URL.Path) {
+	if m.billingEnabled() && modelName == "unknown" &&
+		r.Method == http.MethodPost && !freePass {
 		logger.Info("Rejecting inference request with no detectable model",
 			zap.String("path", r.URL.Path),
 			zap.String("remote_addr", r.RemoteAddr))
@@ -573,8 +586,16 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		return nil
 	}
 
-	// Pre-request balance check for legacy users (only for LLM requests that have a model field)
-	if m.Config.X402Enabled && m.portalClient != nil && modelName != "unknown" {
+	// Record successful authorization — only now, after the body gates above
+	// have had their chance to reject: a gate-rejected request must count
+	// only as rejected, never as both authorized and rejected.
+	if m.metricsCollector != nil {
+		m.metricsCollector.RecordAuthorized()
+	}
+
+	// Pre-request balance check for legacy users (only for LLM requests that
+	// have a model field; free-pass paths are exempt from billing entirely).
+	if m.Config.X402Enabled && m.portalClient != nil && modelName != "unknown" && !freePass {
 		hasher := sha256.New()
 		hasher.Write([]byte(apiKey))
 		userApiKeyHash := hex.EncodeToString(hasher.Sum(nil))
@@ -670,10 +691,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		m.metricsCollector.RecordProcessingTime(time.Since(startTime))
 	}
 
-	// Record usage for reporting — only for LLM requests (model must be known).
-	// Non-LLM endpoints (GET /v1/models, GET /api/tags, /api/version, etc.) produce
-	// output tokens from their JSON responses but should never be billed.
-	if modelName != "unknown" {
+	// Record usage for reporting — only for LLM requests (model must be known)
+	// that are not on the free-pass list. Non-LLM endpoints (GET /v1/models,
+	// GET /api/tags, /api/version, etc.) produce output tokens from their JSON
+	// responses but should never be billed; free-pass paths (e.g. /api/show)
+	// must never be billed either, even when their body contains a "model" field.
+	if modelName != "unknown" && !freePass {
 		if !upstreamOK {
 			// The upstream failed: do not bill the caller for it.
 			caddy.Log().Info("Upstream error, skipping usage recording",
@@ -1181,6 +1204,19 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 		return nil
 	}
 
+	// 2.5. Free-pass paths (e.g. /api/show) are exempt from billing entirely —
+	// checked here, right after signature verification, so a free-pass route
+	// is proxied through even when its body happens to contain a "model"
+	// field (modern Ollama's /api/show request body is one such case). This
+	// must run after signature verification above, not before: a free pass
+	// on the billing gate is not a free pass on authentication.
+	if isFreePassPath(r.URL.Path) {
+		logger.Debug("x402: free-pass path, skipping billing entirely",
+			zap.String("path", r.URL.Path),
+			zap.String("wallet", walletAddr))
+		return next.ServeHTTP(w, r)
+	}
+
 	// 3. Detect model from rawBody (already available from sig step above).
 	// This determines whether the request is an LLM call (has "model" field) or not.
 	// We do this BEFORE the balance check so that non-LLM paths (e.g. GET /v1/models,
@@ -1219,11 +1255,11 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	// 4. For non-LLM requests (no "model" field in body), skip balance check entirely
 	// and proxy directly — these paths consume no tokens and should never be gated.
 	// A GET/HEAD/etc. is always free-passed (discovery/health checks). A POST with
-	// no detectable model is billable by default and only proxied for free if the
-	// path is explicitly on the free-pass list (see isFreePassPath) — anything else
-	// fails closed instead of proxying for free.
+	// no detectable model is billable by default and fails closed instead of being
+	// proxied for free (free-pass paths were already exempted above in step 2.5,
+	// regardless of method or detected model).
 	if model == "unknown" {
-		if r.Method != http.MethodPost || isFreePassPath(r.URL.Path) {
+		if r.Method != http.MethodPost {
 			logger.Debug("x402: non-LLM request, skipping balance check",
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),

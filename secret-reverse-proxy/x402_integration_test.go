@@ -275,6 +275,30 @@ func buildX402MiddlewareWithMaxBodySize(t *testing.T, portalURL string, minBalan
 	return m
 }
 
+// buildMeteringOnlyMiddleware builds a middleware in metering-only billing
+// mode (Config.Metering=true, x402/portal disabled) — mirroring a legacy
+// deployment that bills via the accumulator/ResilientReporter path rather
+// than the x402 portal. The gates under test here only read config, so a nil
+// portalClient and no live reporter/accumulator are fine.
+func buildMeteringOnlyMiddleware(t *testing.T) *Middleware {
+	t.Helper()
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		Metering:    true,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+
+	return m
+}
+
 // gzipCompress gzip-encodes s, for building gzip-encoded agent request bodies.
 func gzipCompress(t *testing.T, s string) []byte {
 	t.Helper()
@@ -732,6 +756,109 @@ func TestX402_ApiShowWithoutModel_ProxiedFreeNoBalanceCheck(t *testing.T) {
 	}
 }
 
+func TestLegacy_MeteringOnly_InferencePathWithoutModel_Returns400(t *testing.T) {
+	// Config.Metering is an independent billing mode (accumulator →
+	// ResilientReporter) with x402/portal entirely disabled. Before this fix
+	// the model-less-POST 400 gate only checked X402Enabled+portalClient, so
+	// a metering-only deployment proxied model-less requests for free.
+	m := buildMeteringOnlyMiddleware(t)
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for inference path without model")
+	}
+}
+
+func TestX402_ApiShowWithModel_ProxiedFreeNoBalanceCheckNoUsageReport(t *testing.T) {
+	// Modern Ollama sends {"model": ...} on /api/show, and the metadata
+	// response has no "usage" object. Free-pass paths must be exempt from
+	// billing entirely — regardless of whether a "model" field is present —
+	// so this must never be balance-checked or usage-billed even for a
+	// funded wallet.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // funded wallet — must not matter for this path
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama3.2"}` // modern-Ollama /api/show request body
+	req := agentReq(t, privKey, walletAddr, "POST", "/api/show", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for /api/show")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+	if portal.getReportUsageCount() != 0 {
+		t.Errorf("expected no usage report, got %d", portal.getReportUsageCount())
+	}
+}
+
+func TestLegacy_ApiShowWithModel_BillingEnabled_AccumulatorRecordsNothing(t *testing.T) {
+	// Same modern-Ollama regression as the x402 case above, but through the
+	// legacy Bearer-token path: a free-pass path with a "model" field must
+	// not be balance-checked or recorded into the token accumulator.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	m.tokenCounter = factories.CreateTokenCounter()
+	m.tokenAccumulator = NewTokenAccumulator()
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama3.2"}` // modern-Ollama /api/show request body
+	req := httptest.NewRequest("POST", "/api/show", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for /api/show")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check for free-pass path, got %d", portal.getBalanceCheckCount())
+	}
+	usage := m.tokenAccumulator.PeekUsage()
+	if len(usage) != 0 {
+		t.Errorf("expected no accumulated usage for free-pass path, got %#v", usage)
+	}
+}
+
 func TestLegacy_InferencePathWithoutModel_Returns400(t *testing.T) {
 	portal := newTestPortalServer("test-service-key")
 	defer portal.close()
@@ -755,6 +882,40 @@ func TestLegacy_InferencePathWithoutModel_Returns400(t *testing.T) {
 	}
 	if next.called {
 		t.Error("expected next handler NOT to be called for inference path without model")
+	}
+}
+
+func TestLegacy_InferencePathWithoutModel_RecordsRejectedNotAuthorized(t *testing.T) {
+	// A gate-rejected request must count only as rejected, never as both
+	// authorized and rejected — RecordAuthorized must fire only after the
+	// body gates (413 + 400) have had their chance to reject.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	metrics := &fakeMetricsCollector{}
+	m.metricsCollector = metrics
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if metrics.rejectedCalls != 1 {
+		t.Errorf("expected RecordRejected to fire once, got %d", metrics.rejectedCalls)
+	}
+	if metrics.authorizedCalls != 0 {
+		t.Errorf("expected RecordAuthorized NOT to fire, got %d", metrics.authorizedCalls)
 	}
 }
 
@@ -848,6 +1009,7 @@ func TestLegacy_UpstreamError_SkipsTokenAccumulator(t *testing.T) {
 // queryable counters in tests.
 type fakeMetricsCollector struct {
 	authorizedCalls int
+	rejectedCalls   int
 	tokensCalls     int
 	lastInputTokens int64
 	lastOutputToken int64
@@ -855,7 +1017,7 @@ type fakeMetricsCollector struct {
 
 func (f *fakeMetricsCollector) RecordRequest()     {}
 func (f *fakeMetricsCollector) RecordAuthorized()  { f.authorizedCalls++ }
-func (f *fakeMetricsCollector) RecordRejected()    {}
+func (f *fakeMetricsCollector) RecordRejected()    { f.rejectedCalls++ }
 func (f *fakeMetricsCollector) RecordRateLimited() {}
 func (f *fakeMetricsCollector) RecordTokens(inputTokens, outputTokens int64) {
 	f.tokensCalls++
