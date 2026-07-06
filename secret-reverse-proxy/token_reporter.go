@@ -17,6 +17,18 @@ import (
 	"go.uber.org/zap"
 )
 
+// Reporter lifecycle states. A ResilientReporter is single-use: it moves
+// idle -> running (at most once) -> stopped (at most once) and never back.
+// Using one atomic state machine instead of two independent bools closes a
+// TOCTOU window where a concurrent Start could observe "not yet stopped"
+// and win a running-CAS after Stop had already begun tearing the loop down,
+// producing two goroutines that both `defer close(rr.doneChan)`.
+const (
+	reporterIdle int32 = iota
+	reporterRunning
+	reporterStopped
+)
+
 type ResilientReporter struct {
 	config           *Config
 	accumulator      *TokenAccumulator
@@ -26,8 +38,13 @@ type ResilientReporter struct {
 	retryBackoff     time.Duration
 	stopChan         chan struct{}
 	doneChan         chan struct{}
-	running          atomic.Bool
-	stopped          atomic.Bool
+	state            atomic.Int32
+	httpClient       *http.Client
+	// launchCount counts how many reporting goroutines have ever been
+	// launched. The idle->running CAS in StartReportingLoop admits a single
+	// winner for the lifetime of the reporter, so this must never exceed 1;
+	// it exists to make that invariant directly observable under test.
+	launchCount atomic.Int32
 }
 
 type FailedReport struct {
@@ -37,6 +54,20 @@ type FailedReport struct {
 }
 
 func NewResilientReporter(config *Config, accumulator *TokenAccumulator) *ResilientReporter {
+	// utils.GetHTTPClient() returns http.DefaultClient when SKIP_SSL_VALIDATION
+	// isn't set — a process-wide shared client also used elsewhere (e.g.
+	// x402/portal_client.go, query-contract). Copy it into our own *http.Client
+	// before setting Timeout: mutating the shared client's Timeout field on
+	// every report cycle would race against any concurrent Do()/Get() on that
+	// same global client.
+	base := utils.GetHTTPClient()
+	httpClient := &http.Client{
+		Transport:     base.Transport,
+		CheckRedirect: base.CheckRedirect,
+		Jar:           base.Jar,
+		Timeout:       30 * time.Second,
+	}
+
 	return &ResilientReporter{
 		config:           config,
 		accumulator:      accumulator,
@@ -46,17 +77,13 @@ func NewResilientReporter(config *Config, accumulator *TokenAccumulator) *Resili
 		retryBackoff:     time.Minute * 5,
 		stopChan:         make(chan struct{}),
 		doneChan:         make(chan struct{}),
+		httpClient:       httpClient,
 	}
 }
 
 func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
-	if rr.stopped.Load() {
-		rr.logger.Warn("resilient reporter already stopped, not restarting")
-		return
-	}
-
-	if !rr.running.CompareAndSwap(false, true) {
-		rr.logger.Warn("Reporting loop is already running")
+	if !rr.state.CompareAndSwap(reporterIdle, reporterRunning) {
+		rr.logger.Warn("Reporting loop not starting: already running or stopped")
 		return
 	}
 
@@ -65,18 +92,19 @@ func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
 		rr.logger.Error("Failed to create failed reports directory", zap.Error(err))
 	}
 
+	rr.launchCount.Add(1)
 	go func() {
+		// Only one goroutine can ever be launched: the CAS above admits a
+		// single winner for the lifetime of this reporter, so this close
+		// can never race a second one.
 		defer close(rr.doneChan)
-		defer func() {
-			rr.running.Store(false)
-		}()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		
+
 		// Process any failed reports on startup
 		rr.retryFailedReports()
-		
+
 		for {
 			select {
 			case <-ticker.C:
@@ -90,12 +118,14 @@ func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
 	}()
 }
 
-// Stop gracefully stops the reporting loop
+// Stop gracefully stops the reporting loop. Only a reporter currently in the
+// running state can transition to stopped; a reporter that was never started
+// (idle) or already stopped is a safe no-op, and stopped is terminal — a
+// subsequent StartReportingLoop will refuse to restart it.
 func (rr *ResilientReporter) Stop() {
-	if !rr.running.CompareAndSwap(true, false) {
+	if !rr.state.CompareAndSwap(reporterRunning, reporterStopped) {
 		return
 	}
-	rr.stopped.Store(true)
 
 	rr.logger.Info("Requesting resilient reporter to stop")
 	close(rr.stopChan)
@@ -107,6 +137,11 @@ func (rr *ResilientReporter) Stop() {
 	case <-time.After(1 * time.Second):
 		rr.logger.Warn("Resilient reporter did not stop gracefully within timeout")
 	}
+}
+
+// isRunning reports whether the reporting goroutine is currently active.
+func (rr *ResilientReporter) isRunning() bool {
+	return rr.state.Load() == reporterRunning
 }
 
 func (rr *ResilientReporter) processCurrentUsage() {
@@ -206,12 +241,9 @@ func (rr *ResilientReporter) submitWithRetry(records []map[string]any, attempt i
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Caddy-Secret-Reverse-Proxy-Enhanced/1.0")
 
-	// Create HTTP client with timeout and SSL configuration
-	client := utils.GetHTTPClient()
-	client.Timeout = 30 * time.Second
-
-	// Send the request
-	resp, err := client.Do(req)
+	// Send the request using the reporter's own client (never the shared
+	// utils.GetHTTPClient() instance — see NewResilientReporter).
+	resp, err := rr.httpClient.Do(req)
 	if err != nil {
 		if attempt < rr.maxRetries-1 {
 			rr.logger.Warn("HTTP request failed, will retry", 
