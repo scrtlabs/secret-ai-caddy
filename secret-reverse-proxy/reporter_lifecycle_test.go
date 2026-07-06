@@ -94,3 +94,37 @@ func TestStopWaitsForGoroutineExit(t *testing.T) {
 		t.Fatal("Expected doneChan to be closed once Stop returns")
 	}
 }
+
+// TestStartReportingLoopAfterStopDoesNotRestart verifies that calling
+// StartReportingLoop after Stop is a safe no-op rather than a panic. The
+// reporter is single-use: stopChan/doneChan are closed once and never
+// recreated, so a second start must be refused, not attempted.
+func TestStartReportingLoopAfterStopDoesNotRestart(t *testing.T) {
+	config := &Config{
+		Metering:         true,
+		MeteringInterval: 1 * time.Second,
+		MeteringURL:      "http://test.example.com",
+	}
+	accumulator := NewTokenAccumulator()
+	reporter := NewResilientReporter(config, accumulator)
+
+	reporter.StartReportingLoop(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	reporter.Stop()
+
+	// This must not panic (e.g. from closing an already-closed doneChan).
+	reporter.StartReportingLoop(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	if reporter.running.Load() {
+		t.Error("Expected reporter to remain stopped after restart attempt")
+	}
+
+	// doneChan must still be closed (no new goroutine replaced/reused it).
+	select {
+	case <-reporter.doneChan:
+		// expected: still closed from the original Stop
+	default:
+		t.Fatal("Expected doneChan to remain closed after restart attempt")
+	}
+}

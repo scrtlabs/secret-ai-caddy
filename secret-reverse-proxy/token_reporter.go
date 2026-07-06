@@ -27,6 +27,7 @@ type ResilientReporter struct {
 	stopChan         chan struct{}
 	doneChan         chan struct{}
 	running          atomic.Bool
+	stopped          atomic.Bool
 }
 
 type FailedReport struct {
@@ -49,6 +50,11 @@ func NewResilientReporter(config *Config, accumulator *TokenAccumulator) *Resili
 }
 
 func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
+	if rr.stopped.Load() {
+		rr.logger.Warn("resilient reporter already stopped, not restarting")
+		return
+	}
+
 	if !rr.running.CompareAndSwap(false, true) {
 		rr.logger.Warn("Reporting loop is already running")
 		return
@@ -89,6 +95,7 @@ func (rr *ResilientReporter) Stop() {
 	if !rr.running.CompareAndSwap(true, false) {
 		return
 	}
+	rr.stopped.Store(true)
 
 	rr.logger.Info("Requesting resilient reporter to stop")
 	close(rr.stopChan)
