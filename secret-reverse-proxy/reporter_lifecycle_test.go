@@ -69,3 +69,28 @@ func TestConcurrentStop(t *testing.T) {
 		t.Error("Expected reporter to be stopped after concurrent Stop calls")
 	}
 }
+
+// TestStopWaitsForGoroutineExit verifies that Stop only returns once the
+// reporting goroutine has actually exited, rather than racing ahead of it.
+func TestStopWaitsForGoroutineExit(t *testing.T) {
+	config := &Config{
+		Metering:         true,
+		MeteringInterval: 1 * time.Second,
+		MeteringURL:      "http://test.example.com",
+	}
+	accumulator := NewTokenAccumulator()
+	reporter := NewResilientReporter(config, accumulator)
+
+	reporter.StartReportingLoop(10 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	reporter.Stop()
+
+	// By the time Stop returns, doneChan must already be closed.
+	select {
+	case <-reporter.doneChan:
+		// expected: goroutine has exited
+	default:
+		t.Fatal("Expected doneChan to be closed once Stop returns")
+	}
+}

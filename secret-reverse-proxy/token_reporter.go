@@ -25,6 +25,7 @@ type ResilientReporter struct {
 	maxRetries       int
 	retryBackoff     time.Duration
 	stopChan         chan struct{}
+	doneChan         chan struct{}
 	running          atomic.Bool
 }
 
@@ -43,6 +44,7 @@ func NewResilientReporter(config *Config, accumulator *TokenAccumulator) *Resili
 		maxRetries:       3,
 		retryBackoff:     time.Minute * 5,
 		stopChan:         make(chan struct{}),
+		doneChan:         make(chan struct{}),
 	}
 }
 
@@ -58,10 +60,11 @@ func (rr *ResilientReporter) StartReportingLoop(interval time.Duration) {
 	}
 
 	go func() {
+		defer close(rr.doneChan)
 		defer func() {
 			rr.running.Store(false)
 		}()
-		
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		
@@ -90,15 +93,12 @@ func (rr *ResilientReporter) Stop() {
 	rr.logger.Info("Requesting resilient reporter to stop")
 	close(rr.stopChan)
 
-	// Wait a bit for goroutine to finish
-	for i := 0; i < 10 && rr.running.Load(); i++ {
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if rr.running.Load() {
-		rr.logger.Warn("Resilient reporter did not stop gracefully within timeout")
-	} else {
+	// Wait for the goroutine to actually exit, bounded by a timeout.
+	select {
+	case <-rr.doneChan:
 		rr.logger.Info("Resilient reporter stopped successfully")
+	case <-time.After(1 * time.Second):
+		rr.logger.Warn("Resilient reporter did not stop gracefully within timeout")
 	}
 }
 
