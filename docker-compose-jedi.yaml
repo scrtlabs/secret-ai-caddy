@@ -13,6 +13,23 @@
 #   5. Caddy max_retries 2 / retry_backoff 30s (metering retries only)
 # =============================================================================
 
+# Attestable attestation-surface policy. This compose file is measured into the
+# attestation quote and served verbatim at /docker-compose, so declaring the policy
+# here lets an external verifier confirm it. secret-vm-attest-rest reads this block
+# at startup and force-applies it over env / secret-vm.json (applied last, so it is
+# authoritative — that is what makes it verifiable).
+#   rest_server_ip: bind address; 127.0.0.1 keeps attestation private behind Caddy.
+#   secure:         false => plain HTTP on loopback (Caddy terminates public TLS).
+#   endpoints_mask: bit0=/logs bit1=/docker-compose bit2=/services bit3=/vm_upgrades bit4=/resources
+#                   "01000" => only /docker-compose gated-open; /cpu and /gpu are
+#                   always public evidence; logs/services/vm_upgrades/resources closed.
+#   private_mode:   enforce the mask.
+x-secretvm:
+  rest_server_ip: "127.0.0.1"
+  secure: false
+  endpoints_mask: "01000"
+  private_mode: true
+
 services:
 
   init:
@@ -32,8 +49,9 @@ services:
   caddy:
     image: ghcr.io/scrtlabs/secret-ai-caddy@sha256:52c9754026680601c4d41ac495302a01ed879437271c5e173649bf96562258e9
     container_name: caddy-proxy
-    ports:
-      - "21434:21434"
+    # Host network so Caddy can reach the host attestation REST service on
+    # 127.0.0.1:29343 to serve the /cpu /gpu /docker-compose evidence routes.
+    network_mode: host
     volumes:
       - /mnt/secure/app_cert:/etc/ssl/certs:ro
       - /mnt/secure/app_cert:/etc/ssl/private:ro
@@ -51,7 +69,7 @@ services:
       - METERING_INTERVAL=1m
       - METERING_URL=https://secretai.scrtlabs.com
     healthcheck:
-      test: ["CMD", "curl", "http://localhost:80/"]
+      test: ["CMD", "curl", "-k", "-f", "https://127.0.0.1:21434/cpu"]
       interval: 30s
       timeout: 10s
       start_period: 15s
@@ -63,8 +81,6 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-    networks:
-      - secretai_network
     depends_on:
       vllm:
         condition: service_healthy
@@ -74,6 +90,9 @@ services:
     image: ghcr.io/berriai/litellm@sha256:64b0c74045c506ce62b3b53e0bc90ec717044285eef59bf015562644c316f159
     container_name: litellm-router
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "4"]
+    # Publish on the host loopback so the host-network Caddy can reach it.
+    ports:
+      - "127.0.0.1:4000:4000"
     configs:
       - source: litellm_config
         target: /etc/litellm/config.yaml
@@ -102,6 +121,9 @@ services:
   gpu-watchdog:
     image: python@sha256:506f2951c04925a2a98fc0604e0e0a3ffd2788cc4aed0eb77c3517c98ac651c0
     container_name: gpu-watchdog
+    # Publish on the host loopback so the host-network Caddy can reach /gpu-status.
+    ports:
+      - "127.0.0.1:9090:9090"
     privileged: true
     runtime: nvidia
     deploy:
@@ -306,7 +328,7 @@ configs:
 
         # GPU status — public, no auth required
         handle /gpu-status {
-          reverse_proxy gpu-watchdog:9090
+          reverse_proxy 127.0.0.1:9090
         }
 
         @cors_preflight method OPTIONS
@@ -321,6 +343,41 @@ configs:
             Vary "Origin"
           }
           respond "" 204
+        }
+
+        # TEE attestation evidence — public, served from the host attestation REST
+        # service (127.0.0.1:29343, plain HTTP on loopback per the x-secretvm
+        # directive). GET-only; auth/cookie headers are stripped so evidence is
+        # deterministic and identical for every caller.
+        @teequote_evidence {
+          method GET
+          path /cpu /gpu /docker-compose
+        }
+        handle @teequote_evidence {
+          @has_origin header Origin *
+          header @has_origin {
+            Access-Control-Allow-Origin {header.origin}
+            Access-Control-Allow-Credentials "true"
+            Access-Control-Allow-Methods "GET, OPTIONS"
+            Access-Control-Allow-Headers "*"
+            Access-Control-Expose-Headers "*"
+            Vary "Origin"
+          }
+
+          reverse_proxy 127.0.0.1:29343 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Port {server_port}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-For {remote_host}
+            header_up -Authorization
+            header_up -Cookie
+          }
+        }
+
+        @teequote_path path /cpu /gpu /docker-compose
+        handle @teequote_path {
+          respond "method not allowed" 405
         }
 
         handle {
@@ -354,7 +411,7 @@ configs:
             x402_min_balance_usd {env.X402_MIN_BALANCE_USD}
           }
 
-          reverse_proxy litellm-router:4000 {
+          reverse_proxy 127.0.0.1:4000 {
             health_uri /health/liveliness
             health_interval 30s
             health_timeout 10s
@@ -363,6 +420,7 @@ configs:
             header_up X-Forwarded-Port {server_port}
             header_up X-Forwarded-Proto {scheme}
             header_up X-Forwarded-For {remote_host}
+            header_up -Cookie
           }
         }
 
