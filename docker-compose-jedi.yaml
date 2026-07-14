@@ -81,9 +81,12 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    # Weakened to service_started: Caddy (and the /cpu /gpu /docker-compose evidence
+    # routes, which hit the host attest-rest, not vLLM) comes up without waiting for
+    # the ~10 min vLLM warmup. Inference routes 502 (handled) until backends are ready.
     depends_on:
       vllm:
-        condition: service_healthy
+        condition: service_started
 
   # ── LiteLLM router ───────────────────────────────────────────────────────
   litellm:
