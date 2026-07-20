@@ -24,15 +24,15 @@ func TestResilientReporterCleanup(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	
 	// Verify it's running
-	if !reporter.running {
+	if !reporter.isRunning() {
 		t.Error("Expected reporter to be running")
 	}
-	
+
 	// Stop the reporter
 	reporter.Stop()
-	
+
 	// Verify it stopped
-	if reporter.running {
+	if reporter.isRunning() {
 		t.Error("Expected reporter to be stopped")
 	}
 }
@@ -57,18 +57,18 @@ func TestMiddlewareCleanup(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	
 	// Verify reporter is running
-	if !m.resilientReporter.running {
+	if !m.resilientReporter.isRunning() {
 		t.Error("Expected resilient reporter to be running before cleanup")
 	}
-	
+
 	// Call cleanup
 	err := m.Cleanup()
 	if err != nil {
 		t.Errorf("Cleanup failed: %v", err)
 	}
-	
+
 	// Verify reporter stopped
-	if m.resilientReporter.running {
+	if m.resilientReporter.isRunning() {
 		t.Error("Expected resilient reporter to be stopped after cleanup")
 	}
 }

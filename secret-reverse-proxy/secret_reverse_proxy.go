@@ -17,6 +17,7 @@ package secret_reverse_proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -371,6 +372,17 @@ func (m *Middleware) Validate() error {
 	return nil
 }
 
+// billingEnabled reports whether any billing mode is active for this
+// middleware instance: x402 portal-based billing (agent requests) or
+// metering-based billing (accumulator → ResilientReporter, for legacy
+// Bearer-token users). The legacy body gates below (oversized-body 413,
+// model-less-POST 400) apply only when billing is enabled; with billing off
+// this middleware is a pure auth proxy and must keep proxying such requests
+// unchanged.
+func (m Middleware) billingEnabled() bool {
+	return (m.Config.X402Enabled && m.portalClient != nil) || m.Config.Metering
+}
+
 // ServeHTTP implements caddyhttp.MiddlewareHandler and is the main request processing method.
 // This method is called for every HTTP request that passes through this middleware.
 // It performs API key authentication and either blocks or forwards the request.
@@ -524,20 +536,68 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// logger.Debug("API key validation successful, forwarding request")
 	// return next.ServeHTTP(w, r)
 
-	// Record successful authorization
+	// Read request body BEFORE forwarding to downstream handlers
+	tokenCountStart := time.Now()
+	requestBody, _, bodyTruncated := m.readRequestBody(r)
+
+	// Computed once and reused below: free-pass paths (e.g. /api/show) skip
+	// the model-less-POST 400 gate, the balance check, and token-accumulator
+	// recording even when their body happens to contain a "model" field. The
+	// 413 truncation gate below still applies to them — an unbufferable body
+	// is unbufferable regardless of path.
+	freePass := isFreePassPath(r.URL.Path)
+
+	// A truncated body can't be reliably model-detected or billed. Scoped to
+	// billing-enabled deployments only, same as the "no detectable model" gate
+	// below: with billing off this middleware is a pure auth proxy and must
+	// keep proxying oversized bodies through complete and unmodified (some
+	// backends handle their own limits) — SafeReadRequestBody restores the
+	// full body (buffered prefix + unread remainder) precisely so this proxy
+	// path never forwards a silently truncated request.
+	if bodyTruncated && m.billingEnabled() {
+		logger.Info("Rejecting request with oversized body",
+			zap.String("path", r.URL.Path),
+			zap.String("remote_addr", r.RemoteAddr))
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
+		}
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return nil
+	}
+
+	// Detect model from request body
+	modelName := detectModelFromRequestBody(requestBody)
+
+	// Fail closed: a POST with no detectable model is billable by default and
+	// only proxied for free if the path is explicitly on the free-pass list
+	// (see isFreePassPath). Non-POST requests (GET/HEAD/OPTIONS/...) are
+	// always free-passed, preserving discovery/health-check behavior.
+	// Scoped to billing-enabled deployments only: when billing is off, this
+	// middleware runs as a pure auth proxy and some backends legitimately default
+	// the model when the field is omitted, so we must not break that proxy-through
+	// behavior.
+	if m.billingEnabled() && modelName == "unknown" &&
+		r.Method == http.MethodPost && !freePass {
+		logger.Info("Rejecting inference request with no detectable model",
+			zap.String("path", r.URL.Path),
+			zap.String("remote_addr", r.RemoteAddr))
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordRejected()
+		}
+		http.Error(w, "Missing or invalid model in request body", http.StatusBadRequest)
+		return nil
+	}
+
+	// Record successful authorization — only now, after the body gates above
+	// have had their chance to reject: a gate-rejected request must count
+	// only as rejected, never as both authorized and rejected.
 	if m.metricsCollector != nil {
 		m.metricsCollector.RecordAuthorized()
 	}
 
-	// Read request body BEFORE forwarding to downstream handlers
-	tokenCountStart := time.Now()
-	requestBody, contentType := m.readRequestBody(r)
-
-	// Detect model from request body
-	modelName := detectModelFromRequestBody(requestBody, contentType)
-
-	// Pre-request balance check for legacy users (only for LLM requests that have a model field)
-	if m.Config.X402Enabled && m.portalClient != nil && modelName != "unknown" {
+	// Pre-request balance check for legacy users (only for LLM requests that
+	// have a model field; free-pass paths are exempt from billing entirely).
+	if m.Config.X402Enabled && m.portalClient != nil && modelName != "unknown" && !freePass {
 		hasher := sha256.New()
 		hasher.Write([]byte(apiKey))
 		userApiKeyHash := hex.EncodeToString(hasher.Sum(nil))
@@ -571,17 +631,27 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Prepare forwarded body: inject operator defaults + stream_options.include_usage=true.
 	// stream_options injection ensures vLLM returns authoritative usage in the final SSE chunk.
 	// This runs AFTER token counting so input billing uses the original prompt length.
-	{
+	//
+	// Guarded by !bodyTruncated: when billing is disabled, a truncated body
+	// reaches this point with requestBody holding only the buffered prefix
+	// while r.Body was already restored (by SafeReadRequestBody) to the
+	// prefix chained with the unread remainder. If that prefix happens to
+	// parse as complete, valid JSON, injecting into it and replacing r.Body
+	// with the prefix-derived result would silently drop the unread
+	// remainder. The complete-forward guarantee must be unconditional, so
+	// this block never runs against a truncated body.
+	if !bodyTruncated {
 		forwarded := requestBody
 		if m.Config != nil && (m.Config.DefaultThink != "" || m.Config.DefaultNumPredict != 0) {
-			forwarded = injectRequestDefaults(forwarded, contentType,
+			forwarded = injectRequestDefaults(forwarded,
 				m.Config.DefaultThink, m.Config.DefaultNumPredict)
 		}
-		forwarded = injectStreamUsageOption(forwarded, contentType)
+		forwarded = injectStreamUsageOption(forwarded)
 		if forwarded != requestBody {
 			bodyBytes := []byte(forwarded)
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			r.ContentLength = int64(len(bodyBytes))
+			r.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
 		}
 	}
 
@@ -590,6 +660,12 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	if err != nil {
 		return err
 	}
+
+	responseStatus := http.StatusOK
+	if statusWriter, ok := wrappedWriter.(*TokenMeteringResponseWriter); ok {
+		responseStatus = statusWriter.Status()
+	}
+	upstreamOK := responseStatus >= 200 && responseStatus < 300
 
 	// Count response tokens
 	responseTokenCountStart := time.Now()
@@ -604,6 +680,11 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	if promptTok, completionTok, cachedTok, ok := extractUsageFromResponse(responseBody); ok {
 		cachedTokens = cachedTok
 		inputTokens = promptTok - cachedTok // non-cached input only; cached billed separately
+		if inputTokens < 0 {
+			// A backend that reports cached_tokens > prompt_tokens (seen with some
+			// vLLM cache-hit accounting quirks) must never bill a negative amount.
+			inputTokens = 0
+		}
 		outputTokens = completionTok
 	} else {
 		// Priority 2: extract only the generated text, then tokenize.
@@ -618,31 +699,44 @@ func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Record response token counting time
 	if m.metricsCollector != nil {
 		m.metricsCollector.RecordTokenCountTime(time.Since(responseTokenCountStart))
-		// Record token metrics
-		m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
+		// Record token metrics — only for successful upstream responses; a failed
+		// upstream shouldn't inflate token counters, matching the x402 path.
+		if upstreamOK {
+			m.metricsCollector.RecordTokens(int64(inputTokens), int64(outputTokens))
+		}
 		// Record processing time
 		m.metricsCollector.RecordProcessingTime(time.Since(startTime))
 	}
 
-	// Record usage for reporting — only for LLM requests (model must be known).
-	// Non-LLM endpoints (GET /v1/models, GET /api/tags, /api/version, etc.) produce
-	// output tokens from their JSON responses but should never be billed.
-	if modelName != "unknown" {
-		if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
-			hasher := sha256.New()
-			hasher.Write([]byte(apiKey))
-			apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
+	// Record usage for reporting — only for LLM requests (model must be known)
+	// that are not on the free-pass list. Non-LLM endpoints (GET /v1/models,
+	// GET /api/tags, /api/version, etc.) produce output tokens from their JSON
+	// responses but should never be billed; free-pass paths (e.g. /api/show)
+	// must never be billed either, even when their body contains a "model" field.
+	if modelName != "unknown" && !freePass {
+		if !upstreamOK {
+			// The upstream failed: do not bill the caller for it.
+			caddy.Log().Info("Upstream error, skipping usage recording",
+				zap.Int("status", responseStatus),
+				zap.String("model", modelName),
+				zap.String("endpoint", r.URL.Path))
+		} else {
+			if m.tokenAccumulator != nil && (inputTokens > 0 || outputTokens > 0) {
+				hasher := sha256.New()
+				hasher.Write([]byte(apiKey))
+				apiKeyHash := hex.EncodeToString(hasher.Sum(nil))
 
-			m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens, cachedTokens)
+				m.tokenAccumulator.RecordUsageWithModel(apiKeyHash, modelName, inputTokens, outputTokens, cachedTokens)
+			}
+
+			// Log token usage for monitoring (enhanced system handles reporting internally)
+			caddy.Log().Info("Token usage recorded",
+				zap.Int("input_tokens", inputTokens),
+				zap.Int("output_tokens", outputTokens),
+				zap.Int("cached_tokens", cachedTokens),
+				zap.String("model", modelName),
+				zap.String("endpoint", r.URL.Path))
 		}
-
-		// Log token usage for monitoring (enhanced system handles reporting internally)
-		caddy.Log().Info("Token usage recorded",
-			zap.Int("input_tokens", inputTokens),
-			zap.Int("output_tokens", outputTokens),
-			zap.Int("cached_tokens", cachedTokens),
-			zap.String("model", modelName),
-			zap.String("endpoint", r.URL.Path))
 	}
 
 	return nil
@@ -1036,21 +1130,81 @@ func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// defaultMaxBodySize is the fallback cap applied when Config.MaxBodySize is
+// unset/zero. Kept equal to proxyconfig.DefaultMaxBodySize (which also backs
+// config.DefaultConfig() and metering.NewBodyHandler's own <= 0 fallback) so
+// all three defaults move together instead of silently drifting apart.
+const defaultMaxBodySize int64 = proxyconfig.DefaultMaxBodySize
+
+// effectiveMaxBodySize returns configured, falling back to defaultMaxBodySize
+// when configured is unset/zero.
+func effectiveMaxBodySize(configured int64) int64 {
+	if configured <= 0 {
+		return defaultMaxBodySize
+	}
+	return configured
+}
+
+// isGzipContentEncoding reports whether encoding names a gzip-compressed
+// body. "x-gzip" is a long-standing alias for "gzip" (predating the
+// standardized token) that some HTTP clients still send.
+func isGzipContentEncoding(encoding string) bool {
+	return strings.EqualFold(encoding, "gzip") || strings.EqualFold(encoding, "x-gzip")
+}
+
+// errGzipBodyTooLarge indicates the gzip stream decompressed past maxBodySize.
+// It is distinct from a gzip-format/decode error so callers can respond 413
+// instead of treating the body as unparseable.
+var errGzipBodyTooLarge = errors.New("decompressed body exceeds max size")
+
+// decompressGzipBody gunzips a compressed request body for analysis purposes
+// only (model detection, message-content extraction, input-token counting).
+// The read is capped at maxBodySize+1 to guard against zip bombs; exceeding
+// the cap returns errGzipBodyTooLarge so callers can distinguish it from a
+// genuine decode failure.
+func decompressGzipBody(rawBody []byte, maxBodySize int64) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(rawBody))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	decoded, err := io.ReadAll(io.LimitReader(zr, maxBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(decoded)) > maxBodySize {
+		return nil, fmt.Errorf("%w: %d bytes", errGzipBodyTooLarge, maxBodySize)
+	}
+	return decoded, nil
+}
+
 // serveX402 handles requests from x402 agents identified by x-agent-address header.
 // Flow: verify EIP-191 signature → check portal balance → forward → report usage.
 func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, walletAddr string) error {
 	logger := caddy.Log()
 
-	// 1. Read raw body before anything else (needed for EIP-191 signature verification)
+	// 1. Read raw body before anything else (needed for EIP-191 signature verification).
+	// The read is capped at the configured max body size: a body we cannot fully
+	// buffer can't be verified (the signature covers the whole body) or billed,
+	// so we reject it with 413 here, before signature verification even runs.
 	var rawBody []byte
 	if r.Body != nil {
-		var err error
-		rawBody, err = io.ReadAll(r.Body)
+		maxBodySize := effectiveMaxBodySize(m.Config.MaxBodySize)
+		limited, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
 		if err != nil {
 			http.Error(w, "Failed to read request body", http.StatusBadRequest)
 			return nil
 		}
 		r.Body.Close()
+		if int64(len(limited)) > maxBodySize {
+			logger.Info("x402: request body exceeds max size",
+				zap.Int64("max_size", maxBodySize),
+				zap.String("wallet", walletAddr))
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return nil
+		}
+		rawBody = limited
 		// Restore body so readRequestBody and next.ServeHTTP can consume it
 		r.Body = io.NopCloser(bytes.NewReader(rawBody))
 	}
@@ -1074,21 +1228,74 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 		return nil
 	}
 
+	// 2.5. Free-pass paths (e.g. /api/show) are exempt from billing entirely —
+	// checked here, right after signature verification, so a free-pass route
+	// is proxied through even when its body happens to contain a "model"
+	// field (modern Ollama's /api/show request body is one such case). This
+	// must run after signature verification above, not before: a free pass
+	// on the billing gate is not a free pass on authentication.
+	if isFreePassPath(r.URL.Path) {
+		logger.Debug("x402: free-pass path, skipping billing entirely",
+			zap.String("path", r.URL.Path),
+			zap.String("wallet", walletAddr))
+		return next.ServeHTTP(w, r)
+	}
+
 	// 3. Detect model from rawBody (already available from sig step above).
 	// This determines whether the request is an LLM call (has "model" field) or not.
 	// We do this BEFORE the balance check so that non-LLM paths (e.g. GET /v1/models,
 	// health checks, embedding queries without billing) are never blocked by balance.
-	contentType := r.Header.Get("Content-Type")
-	model := detectModelFromRequestBody(string(rawBody), contentType)
+	//
+	// A gzip-encoded body never sniffs as JSON, so for gzip requests we gunzip
+	// rawBody into an analysis-only copy here and reuse it below (step 7) for
+	// message-content extraction and input-token counting. This copy is never
+	// forwarded upstream: the signature above was verified over rawBody, and the
+	// bytes forwarded to next.ServeHTTP (step 8) stay exactly what step 1 restored,
+	// so the upstream still receives the original compressed body. If the decompressed
+	// size exceeds the configured cap (guarding against zip bombs), that's a 413, not a
+	// format problem; any other gunzip failure means the body isn't valid gzip at all,
+	// so we reject it immediately with a 400 rather than falling through to model
+	// detection and reporting the misleading "missing model" error.
+	isGzipRequest := isGzipContentEncoding(r.Header.Get("Content-Encoding"))
+	analysisBody := rawBody
+	if isGzipRequest {
+		decoded, err := decompressGzipBody(rawBody, effectiveMaxBodySize(m.Config.MaxBodySize))
+		if err != nil {
+			if errors.Is(err, errGzipBodyTooLarge) {
+				logger.Info("x402: decompressed gzip body exceeds max size",
+					zap.String("wallet", walletAddr))
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return nil
+			}
+			logger.Info("x402: failed to gunzip request body",
+				zap.Error(err),
+				zap.String("wallet", walletAddr))
+			http.Error(w, "Invalid gzip request body", http.StatusBadRequest)
+			return nil
+		}
+		analysisBody = decoded
+	}
+	model := detectModelFromRequestBody(string(analysisBody))
 
 	// 4. For non-LLM requests (no "model" field in body), skip balance check entirely
 	// and proxy directly — these paths consume no tokens and should never be gated.
+	// A GET/HEAD/etc. is always free-passed (discovery/health checks). A POST with
+	// no detectable model is billable by default and fails closed instead of being
+	// proxied for free (free-pass paths were already exempted above in step 2.5,
+	// regardless of method or detected model).
 	if model == "unknown" {
-		logger.Debug("x402: non-LLM request, skipping balance check",
-			zap.String("method", r.Method),
+		if r.Method != http.MethodPost {
+			logger.Debug("x402: non-LLM request, skipping balance check",
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.String("wallet", walletAddr))
+			return next.ServeHTTP(w, r)
+		}
+		logger.Info("x402: rejecting inference request with no detectable model",
 			zap.String("path", r.URL.Path),
 			zap.String("wallet", walletAddr))
-		return next.ServeHTTP(w, r)
+		http.Error(w, "Missing or invalid model in request body", http.StatusBadRequest)
+		return nil
 	}
 
 	// 5. Check balance with DevPortal (LLM requests only)
@@ -1114,25 +1321,69 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	}
 
 	// 7. Count input tokens from message text only (not the full JSON envelope).
-	requestBody, _ := m.readRequestBody(r)
+	// readRequestBody decompresses gzip bodies itself via the metering BodyHandler,
+	// but for x402 requests we already have a decompressed analysis copy from step 3
+	// above — reuse it instead of gunzipping a second time, and skip readRequestBody's
+	// r.Body reassignment entirely so the compressed bytes restored in step 1 remain
+	// untouched for forwarding.
+	var requestBody string
+	if isGzipRequest {
+		requestBody = string(analysisBody)
+	} else {
+		var truncated bool
+		requestBody, _, truncated = m.readRequestBody(r)
+		// Defense in depth: step 1 already capped rawBody at maxBodySize, so
+		// readRequestBody should never report truncation here. If it ever
+		// does (e.g. bodyHandler configured with a smaller cap than the
+		// step-1 check), fail the same way the legacy path does rather than
+		// billing/proxying a request we can't fully account for.
+		if truncated {
+			logger.Info("x402: request body unexpectedly truncated after size check",
+				zap.String("wallet", walletAddr))
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return nil
+		}
+	}
 	inputContent := extractRequestMessageContent(requestBody)
 	if inputContent == "" {
 		inputContent = requestBody
 	}
 	inputTokens := m.countTokens(inputContent, "text/plain", model)
 
-	// Inject stream_options.include_usage=true so vLLM returns authoritative usage counts.
-	forwarded := injectStreamUsageOption(requestBody, contentType)
-	if forwarded != requestBody {
-		bodyBytes := []byte(forwarded)
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		r.ContentLength = int64(len(bodyBytes))
+	// Inject stream_options.include_usage=true so vLLM returns authoritative usage
+	// counts. Skipped for compressed requests: rewriting the body would produce
+	// plaintext JSON under a gzip Content-Encoding header, which the upstream can't
+	// decode — the original compressed body (restored in step 1) is forwarded as-is.
+	if !isGzipRequest {
+		forwarded := injectStreamUsageOption(requestBody)
+		if forwarded != requestBody {
+			bodyBytes := []byte(forwarded)
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
+			r.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+		}
 	}
 
 	// 8. Forward to upstream with response capture
 	tw := NewTokenMeteringResponseWriter(w)
 	if err := next.ServeHTTP(tw, r); err != nil {
 		return err
+	}
+
+	// If the upstream failed, the client must not be billed for it: skip output-token
+	// counting (an error body has no "usage" object, so the tokenizer would otherwise
+	// count the error body itself as output tokens), skip reporting usage to the
+	// portal, and skip token metrics. The balance check already succeeded, so the
+	// request is still recorded as authorized.
+	if status := tw.Status(); status < 200 || status >= 300 {
+		logger.Info("x402: upstream error, skipping usage reporting",
+			zap.Int("status", status),
+			zap.String("wallet", walletAddr),
+			zap.String("model", model))
+		if m.metricsCollector != nil {
+			m.metricsCollector.RecordAuthorized()
+		}
+		return nil
 	}
 
 	// 9. Count output tokens — prefer authoritative usage from backend response,
@@ -1145,6 +1396,11 @@ func (m Middleware) serveX402(w http.ResponseWriter, r *http.Request, next caddy
 	if promptTok, completionTok, cachedTok, ok := extractUsageFromResponse(respBody); ok {
 		cachedTokens = cachedTok
 		inputTokens = promptTok - cachedTok // non-cached input only; cached billed separately
+		if inputTokens < 0 {
+			// A backend that reports cached_tokens > prompt_tokens (seen with some
+			// vLLM cache-hit accounting quirks) must never bill a negative amount.
+			inputTokens = 0
+		}
 		outputTokens = completionTok
 		_ = cachedTokens // x402 path: portal ReportUsage API doesn't support cached yet
 	} else if m.tokenCounter != nil {
@@ -1258,8 +1514,11 @@ func (m *Middleware) countTokens(content, contentType, model string) int {
 	return 0
 }
 
-// readRequestBody reads request body using the enhanced body handler
-func (m *Middleware) readRequestBody(r *http.Request) (content, contentType string) {
+// readRequestBody reads request body using the enhanced body handler.
+// truncated reports whether the body exceeded the handler's buffer cap
+// (BodyInfo.IsTruncated) — callers on billing paths use it to distinguish a
+// merely-oversized body from one that is genuinely missing/invalid.
+func (m *Middleware) readRequestBody(r *http.Request) (content, contentType string, truncated bool) {
 	if m.bodyHandler != nil {
 		// Use enhanced body handler
 		bodyInfo, err := m.bodyHandler.SafeReadRequestBody(r)
@@ -1268,7 +1527,7 @@ func (m *Middleware) readRequestBody(r *http.Request) (content, contentType stri
 			if m.metricsCollector != nil {
 				m.metricsCollector.RecordValidationError()
 			}
-			return "", r.Header.Get("Content-Type")
+			return "", r.Header.Get("Content-Type"), false
 		}
 
 		// Record metrics if available
@@ -1280,12 +1539,12 @@ func (m *Middleware) readRequestBody(r *http.Request) (content, contentType stri
 			}
 		}
 
-		return bodyInfo.Content, bodyInfo.ContentType
+		return bodyInfo.Content, bodyInfo.ContentType, bodyInfo.IsTruncated
 	}
 
 	// If enhanced system is not available, log error
 	caddy.Log().Warn("Enhanced body handler not available, cannot read request body")
-	return "", r.Header.Get("Content-Type")
+	return "", r.Header.Get("Content-Type"), false
 }
 
 // createResponseWriter creates the response writer for token metering
@@ -1526,8 +1785,10 @@ func extractRequestMessageContent(body string) string {
 // injectStreamUsageOption adds stream_options.include_usage=true to streaming requests.
 // This ensures vLLM returns authoritative token counts in the final SSE chunk.
 // Only modifies the body when stream=true and include_usage is not already set.
-func injectStreamUsageOption(body, contentType string) string {
-	if body == "" || !strings.Contains(strings.ToLower(contentType), "application/json") {
+// Whether the body is treated as JSON is determined by sniffing the body itself
+// (see looksLikeJSONObject), not by the client-controlled Content-Type header.
+func injectStreamUsageOption(body string) string {
+	if body == "" || !looksLikeJSONObject(body) {
 		return body
 	}
 	var parsed map[string]any
@@ -1580,18 +1841,62 @@ func detectModelFromResponseBody(content string) string {
 	return "unknown"
 }
 
-// detectModelFromRequestBody extracts the model name from JSON request body.
+// looksLikeJSONObject reports whether body, after trimming leading whitespace,
+// starts with '{'. This is a cheap body-sniffing check used to decide whether
+// a request should be treated as an LLM JSON call, since the client-controlled
+// Content-Type header cannot be trusted for that decision.
+func looksLikeJSONObject(body string) bool {
+	trimmed := strings.TrimLeft(body, " \t\r\n")
+	return strings.HasPrefix(trimmed, "{")
+}
+
+// freePassPaths lists the URL path suffixes that are allowed to proceed
+// without a detectable "model" field even on POST. This is deliberately an
+// allowlist of known-safe, non-token-consuming routes rather than an
+// allowlist of known inference routes: an inference-route allowlist fails
+// open for every LLM/embedding endpoint it doesn't yet know about (new
+// backends, new API surfaces, trailing-slash variants, ...), which is exactly
+// how the billing bypass this gate exists to close kept reappearing. A
+// free-pass list fails closed by default — anything not explicitly named
+// here is treated as billable and rejected when it has no model. Matched by
+// suffix so endpoints mounted under a base path (e.g. "/proxy/api/show") are
+// still covered.
+var freePassPaths = []string{
+	"/api/show", // Ollama model-metadata lookup — legitimate, non-token-consuming
+}
+
+// isFreePassPath reports whether path is on the free-pass list, i.e. safe to
+// proxy through on POST even without a detectable model. The path is
+// normalized (trailing slashes stripped) before matching. Used to fail
+// closed: a POST to any other path with no detectable model must not be
+// proxied for free (see BLOCK 4/serveX402 step 4).
+func isFreePassPath(path string) bool {
+	normalized := strings.TrimRight(path, "/")
+	if normalized == "" {
+		normalized = "/"
+	}
+	for _, suffix := range freePassPaths {
+		if strings.HasSuffix(normalized, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectModelFromRequestBody extracts the model name from a JSON request body.
 // This function parses the request body as JSON and searches for a "model" field.
+// Whether the body is treated as JSON is determined by sniffing the body itself
+// (see looksLikeJSONObject), not by the client-controlled Content-Type header,
+// so billing cannot be bypassed by mislabeling the request.
 //
 // Parameters:
 //   - requestBody: The request body content
-//   - contentType: The content type of the request
 //
 // Returns:
 //   - string: The detected model name, or "unknown" if not found or not JSON
-func detectModelFromRequestBody(requestBody, contentType string) string {
-	// Only process JSON content
-	if !strings.Contains(strings.ToLower(contentType), "application/json") {
+func detectModelFromRequestBody(requestBody string) string {
+	// Only process bodies that look like a JSON object
+	if !looksLikeJSONObject(requestBody) {
 		return "unknown"
 	}
 
@@ -1615,15 +1920,17 @@ func detectModelFromRequestBody(requestBody, contentType string) string {
 // injectRequestDefaults adds operator-defined default values to an LLM request body.
 // It only sets fields that the client has not already provided, so client values
 // always take precedence.  Returns the (possibly modified) body as a string.
+// Whether the body is treated as JSON is determined by sniffing the body itself
+// (see looksLikeJSONObject), not by the client-controlled Content-Type header.
 //
 // Supported defaults (controlled via Caddyfile directives):
 //   - default_think      → sets top-level "think" field  (e.g. "low")
 //   - default_num_predict → sets "options.num_predict"   (e.g. 512)
-func injectRequestDefaults(body, contentType, defaultThink string, defaultNumPredict int) string {
+func injectRequestDefaults(body, defaultThink string, defaultNumPredict int) string {
 	if body == "" {
 		return body
 	}
-	if !strings.Contains(strings.ToLower(contentType), "application/json") {
+	if !looksLikeJSONObject(body) {
 		return body
 	}
 	if defaultThink == "" && defaultNumPredict == 0 {

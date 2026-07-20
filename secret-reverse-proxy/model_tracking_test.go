@@ -10,44 +10,38 @@ func TestModelAwareTokenTracking(t *testing.T) {
 	testCases := []struct {
 		name          string
 		requestBody   string
-		contentType   string
 		expectedModel string
 	}{
 		{
 			name:          "Valid JSON with model",
 			requestBody:   `{"model": "gpt-4", "prompt": "Hello world"}`,
-			contentType:   "application/json",
 			expectedModel: "gpt-4",
 		},
 		{
 			name:          "Valid JSON with different model",
 			requestBody:   `{"model": "gpt-3.5-turbo", "messages": []}`,
-			contentType:   "application/json",
 			expectedModel: "gpt-3.5-turbo",
 		},
 		{
 			name:          "JSON without model field",
 			requestBody:   `{"prompt": "Hello world"}`,
-			contentType:   "application/json",
 			expectedModel: "unknown",
 		},
 		{
 			name:          "Non-JSON content",
 			requestBody:   "plain text",
-			contentType:   "text/plain",
 			expectedModel: "unknown",
 		},
 		{
 			name:          "Invalid JSON",
 			requestBody:   `{"model": "gpt-4", "invalid": }`,
-			contentType:   "application/json",
 			expectedModel: "unknown",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := detectModelFromRequestBody(tc.requestBody, tc.contentType)
+			result := detectModelFromRequestBody(tc.requestBody)
 			if result != tc.expectedModel {
 				t.Errorf("Expected model %q, got %q", tc.expectedModel, result)
 			}
@@ -59,9 +53,9 @@ func TestTokenAccumulatorWithModel(t *testing.T) {
 	ta := NewTokenAccumulator()
 	
 	// Record usage for different models
-	ta.RecordUsageWithModel("api_key_hash_1", "gpt-4", 100, 50)
-	ta.RecordUsageWithModel("api_key_hash_1", "gpt-3.5-turbo", 200, 80)
-	ta.RecordUsageWithModel("api_key_hash_2", "gpt-4", 150, 70)
+	ta.RecordUsageWithModel("api_key_hash_1", "gpt-4", 100, 50, 0)
+	ta.RecordUsageWithModel("api_key_hash_1", "gpt-3.5-turbo", 200, 80, 0)
+	ta.RecordUsageWithModel("api_key_hash_2", "gpt-4", 150, 70, 0)
 	
 	// Get usage and verify structure
 	usage := ta.PeekUsage()
@@ -103,8 +97,8 @@ func TestBuildRecordsWithModelData(t *testing.T) {
 	reporter := NewResilientReporter(config, ta)
 	
 	// Create test usage data
-	ta.RecordUsageWithModel("test_hash_1", "gpt-4", 100, 50)
-	ta.RecordUsageWithModel("test_hash_1", "gpt-3.5-turbo", 200, 80)
+	ta.RecordUsageWithModel("test_hash_1", "gpt-4", 100, 50, 0)
+	ta.RecordUsageWithModel("test_hash_1", "gpt-3.5-turbo", 200, 80, 0)
 	
 	usage := ta.FlushUsage()
 	records := reporter.buildRecords(usage)
@@ -157,9 +151,9 @@ func TestJSONPayloadStructure(t *testing.T) {
 	reporter := NewResilientReporter(config, ta)
 	
 	// Create test usage data with models
-	ta.RecordUsageWithModel("hash1", "gpt-4", 100, 50)
-	ta.RecordUsageWithModel("hash1", "claude-3", 200, 80)
-	ta.RecordUsageWithModel("hash2", "gpt-3.5-turbo", 150, 70)
+	ta.RecordUsageWithModel("hash1", "gpt-4", 100, 50, 0)
+	ta.RecordUsageWithModel("hash1", "claude-3", 200, 80, 0)
+	ta.RecordUsageWithModel("hash2", "gpt-3.5-turbo", 150, 70, 0)
 	
 	usage := ta.FlushUsage()
 	records := reporter.buildRecords(usage)

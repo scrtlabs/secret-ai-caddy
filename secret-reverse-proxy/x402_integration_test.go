@@ -1,11 +1,14 @@
 package secret_reverse_proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -19,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
+	"github.com/scrtlabs/secret-reverse-proxy/factories"
 	validators "github.com/scrtlabs/secret-reverse-proxy/validators"
 	"github.com/scrtlabs/secret-reverse-proxy/x402"
 )
@@ -56,20 +60,29 @@ func signRequest(t *testing.T, privKey *ecdsa.PrivateKey, method, path, body, ti
 
 type testPortalServer struct {
 	balances     map[string]float64 // wallet → USD balance
+	userBalances map[string]float64 // api key hash → USD balance (legacy path)
 	usageReports []x402.UsageReportRequest
+	balanceCheck int // number of GetBalance/GetUserBalance calls received
+	reportUsage  int // number of ReportUsage calls received
 	serviceKey   string
 	mu           sync.Mutex
 	server       *httptest.Server
+	// reportSignal fires once per ReportUsage call so tests can wait
+	// deterministically for the async report goroutine instead of sleeping.
+	reportSignal chan struct{}
 }
 
 func newTestPortalServer(serviceKey string) *testPortalServer {
 	p := &testPortalServer{
-		balances:   make(map[string]float64),
-		serviceKey: serviceKey,
+		balances:     make(map[string]float64),
+		userBalances: make(map[string]float64),
+		serviceKey:   serviceKey,
+		reportSignal: make(chan struct{}, 16),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/balance", p.handleBalance)
+	mux.HandleFunc("/api/user/balance", p.handleUserBalance)
 	mux.HandleFunc("/api/user/report-usage", p.handleReportUsage)
 	p.server = httptest.NewServer(mux)
 	return p
@@ -91,6 +104,7 @@ func (p *testPortalServer) handleBalance(w http.ResponseWriter, r *http.Request)
 	}
 
 	p.mu.Lock()
+	p.balanceCheck++
 	balance := p.balances[strings.ToLower(walletAddr)]
 	p.mu.Unlock()
 
@@ -100,13 +114,50 @@ func (p *testPortalServer) handleBalance(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// handleUserBalance backs the DevPortal /api/user/balance endpoint used by
+// the legacy (non-x402-agent) pre-request balance check, keyed by API key
+// hash rather than wallet address.
+func (p *testPortalServer) handleUserBalance(w http.ResponseWriter, r *http.Request) {
+	svcKey := r.Header.Get("X-Agent-Service-Key")
+	if svcKey == "" {
+		http.Error(w, "missing service key", http.StatusUnauthorized)
+		return
+	}
+	apiKeyHash := r.URL.Query().Get("api_key_hash")
+	if apiKeyHash == "" {
+		http.Error(w, "missing api key hash", http.StatusBadRequest)
+		return
+	}
+
+	p.mu.Lock()
+	p.balanceCheck++
+	balance, known := p.userBalances[apiKeyHash]
+	p.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	if !known {
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_found"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"user":   map[string]float64{"balance": balance},
+	})
+}
+
 func (p *testPortalServer) handleReportUsage(w http.ResponseWriter, r *http.Request) {
 	var report x402.UsageReportRequest
 	json.NewDecoder(r.Body).Decode(&report)
 
 	p.mu.Lock()
 	p.usageReports = append(p.usageReports, report)
+	p.reportUsage++
 	p.mu.Unlock()
+
+	select {
+	case p.reportSignal <- struct{}{}:
+	default:
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -118,12 +169,30 @@ func (p *testPortalServer) setBalance(walletAddr string, usd float64) {
 	p.balances[strings.ToLower(walletAddr)] = usd
 }
 
+func (p *testPortalServer) setUserBalance(apiKeyHash string, usd float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.userBalances[apiKeyHash] = usd
+}
+
 func (p *testPortalServer) getUsageReports() []x402.UsageReportRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := make([]x402.UsageReportRequest, len(p.usageReports))
 	copy(out, p.usageReports)
 	return out
+}
+
+func (p *testPortalServer) getBalanceCheckCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.balanceCheck
+}
+
+func (p *testPortalServer) getReportUsageCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reportUsage
 }
 
 func (p *testPortalServer) close() { p.server.Close() }
@@ -133,11 +202,35 @@ func (p *testPortalServer) close() { p.server.Close() }
 type mockLLMHandler struct {
 	called       bool
 	responseBody string
+	// statusCode, when non-zero, is written via WriteHeader before the body
+	// so tests can simulate an upstream failure (e.g. 500).
+	statusCode int
+	// receivedBody captures the exact bytes the upstream saw, so tests can
+	// assert that forwarding did not mutate/re-encode the request body.
+	receivedBody []byte
+	// receivedContentEncoding captures the Content-Encoding header as seen
+	// by the upstream.
+	receivedContentEncoding string
+	// receivedContentLengthHeader captures the literal Content-Length header
+	// value as seen by the upstream (empty if never set).
+	receivedContentLengthHeader string
+	// receivedContentLength captures r.ContentLength as seen by the upstream.
+	receivedContentLength int64
 }
 
 func (h *mockLLMHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	h.called = true
+	h.receivedContentEncoding = r.Header.Get("Content-Encoding")
+	h.receivedContentLengthHeader = r.Header.Get("Content-Length")
+	h.receivedContentLength = r.ContentLength
+	if r.Body != nil {
+		b, _ := io.ReadAll(r.Body)
+		h.receivedBody = b
+	}
 	w.Header().Set("Content-Type", "application/json")
+	if h.statusCode != 0 {
+		w.WriteHeader(h.statusCode)
+	}
 	if h.responseBody != "" {
 		w.Write([]byte(h.responseBody))
 	} else {
@@ -150,6 +243,13 @@ func (h *mockLLMHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error
 
 func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, serviceKey string) *Middleware {
 	t.Helper()
+	return buildX402MiddlewareWithMaxBodySize(t, portalURL, minBalanceUSD, serviceKey, 10*1024*1024)
+}
+
+// buildX402MiddlewareWithMaxBodySize is like buildX402Middleware but lets tests
+// pin a small MaxBodySize so oversized-body tests don't need multi-MB payloads.
+func buildX402MiddlewareWithMaxBodySize(t *testing.T, portalURL string, minBalanceUSD float64, serviceKey string, maxBodySize int64) *Middleware {
+	t.Helper()
 	config := &proxyconfig.Config{
 		APIKey:              "master-key-123",
 		CacheTTL:            time.Hour,
@@ -157,7 +257,7 @@ func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, 
 		DevPortalURL:        portalURL,
 		DevPortalServiceKey: serviceKey,
 		X402MinBalanceUSD:   minBalanceUSD,
-		MaxBodySize:         10 * 1024 * 1024,
+		MaxBodySize:         maxBodySize,
 	}
 
 	logger := zap.NewNop()
@@ -167,11 +267,50 @@ func buildX402Middleware(t *testing.T, portalURL string, minBalanceUSD float64, 
 		validator: validators.NewAPIKeyValidator(config),
 	}
 
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
 	m.portalClient = x402.NewPortalClient(portalURL, config.DevPortalServiceKey, logger)
 	m.challengeBuilder = x402.NewChallengeBuilder(portalURL + "/api/agent/add-funds")
 	m.x402MinBalance = minBalanceUSD
 
 	return m
+}
+
+// buildMeteringOnlyMiddleware builds a middleware in metering-only billing
+// mode (Config.Metering=true, x402/portal disabled) — mirroring a legacy
+// deployment that bills via the accumulator/ResilientReporter path rather
+// than the x402 portal. The gates under test here only read config, so a nil
+// portalClient and no live reporter/accumulator are fine.
+func buildMeteringOnlyMiddleware(t *testing.T) *Middleware {
+	t.Helper()
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		Metering:    true,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+
+	return m
+}
+
+// gzipCompress gzip-encodes s, for building gzip-encoded agent request bodies.
+func gzipCompress(t *testing.T, s string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(s)); err != nil {
+		t.Fatalf("failed to gzip-compress test body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("failed to close gzip writer: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // agentReq builds a signed agent request for tests.
@@ -256,8 +395,17 @@ func TestX402_SufficientBalance_ProxiesRequest(t *testing.T) {
 		t.Error("expected next handler to be called")
 	}
 
-	// Wait briefly for async usage report
-	time.Sleep(100 * time.Millisecond)
+	// The usage report is sent from a goroutine; wait for the mock portal to
+	// signal it received the call instead of sleeping a fixed duration.
+	select {
+	case <-portal.reportSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async usage report")
+	}
+
+	if got := portal.getReportUsageCount(); got != 1 {
+		t.Fatalf("expected 1 usage report, got %d", got)
+	}
 
 	reports := portal.getUsageReports()
 	if len(reports) != 1 {
@@ -268,6 +416,48 @@ func TestX402_SufficientBalance_ProxiesRequest(t *testing.T) {
 	}
 	if len(reports[0].UsageData) != 1 {
 		t.Fatalf("expected 1 usage_data entry, got %d", len(reports[0].UsageData))
+	}
+}
+
+func TestX402_UpstreamError_SkipsUsageReport(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.02) // $0.02 — plenty of funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{
+		statusCode:   http.StatusInternalServerError,
+		responseBody: `{"error":"upstream exploded"}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected upstream 500 to pass through, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called")
+	}
+
+	// Give the (would-be) async report goroutine a bounded window to fire;
+	// it must never do so for a failed upstream response.
+	select {
+	case <-portal.reportSignal:
+		t.Fatal("expected no usage report for a failed upstream request")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if got := portal.getReportUsageCount(); got != 0 {
+		t.Errorf("expected 0 usage reports for failed upstream request, got %d", got)
 	}
 }
 
@@ -379,5 +569,1109 @@ func TestX402_InvalidSignature_Returns401(t *testing.T) {
 	}
 	if next.called {
 		t.Error("expected next handler NOT to be called with invalid signature")
+	}
+}
+
+func TestX402_InferencePathWithoutModel_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for inference path without model")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_InferencePathModelViaTextPlain_BalanceStillChecked(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "text/plain") // client mislabels content-type
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (balance checked and found insufficient), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called when balance is insufficient")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_NonInferenceGET_ProxiedFreeNoBalanceCheck(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds — must not matter for this path
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	req := agentReq(t, privKey, walletAddr, "GET", "/v1/models", "")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for non-inference GET")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_EmbeddingsPathWithoutModel_Returns400(t *testing.T) {
+	// Residual bypass being closed: /v1/embeddings is not a "known inference
+	// path" under the old allowlist, so a model-less POST here used to be
+	// proxied through for free. Under the free-pass inversion it must be
+	// rejected like any other unrecognized billable route.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"input":"hello world"}` // no "model" field
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/embeddings", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for embeddings path without model")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_TrailingSlashInferencePathWithoutModel_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions/", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for trailing-slash inference path without model")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_ApiShowWithoutModel_ProxiedFreeNoBalanceCheck(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds — must not matter for this path
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"name":"llama3"}` // non-model JSON body
+	req := agentReq(t, privKey, walletAddr, "POST", "/api/show", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for /api/show")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestLegacy_MeteringOnly_InferencePathWithoutModel_Returns400(t *testing.T) {
+	// Config.Metering is an independent billing mode (accumulator →
+	// ResilientReporter) with x402/portal entirely disabled. Before this fix
+	// the model-less-POST 400 gate only checked X402Enabled+portalClient, so
+	// a metering-only deployment proxied model-less requests for free.
+	m := buildMeteringOnlyMiddleware(t)
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for inference path without model")
+	}
+}
+
+func TestX402_ApiShowWithModel_ProxiedFreeNoBalanceCheckNoUsageReport(t *testing.T) {
+	// Modern Ollama sends {"model": ...} on /api/show, and the metadata
+	// response has no "usage" object. Free-pass paths must be exempt from
+	// billing entirely — regardless of whether a "model" field is present —
+	// so this must never be balance-checked or usage-billed even for a
+	// funded wallet.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // funded wallet — must not matter for this path
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama3.2"}` // modern-Ollama /api/show request body
+	req := agentReq(t, privKey, walletAddr, "POST", "/api/show", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for /api/show")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+	if portal.getReportUsageCount() != 0 {
+		t.Errorf("expected no usage report, got %d", portal.getReportUsageCount())
+	}
+}
+
+func TestLegacy_ApiShowWithModel_BillingEnabled_AccumulatorRecordsNothing(t *testing.T) {
+	// Same modern-Ollama regression as the x402 case above, but through the
+	// legacy Bearer-token path: a free-pass path with a "model" field must
+	// not be balance-checked or recorded into the token accumulator.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	m.tokenCounter = factories.CreateTokenCounter()
+	m.tokenAccumulator = NewTokenAccumulator()
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama3.2"}` // modern-Ollama /api/show request body
+	req := httptest.NewRequest("POST", "/api/show", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called for /api/show")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check for free-pass path, got %d", portal.getBalanceCheckCount())
+	}
+	usage := m.tokenAccumulator.PeekUsage()
+	if len(usage) != 0 {
+		t.Errorf("expected no accumulated usage for free-pass path, got %#v", usage)
+	}
+}
+
+func TestLegacy_InferencePathWithoutModel_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for inference path without model")
+	}
+}
+
+func TestLegacy_InferencePathWithoutModel_RecordsRejectedNotAuthorized(t *testing.T) {
+	// A gate-rejected request must count only as rejected, never as both
+	// authorized and rejected — RecordAuthorized must fire only after the
+	// body gates (413 + 400) have had their chance to reject.
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	metrics := &fakeMetricsCollector{}
+	m.metricsCollector = metrics
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	if metrics.rejectedCalls != 1 {
+		t.Errorf("expected RecordRejected to fire once, got %d", metrics.rejectedCalls)
+	}
+	if metrics.authorizedCalls != 0 {
+		t.Errorf("expected RecordAuthorized NOT to fire, got %d", metrics.authorizedCalls)
+	}
+}
+
+func TestLegacy_InferencePathWithoutModel_BillingDisabled_ProxiesThrough(t *testing.T) {
+	// With x402/billing disabled, this middleware runs as a pure auth proxy —
+	// a model-less POST to an inference path must be proxied through, not
+	// rejected, since some backends legitimately default the model themselves.
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+
+	next := &mockLLMHandler{}
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}` // no "model" field
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called when billing is disabled")
+	}
+}
+
+func TestLegacy_UpstreamError_SkipsTokenAccumulator(t *testing.T) {
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+	m.tokenCounter = factories.CreateTokenCounter()
+	m.tokenAccumulator = NewTokenAccumulator()
+
+	next := &mockLLMHandler{
+		statusCode: http.StatusInternalServerError,
+		// No "usage" object, so the tokenizer would otherwise count this
+		// error body itself as output tokens.
+		responseBody: `{"error":"upstream exploded, this message is deliberately long enough to tokenize to a nonzero count"}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected upstream 500 to pass through, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called")
+	}
+
+	usage := m.tokenAccumulator.PeekUsage()
+	if len(usage) != 0 {
+		t.Errorf("expected no accumulated usage for a failed upstream request, got %#v", usage)
+	}
+}
+
+// fakeMetricsCollector is a lightweight interfaces.MetricsCollector shim used to
+// assert which metrics calls fire, since the production collector doesn't expose
+// queryable counters in tests.
+type fakeMetricsCollector struct {
+	authorizedCalls int
+	rejectedCalls   int
+	tokensCalls     int
+	lastInputTokens int64
+	lastOutputToken int64
+}
+
+func (f *fakeMetricsCollector) RecordRequest()     {}
+func (f *fakeMetricsCollector) RecordAuthorized()  { f.authorizedCalls++ }
+func (f *fakeMetricsCollector) RecordRejected()    { f.rejectedCalls++ }
+func (f *fakeMetricsCollector) RecordRateLimited() {}
+func (f *fakeMetricsCollector) RecordTokens(inputTokens, outputTokens int64) {
+	f.tokensCalls++
+	f.lastInputTokens = inputTokens
+	f.lastOutputToken = outputTokens
+}
+func (f *fakeMetricsCollector) RecordProcessingTime(time.Duration)              {}
+func (f *fakeMetricsCollector) RecordTokenCountTime(time.Duration)              {}
+func (f *fakeMetricsCollector) RecordValidationError()                          {}
+func (f *fakeMetricsCollector) RecordTokenCountError()                          {}
+func (f *fakeMetricsCollector) RecordReportingError()                           {}
+func (f *fakeMetricsCollector) RecordCacheHit()                                 {}
+func (f *fakeMetricsCollector) RecordCacheMiss()                                {}
+func (f *fakeMetricsCollector) RecordSuccessfulReport()                         {}
+func (f *fakeMetricsCollector) RecordFailedReport()                             {}
+func (f *fakeMetricsCollector) UpdatePendingReports(int64)                      {}
+func (f *fakeMetricsCollector) GetMetrics() map[string]any                      { return nil }
+func (f *fakeMetricsCollector) ServeMetrics(http.ResponseWriter, *http.Request) {}
+
+func TestLegacy_UpstreamError_SkipsTokenMetrics(t *testing.T) {
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 10 * 1024 * 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+	m.tokenCounter = factories.CreateTokenCounter()
+	m.tokenAccumulator = NewTokenAccumulator()
+	metrics := &fakeMetricsCollector{}
+	m.metricsCollector = metrics
+
+	next := &mockLLMHandler{
+		statusCode: http.StatusInternalServerError,
+		// No "usage" object, so the tokenizer would otherwise count this
+		// error body itself as output tokens.
+		responseBody: `{"error":"upstream exploded, this message is deliberately long enough to tokenize to a nonzero count"}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected upstream 500 to pass through, got %d", w.Code)
+	}
+
+	if metrics.authorizedCalls != 1 {
+		t.Errorf("expected RecordAuthorized to fire once (authorization succeeded), got %d", metrics.authorizedCalls)
+	}
+	if metrics.tokensCalls != 0 {
+		t.Errorf("expected RecordTokens to be skipped on upstream failure, got %d calls with (in=%d, out=%d)",
+			metrics.tokensCalls, metrics.lastInputTokens, metrics.lastOutputToken)
+	}
+}
+
+func TestX402_GzipBody_FundedWallet_ForwardsCompressedBytesUnchanged(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.02) // $0.02
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+	if next.receivedContentEncoding != "gzip" {
+		t.Errorf("expected upstream to see Content-Encoding: gzip, got %q", next.receivedContentEncoding)
+	}
+	if !bytes.Equal(next.receivedBody, compressed) {
+		t.Errorf("expected upstream to receive the original compressed bytes unchanged")
+	}
+
+	// Usage is reported from a goroutine; wait for it so it can't race with
+	// portal.close() and leak a connection-refused log into later tests.
+	select {
+	case <-portal.reportSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async usage report")
+	}
+}
+
+func TestX402_GzipBody_ZeroBalance_Returns402(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (model detected through compression), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_GzipContentEncodingWithGarbageBody_Returns400(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	garbage := "this is not gzip data"
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", garbage)
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+	wantMsg := "Invalid gzip request body\n"
+	if got := w.Body.String(); got != wantMsg {
+		t.Errorf("expected body %q, got %q", wantMsg, got)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for undecodable gzip body")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+// TestX402_XGzipContentEncodingAlias_TreatedAsGzip pins that "x-gzip" (the
+// long-standing pre-standardization alias some clients still send) is
+// accepted exactly like "gzip" in the x402 path's encoding check — a
+// legitimately gzip-compressed body under that header must still be
+// decompressed for model detection rather than treated as unencoded garbage.
+func TestX402_XGzipContentEncodingAlias_TreatedAsGzip(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "x-gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (model detected through x-gzip compression), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_GzipDecompressedBodyTooLarge_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 1024)
+	next := &mockLLMHandler{}
+
+	// The compressed bytes stay well under the cap, but the decompressed
+	// content does not — this is a legitimate gzip stream, not garbage.
+	plainBody := `{"model":"llama-3","padding":"` + strings.Repeat("x", 4096) + `"}`
+	compressed := gzipCompress(t, plainBody)
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", string(compressed))
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for oversized decompressed body")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+func TestX402_OversizedBody_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 1024)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"` + strings.Repeat("x", 2000) + `"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for oversized body")
+	}
+	if portal.getBalanceCheckCount() != 0 {
+		t.Errorf("expected no balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+// TestX402_ReadRequestBodyTruncated_Returns413 exercises the step 7
+// defense-in-depth guard directly: step 1 already caps rawBody at
+// effectiveMaxBodySize(m.Config.MaxBodySize), so readRequestBody normally
+// can never report truncation for a request that reached step 7. To force
+// that condition anyway, this test points m.bodyHandler at a cap smaller
+// than the step-1 check, simulating any future drift between the two, and
+// asserts the guard 413s instead of silently billing/proxying.
+func TestX402_ReadRequestBodyTruncated_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance, should never be checked
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 4096)
+	// Force readRequestBody (step 7) to see a stricter cap than step 1 used.
+	m.bodyHandler = factories.CreateBodyHandler(16)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called when readRequestBody reports truncation")
+	}
+	if portal.getReportUsageCount() != 0 {
+		t.Errorf("expected no usage report, got %d", portal.getReportUsageCount())
+	}
+}
+
+func TestLegacy_OversizedBody_BillingEnabled_Returns413(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	m := buildX402MiddlewareWithMaxBodySize(t, portal.server.URL, 0.01, "test-service-key", 1024)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"` + strings.Repeat("x", 2000) + `"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected status 413, got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called for oversized body")
+	}
+}
+
+func TestLegacy_OversizedBody_BillingDisabled_ProxiesThrough(t *testing.T) {
+	// With x402/billing disabled, an oversized body is proxied through complete
+	// and unmodified — the new 413 gate stays scoped to billing paths, and the
+	// upstream must receive every byte of the original body, not just the
+	// prefix SafeReadRequestBody buffered for token counting before truncating.
+	config := &proxyconfig.Config{
+		APIKey:      "master-key-123",
+		CacheTTL:    time.Hour,
+		X402Enabled: false,
+		MaxBodySize: 1024,
+	}
+
+	m := &Middleware{
+		Config:    config,
+		validator: validators.NewAPIKeyValidator(config),
+	}
+	m.bodyHandler = factories.CreateBodyHandler(config.MaxBodySize)
+
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"` + strings.Repeat("x", 2000) + `"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Error("expected next handler to be called when billing is disabled")
+	}
+	if string(next.receivedBody) != body {
+		t.Errorf("expected upstream to receive the COMPLETE body (%d bytes), got %d bytes",
+			len(body), len(next.receivedBody))
+	}
+}
+
+// legacyAPIKeyHash reproduces the sha256(apiKey) hex hash that the legacy
+// pre-request balance check sends to DevPortal as api_key_hash, so tests can
+// pre-seed testPortalServer.userBalances for a given Bearer API key.
+func legacyAPIKeyHash(apiKey string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(apiKey))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func TestLegacy_GzipBody_FundedBalance_ForwardsDecompressedBody(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+	portal.setUserBalance(legacyAPIKeyHash("master-key-123"), 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(compressed))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+	if next.receivedContentEncoding != "" {
+		t.Errorf("expected upstream to see no Content-Encoding header, got %q", next.receivedContentEncoding)
+	}
+	if string(next.receivedBody) != plainBody {
+		t.Errorf("expected upstream to receive the decompressed JSON %q, got %q", plainBody, string(next.receivedBody))
+	}
+	wantCL := strconv.Itoa(len(plainBody))
+	if next.receivedContentLengthHeader != wantCL {
+		t.Errorf("expected upstream Content-Length header %q, got %q", wantCL, next.receivedContentLengthHeader)
+	}
+	if next.receivedContentLength != int64(len(plainBody)) {
+		t.Errorf("expected upstream r.ContentLength %d, got %d", len(plainBody), next.receivedContentLength)
+	}
+}
+
+func TestLegacy_GzipBody_ZeroBalance_Returns402(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+	portal.setUserBalance(legacyAPIKeyHash("master-key-123"), 0.0) // no funds
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	plainBody := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	compressed := gzipCompress(t, plainBody)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(compressed))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("expected status 402 (model detected through compression), got %d", w.Code)
+	}
+	if next.called {
+		t.Error("expected next handler NOT to be called")
+	}
+	if portal.getBalanceCheckCount() != 1 {
+		t.Errorf("expected exactly 1 balance check, got %d", portal.getBalanceCheckCount())
+	}
+}
+
+// TestLegacy_NonGzipBody_ForwardsUnchanged is a regression pin: a legacy
+// request with no Content-Encoding must be forwarded exactly as before the
+// gzip-coherence fix — the fix must only engage when the body was actually
+// decompressed.
+func TestLegacy_NonGzipBody_ForwardsUnchanged(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+	portal.setUserBalance(legacyAPIKeyHash("master-key-123"), 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+	if next.receivedContentEncoding != "" {
+		t.Errorf("expected no Content-Encoding header, got %q", next.receivedContentEncoding)
+	}
+	if next.receivedContentLengthHeader != "" {
+		t.Errorf("expected Content-Length header to remain unset (today's behavior), got %q", next.receivedContentLengthHeader)
+	}
+	if string(next.receivedBody) != body {
+		t.Errorf("expected upstream to receive the original body unchanged, got %q", string(next.receivedBody))
+	}
+}
+
+// TestLegacy_StreamInjection_ContentLengthHeaderMatchesInjectedBody pins that
+// when the legacy path's stream_options injection replaces the request body,
+// the upstream-visible Content-Length HEADER (not just r.ContentLength) is
+// kept in sync with the injected body's actual length — otherwise a
+// downstream forwarder that reads the header directly would send a stale
+// length alongside the new, longer body.
+func TestLegacy_StreamInjection_ContentLengthHeaderMatchesInjectedBody(t *testing.T) {
+	m := buildMeteringOnlyMiddleware(t)
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer master-key-123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+
+	if string(next.receivedBody) == body {
+		t.Fatal("expected stream_options.include_usage to be injected, body was forwarded unchanged")
+	}
+	if !strings.Contains(string(next.receivedBody), "include_usage") {
+		t.Errorf("expected injected body to contain include_usage, got %q", string(next.receivedBody))
+	}
+
+	wantCL := strconv.Itoa(len(next.receivedBody))
+	if next.receivedContentLengthHeader != wantCL {
+		t.Errorf("expected upstream Content-Length header %q (matching injected body length), got %q",
+			wantCL, next.receivedContentLengthHeader)
+	}
+	if next.receivedContentLength != int64(len(next.receivedBody)) {
+		t.Errorf("expected upstream r.ContentLength %d, got %d", len(next.receivedBody), next.receivedContentLength)
+	}
+}
+
+// TestX402_StreamInjection_ContentLengthHeaderMatchesInjectedBody is the
+// x402-path counterpart of the legacy test above, exercising the step 7
+// injection call site.
+func TestX402_StreamInjection_ContentLengthHeaderMatchesInjectedBody(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{}
+
+	body := `{"model":"llama-3","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+	if !next.called {
+		t.Fatal("expected next handler to be called")
+	}
+
+	if string(next.receivedBody) == body {
+		t.Fatal("expected stream_options.include_usage to be injected, body was forwarded unchanged")
+	}
+	if !strings.Contains(string(next.receivedBody), "include_usage") {
+		t.Errorf("expected injected body to contain include_usage, got %q", string(next.receivedBody))
+	}
+
+	wantCL := strconv.Itoa(len(next.receivedBody))
+	if next.receivedContentLengthHeader != wantCL {
+		t.Errorf("expected upstream Content-Length header %q (matching injected body length), got %q",
+			wantCL, next.receivedContentLengthHeader)
+	}
+	if next.receivedContentLength != int64(len(next.receivedBody)) {
+		t.Errorf("expected upstream r.ContentLength %d, got %d", len(next.receivedBody), next.receivedContentLength)
+	}
+}
+
+// TestX402_CachedTokensExceedPromptTokens_InputTokensClampedToZero pins step
+// 9's defense against a backend reporting cached_tokens greater than
+// prompt_tokens (seen with some cache-accounting quirks): non-cached input
+// tokens (prompt_tokens - cached_tokens) must never go negative and be
+// reported to the portal as such.
+func TestX402_CachedTokensExceedPromptTokens_InputTokensClampedToZero(t *testing.T) {
+	portal := newTestPortalServer("test-service-key")
+	defer portal.close()
+
+	privKey, walletAddr := generateTestWallet(t)
+	portal.setBalance(walletAddr, 1.0) // ample balance
+
+	m := buildX402Middleware(t, portal.server.URL, 0.01, "test-service-key")
+	next := &mockLLMHandler{
+		// cached_tokens (50) exceeds prompt_tokens (10): a naive
+		// prompt_tokens - cached_tokens would go negative.
+		responseBody: `{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}],` +
+			`"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":50}}}`,
+	}
+
+	body := `{"model":"llama-3","messages":[{"role":"user","content":"hi"}]}`
+	req := agentReq(t, privKey, walletAddr, "POST", "/v1/chat/completions", body)
+	w := httptest.NewRecorder()
+
+	err := m.ServeHTTP(w, req, next)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	select {
+	case <-portal.reportSignal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async usage report")
+	}
+
+	reports := portal.getUsageReports()
+	if len(reports) != 1 {
+		t.Fatalf("expected 1 usage report, got %d", len(reports))
+	}
+	if len(reports[0].UsageData) != 1 {
+		t.Fatalf("expected 1 usage_data entry, got %d", len(reports[0].UsageData))
+	}
+	if got := reports[0].UsageData[0].InputTokens; got != 0 {
+		t.Errorf("expected input_tokens clamped to 0, got %d", got)
+	}
+	if got := reports[0].UsageData[0].OutputTokens; got != 5 {
+		t.Errorf("expected output_tokens 5, got %d", got)
 	}
 }

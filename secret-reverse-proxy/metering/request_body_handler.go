@@ -16,6 +16,8 @@ import (
 	
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	proxyconfig "github.com/scrtlabs/secret-reverse-proxy/config"
 )
 
 // BodyHandler provides safe request/response body handling with size limits
@@ -29,14 +31,16 @@ type BodyHandler struct {
 
 func NewBodyHandler(maxBodySize int64) *BodyHandler {
 	if maxBodySize <= 0 {
-		maxBodySize = 10 * 1024 * 1024 // 10MB default
+		// Shared with config.DefaultConfig() and secret_reverse_proxy.go's
+		// defaultMaxBodySize so all three fallbacks stay in lockstep.
+		maxBodySize = proxyconfig.DefaultMaxBodySize
 	}
-	
+
+	// The buffer cap tracks maxBodySize exactly (no independent clamp) so
+	// this handler enforces the same effective limit as the x402 path's own
+	// maxBodySize check, rather than silently truncating at a lower value.
 	maxBufferSize := maxBodySize
-	if maxBufferSize > 5*1024*1024 {
-		maxBufferSize = 5 * 1024 * 1024 // 5MB max buffer
-	}
-	
+
 	return &BodyHandler{
 		maxBodySize:        maxBodySize,
 		maxBufferSize:      maxBufferSize,
@@ -84,14 +88,33 @@ func (bh *BodyHandler) SafeReadRequestBody(r *http.Request) (*RequestBodyInfo, e
 		return info, nil
 	}
 
+	// originalBody is the request's body exactly as it arrived, before any
+	// decompression wrapping below. It is what we hand off as the Close()
+	// target if the body ends up truncated (see the restore step after the
+	// read loop): the real underlying connection/stream must still be closed
+	// exactly once by whoever finishes reading the restored r.Body, even
+	// though that might now be a gzip.Reader wrapping it rather than
+	// originalBody itself.
+	originalBody := r.Body
+
 	// Handle compressed content
-	reader, err := bh.getDecompressedReader(r)
+	reader, decompressed, err := bh.getDecompressedReader(r)
 	if err != nil {
 		bh.logger.Error("Failed to create decompressed reader", zap.Error(err))
 		info.Error = err
 		return info, nil // Don't fail the request, just log the error
 	}
+	// Closing reader here is only correct once we know it won't be handed
+	// off as the remainder of a truncated body below: for a truncated gzip
+	// request, reader (the gzip.Reader) becomes part of the restored r.Body
+	// and must stay open for the downstream handler to keep reading from
+	// it. info.IsTruncated is set by the read loop below and read here at
+	// defer-execution time (i.e. after the loop and the restore step have
+	// already run), so this correctly skips the close in that case.
 	defer func() {
+		if info.IsTruncated {
+			return
+		}
 		if closer, ok := reader.(io.Closer); ok && closer != r.Body {
 			closer.Close()
 		}
@@ -146,9 +169,48 @@ func (bh *BodyHandler) SafeReadRequestBody(r *http.Request) (*RequestBodyInfo, e
 	info.Content = string(bodyBytes)
 	info.Size = totalRead
 
-	// Restore the body for downstream handlers
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	
+	// A decompressed body's r.Body no longer matches the original
+	// Content-Encoding regardless of whether we truncated it for buffering
+	// purposes — without removing this header, downstream forwarders would
+	// send plaintext still labeled as gzip, and upstream would fail trying
+	// to gunzip it.
+	if decompressed {
+		r.Header.Del("Content-Encoding")
+	}
+
+	if info.IsTruncated {
+		// We stopped buffering at maxBufferSize/maxBodySize for token
+		// counting purposes, but the rest of the body is still sitting
+		// unread on reader (the same gzip reader we were consuming, when
+		// Content-Encoding was gzip, or r.Body directly otherwise — never a
+		// fresh reader, since a gzip stream can only be read once). Chain
+		// what we already buffered with that remainder so a billing-disabled
+		// deployment still forwards the complete, coherent body upstream
+		// instead of silently truncating it. Close() is wired to
+		// originalBody so the real underlying stream is still closed
+		// exactly once, whether or not it went through the gzip reader.
+		r.Body = multiReaderCloser{
+			Reader: io.MultiReader(bytes.NewReader(bodyBytes), reader),
+			closer: originalBody,
+		}
+		// Total length is no longer known up front — the buffered prefix
+		// plus the still-unread remainder add up to more than totalRead —
+		// so we can't set a Content-Length at all. Go's transport falls
+		// back to chunked encoding for ContentLength == -1 with no header.
+		r.ContentLength = -1
+		r.Header.Del("Content-Length")
+	} else {
+		// Restore the body for downstream handlers
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		// If we decompressed the body, r.ContentLength/Content-Length must
+		// reflect the decompressed length, not the original compressed one.
+		if decompressed {
+			r.ContentLength = totalRead
+			r.Header.Set("Content-Length", strconv.FormatInt(totalRead, 10))
+		}
+	}
+
 	// Parse content if it's JSON
 	if bh.IsJSONContent(info.ContentType) {
 		if parsedJSON, err := bh.parseJSON(bodyBytes); err == nil {
@@ -160,18 +222,37 @@ func (bh *BodyHandler) SafeReadRequestBody(r *http.Request) (*RequestBodyInfo, e
 	return info, nil
 }
 
-// getDecompressedReader handles compressed request bodies
-func (bh *BodyHandler) getDecompressedReader(r *http.Request) (io.Reader, error) {
+// multiReaderCloser pairs a combined io.Reader (here: buffered bytes followed
+// by the not-yet-consumed remainder of a request body) with the Close
+// behavior of a separate, unrelated Closer. This lets SafeReadRequestBody
+// restore a truncated body as a MultiReader while still routing Close()
+// calls to the original underlying body/connection, rather than to whichever
+// reader happens to be last in the chain.
+type multiReaderCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (m multiReaderCloser) Close() error {
+	return m.closer.Close()
+}
+
+// getDecompressedReader handles compressed request bodies. The returned bool
+// reports whether the body is actually being decompressed (true only for the
+// "gzip" case) — callers use it to know whether the restored r.Body no
+// longer matches the original Content-Encoding/Content-Length.
+func (bh *BodyHandler) getDecompressedReader(r *http.Request) (io.Reader, bool, error) {
 	encoding := r.Header.Get("Content-Encoding")
-	
+
 	switch strings.ToLower(encoding) {
 	case "gzip":
-		return gzip.NewReader(r.Body)
+		reader, err := gzip.NewReader(r.Body)
+		return reader, true, err
 	case "":
-		return r.Body, nil
+		return r.Body, false, nil
 	default:
 		bh.logger.Warn("Unsupported content encoding", zap.String("encoding", encoding))
-		return r.Body, nil // Return original body, let downstream handle it
+		return r.Body, false, nil // Return original body, let downstream handle it
 	}
 }
 
